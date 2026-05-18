@@ -33,9 +33,9 @@
 #pragma comment(lib, "shell32.lib")
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v2.2.3"
-#define CHANGELOG_VERSION L"v2.2.3"
-#define UPDATE_URL        "https://raw.githubusercontent.com/vernoh/pulsekps/main/version.txt"
+#define APP_VERSION      L"v2.2.4"
+#define CHANGELOG_VERSION L"v2.2.4"
+#define UPDATE_URL        "https://api.github.com/repos/vernoh/pulsekps/releases/latest"
 #define TRIAL_DAYS        2
 #define TRIAL_REG_KEY     L"Software\\MacroApp\\Trial"
 #define INITIAL_KPS   20
@@ -680,6 +680,22 @@ std::string httpCall(const wchar_t* path,const std::string& body,const std::stri
     HINTERNET hR=HttpOpenRequest(hC,wm.c_str(),path,NULL,NULL,t,INTERNET_FLAG_SECURE|INTERNET_FLAG_RELOAD|INTERNET_FLAG_NO_CACHE_WRITE,0);if(!hR){InternetCloseHandle(hC);InternetCloseHandle(hN);return"";}
     std::string h="Content-Type: application/json\r\napikey: "+key+"\r\nAuthorization: Bearer "+key+"\r\nPrefer: return=representation\r\n";
     HttpSendRequestA(hR,h.c_str(),(DWORD)h.size(),(LPVOID)body.c_str(),(DWORD)body.size());
+    std::string resp;char buf[4096];DWORD rd=0;
+    while(InternetReadFile(hR,buf,sizeof(buf)-1,&rd)&&rd>0){buf[rd]=0;resp+=buf;rd=0;}
+    InternetCloseHandle(hR);InternetCloseHandle(hC);InternetCloseHandle(hN);
+    return resp;
+}
+
+// GitHub API GET — separate from Supabase httpCall
+std::string githubGet(const char* path){
+    HINTERNET hN=InternetOpen(L"PulseKPS/1.0",INTERNET_OPEN_TYPE_DIRECT,NULL,NULL,0);if(!hN)return"";
+    HINTERNET hC=InternetConnect(hN,L"api.github.com",INTERNET_DEFAULT_HTTPS_PORT,NULL,NULL,INTERNET_SERVICE_HTTP,0,0);
+    if(!hC){InternetCloseHandle(hN);return"";}
+    std::wstring wp(path,path+strlen(path));
+    HINTERNET hR=HttpOpenRequest(hC,L"GET",wp.c_str(),NULL,NULL,NULL,INTERNET_FLAG_SECURE|INTERNET_FLAG_RELOAD|INTERNET_FLAG_NO_CACHE_WRITE,0);
+    if(!hR){InternetCloseHandle(hC);InternetCloseHandle(hN);return"";}
+    std::string h="User-Agent: PulseKPS/1.0\r\nAccept: application/vnd.github.v3+json\r\n";
+    HttpSendRequestA(hR,h.c_str(),(DWORD)h.size(),NULL,0);
     std::string resp;char buf[4096];DWORD rd=0;
     while(InternetReadFile(hR,buf,sizeof(buf)-1,&rd)&&rd>0){buf[rd]=0;resp+=buf;rd=0;}
     InternetCloseHandle(hR);InternetCloseHandle(hC);InternetCloseHandle(hN);
