@@ -33,9 +33,9 @@
 #pragma comment(lib, "shell32.lib")
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v2.2.1"
-#define CHANGELOG_VERSION L"v2.2.1"
-#define UPDATE_URL        "about:blank"
+#define APP_VERSION      L"v2.2.3"
+#define CHANGELOG_VERSION L"v2.2.3"
+#define UPDATE_URL        "https://raw.githubusercontent.com/vernoh/pulsekps/main/version.txt"
 #define TRIAL_DAYS        2
 #define TRIAL_REG_KEY     L"Software\\MacroApp\\Trial"
 #define INITIAL_KPS   20
@@ -199,6 +199,7 @@ bool minimiseToTray=false;
 bool trialMode=false;
 int  trialDaysLeft=TRIAL_DAYS;
 bool changelogShown=false;
+bool showChangelogOnStartup=true; // user can disable in settings
 POINT overlayDrag={};
 bool overlayDragging=false;
 int overlayX=0, overlayY=80; // saved overlay position
@@ -307,7 +308,7 @@ void saveSettings() {
     f << keysToSend.size() << L"\n";
     for (int v : keysToSend) f << v << L"\n";
     LeaveCriticalSection(&keyListCS);
-    f << overlayX << L"\n" << overlayY << L"\n";
+    f << overlayX << L"\n" << overlayY << L"\n" << showChangelogOnStartup << L"\n";
     LOG_OK(L"Settings saved");
 }
 
@@ -349,7 +350,7 @@ void loadSettings() {
         int v; if (f>>v && v>0 && v<256) keysToSend.push_back(v);
     }
     LeaveCriticalSection(&keyListCS);
-    { int ox=0,oy=80; if(f>>ox>>oy){overlayX=ox;overlayY=oy;} }
+    { int ox=0,oy=80,scl=1; if(f>>ox>>oy){overlayX=ox;overlayY=oy;} if(f>>scl)showChangelogOnStartup=(scl!=0); }
     LOG_OK(L"Settings loaded");
     // If no keys saved, add F as default
     EnterCriticalSection(&keyListCS);
@@ -1996,6 +1997,10 @@ void settingsHandleClick(HWND hwnd,int mx,int my,int W,int H){
     // Minimise to tray toggle
     if(mx>=p+cw-48&&mx<=p+cw-4&&my>=l.yMinimise+16&&my<=l.yMinimise+38){
         minimiseToTray=!minimiseToTray;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
+    // Changelog on startup toggle
+    {int clY2=l.yMinimise+62;
+    if(mx>=p+cw-48&&mx<=p+cw-4&&my>=clY2+16&&my<=clY2+38){
+        showChangelogOnStartup=!showChangelogOnStartup;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}}
     // Update check
     if(mx>=p&&mx<=p+cw&&my>=l.yUpdate&&my<=l.yUpdate+54){
         std::thread(checkForUpdate).detach();}
@@ -2130,6 +2135,12 @@ void paintSettingsInto(HDC hdc,int W,int H){
     drawText(hdc,L"MINIMISE TO TRAY",p+14,mY2+10,300,14,T.subtext,hFontSmall);
     drawText(hdc,L"Minimise to tray instead of closing",p+14,mY2+28,cw-70,16,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-48,mY2+16,minimiseToTray);}
+    // Changelog on startup toggle
+    {int clY=l.yMinimise+sfadeY+62;
+    drawCard(hdc,p,clY,cw,54);
+    drawText(hdc,L"CHANGELOG ON STARTUP",p+14,clY+10,300,14,T.subtext,hFontSmall);
+    drawText(hdc,L"Show changelog when a new version is found",p+14,clY+28,cw-70,16,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawToggle(hdc,p+cw-48,clY+16,showChangelogOnStartup);}
     y=l.yUpdate+sfadeY;
     drawCard(hdc,p,y,cw,54);
     drawText(hdc,L"UPDATE",p+14,y+10,200,14,T.subtext,hFontSmall);
@@ -2188,8 +2199,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             animModeHold=(float)holdMode.load();
             animRunning=(float)macroRunning.load();
             // Tab dock indicator animation (smooth bar, instant content)
+            // Dock tab animation — fixed speed, always finishes in ~600ms
             float tabTarget=(float)activeTab;
-            animateTo(tabAnim,tabTarget,0.35f);
+            float tabDiff=tabTarget-tabAnim;
+            if(fabsf(tabDiff)<0.01f){
+                tabAnim=tabTarget;
+            } else {
+                tabAnim+=tabDiff*0.18f; // linear-ish, consistent speed
+            }
 
             // Hover states - fast ease out
             int curHov=(int)(INT_PTR)hwndHovered;
@@ -2637,7 +2654,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     updateSplash(L"Starting macro engine...");Sleep(180);
     updateSplash(L"Ready.");Sleep(300);
     // Show changelog inline if new version
-    if(!changelogShown){
+    if(!changelogShown&&showChangelogOnStartup){
         splashShowChangelog=true;
         splashChangelogScroll=0;
         InvalidateRect(hwndSplash,NULL,TRUE);
