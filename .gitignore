@@ -5,3 +5,13 @@ keygen.exe
 keygen.cpp
 resource.res
 *.dat
+settings.dat.ver
+
+# Build output - the release binary is attached to the GitHub release, not committed
+*.exe
+*.obj
+*.pdb
+*.ilk
+
+# Third-party tool used to compress the release binary; download separately
+upx.exe
