@@ -1,5 +1,9 @@
 #define UNICODE
 #define _UNICODE
+// Stops windows.h defining min/max as macros - they break every std::min/std::max
+// call. gdiplus.h still needs those names, so they're pulled into namespace Gdiplus
+// from <algorithm> just before it's included below.
+#define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -8,6 +12,7 @@
 #include <psapi.h>
 #include <mmsystem.h>
 #include <tlhelp32.h>
+#include <srrestoreptapi.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -20,7 +25,11 @@
 #include <cmath>
 #include <mutex>
 #include <algorithm>
+namespace Gdiplus { using std::min; using std::max; }
 #include <gdiplus.h>
+// rpcndr.h (via windows.h) does `#define small char`, which breaks locals named
+// small - e.g. the one in getSmallIcon().
+#undef small
 #pragma comment(lib, "gdiplus.lib")
 
 #pragma comment(lib, "user32.lib")
@@ -33,24 +42,32 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")  // registry + OpenProcessToken/AdjustTokenPrivileges
+#pragma comment(lib, "pdh.lib")       // Pdh* counters in resourceThread
+#pragma comment(lib, "srclient.lib")  // SRSetRestorePointW
+#pragma comment(lib, "comdlg32.lib")  // GetOpenFileNameW / GetSaveFileNameW
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v2.5.4"
-#define CHANGELOG_VERSION L"v2.5.4"
-#define UPDATE_URL        "https://api.github.com/repos/vernoh/pulsekps/releases/latest"
+#define APP_VERSION      L"v3.0.1"
+#define CHANGELOG_VERSION L"v3.0.1"
+#define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
 #define TRIAL_REG_KEY     L"Software\\MacroApp\\Trial"
 #define INITIAL_KPS   20
 #define MIN_KPS       20
 #define MAX_KPS       2000
 // ===================== ENCRYPTED STRINGS =====================
-// Strings XOR-encrypted at compile time - not visible in hex editor
+// XOR-obfuscated at compile time to keep the endpoint/key out of a plain `strings`
+// dump. This is NOT security - the repeating key is trivially recoverable. It's fine
+// here because the only value stored is the Supabase URL and the PUBLISHABLE key,
+// both of which are public by design; RLS is what actually protects the data.
+// NEVER store the service_role / sb_secret key in this binary.
 static const unsigned char ENC_SUPABASE_URL[] = {0x2A,0x25,0x27,0x59,0x1C,0x5D,0x40,0x23,0x29,0x30,0x4B,0x1E,0x5C,0x45,0x2F,0x20,0x31,0x55,0x1B,0x5C,0x1D,0x38,0x25,0x23,0x40,0x14,0x53,0x40,0x2E,0x7E,0x30,0x4E,0x00};
 static const int ENC_SUPABASE_URL_len = 32;
-static const unsigned char ENC_ANON_KEY[] = {0x2E,0x29,0x19,0x49,0x14,0x75,0x50,0x22,0x1F,0x3A,0x6B,0x3F,0x67,0x49,0x02,0x61,0x1D,0x48,0x3F,0x41,0x7A,0x25,0x02,0x66,0x42,0x35,0x7B,0x05,0x02,0x3B,0x23,0x79,0x20,0x71,0x79,0x72,0x7E,0x36,0x58,0x3C,0x42,0x50,0x78,0x1D,0x3A,0x6E,0x1F,0x78,0x49,0x2F,0x08,0x11,0x49,0x2F,0x5F,0x75,0x31,0x0A,0x00,0x68,0x05,0x7B,0x5D,0x01,0x3C,0x09,0x48,0x3F,0x04,0x7A,0x26,0x16,0x62,0x45,0x3E,0x5A,0x42,0x29,0x63,0x1D,0x4E,0x13,0x65,0x7D,0x3A,0x31,0x14,0x14,0x44,0x68,0x7B,0x09,0x39,0x37,0x66,0x47,0x47,0x7A,0x22,0x27,0x3A,0x42,0x1B,0x0B,0x40,0x11,0x03,0x1A,0x17,0x3F,0x5F,0x75,0x3E,0x32,0x61,0x15,0x1F,0x7E,0x70,0x01,0x20,0x0A,0x79,0x27,0x5B,0x7C,0x21,0x15,0x60,0x6F,0x0C,0x55,0x07,0x05,0x04,0x16,0x56,0x3B,0x66,0x76,0x38,0x19,0x3E,0x77,0x42,0x51,0x70,0x02,0x66,0x1E,0x4B,0x37,0x07,0x7D,0x0F,0x01,0x2A,0x6F,0x0C,0x73,0x4B,0x06,0x08,0x63,0x0F,0x40,0x60,0x6C,0x0C,0x60,0x36,0x6D,0x3D,0x53,0x01,0x3B,0x65,0x66,0x4F,0x1A,0x66,0x0B,0x66,0x3D,0x01,0x46,0x20,0x60,0x71,0x31,0x20,0x02,0x67,0x0C,0x71,0x7C,0x12,0x04,0x04,0x54,0x37,0x7B,0x40,0x1C,0x63,0x31,0x56,0x27,0x00};
-static const int ENC_ANON_KEY_len = 208;
-static const unsigned char ENC_SERVICE_KEY[] = {0x2E,0x29,0x19,0x49,0x14,0x75,0x50,0x22,0x1F,0x3A,0x6B,0x3F,0x67,0x49,0x02,0x61,0x1D,0x48,0x3F,0x41,0x7A,0x25,0x02,0x66,0x42,0x35,0x7B,0x05,0x02,0x3B,0x23,0x79,0x20,0x71,0x79,0x72,0x7E,0x36,0x58,0x3C,0x42,0x50,0x78,0x1D,0x3A,0x6E,0x1F,0x78,0x49,0x2F,0x08,0x11,0x49,0x2F,0x5F,0x75,0x31,0x0A,0x00,0x68,0x05,0x7B,0x5D,0x01,0x3C,0x09,0x48,0x3F,0x04,0x7A,0x26,0x16,0x62,0x45,0x3E,0x5A,0x42,0x29,0x63,0x1D,0x4E,0x13,0x65,0x7D,0x3A,0x31,0x14,0x14,0x44,0x68,0x7B,0x09,0x39,0x37,0x66,0x47,0x47,0x7A,0x22,0x27,0x3A,0x42,0x1B,0x0B,0x40,0x11,0x03,0x1A,0x17,0x3F,0x5C,0x7D,0x27,0x33,0x3D,0x7B,0x06,0x6B,0x01,0x1D,0x36,0x30,0x4C,0x4F,0x41,0x69,0x18,0x19,0x20,0x68,0x1B,0x5E,0x5B,0x2F,0x13,0x1A,0x17,0x3B,0x66,0x50,0x78,0x1F,0x17,0x46,0x47,0x7F,0x67,0x0A,0x28,0x1E,0x72,0x01,0x5B,0x69,0x13,0x38,0x24,0x68,0x1C,0x5D,0x4A,0x06,0x14,0x38,0x11,0x38,0x76,0x7A,0x78,0x1D,0x17,0x64,0x0E,0x54,0x62,0x65,0x3A,0x09,0x74,0x1A,0x6B,0x7D,0x0D,0x19,0x03,0x68,0x18,0x5B,0x50,0x25,0x3C,0x6B,0x64,0x21,0x5C,0x41,0x3A,0x1C,0x0C,0x79,0x34,0x5D,0x1E,0x3E,0x37,0x34,0x70,0x3F,0x5E,0x5C,0x23,0x37,0x6A,0x66,0x0E,0x73,0x66,0x2E,0x37,0x00};
-static const int ENC_SERVICE_KEY_len = 219;
+// ENC_ANON_KEY holds the sb_publishable_... key (name kept to avoid touching call
+// sites; "anon" and "publishable" are the same public client role).
+static const unsigned char ENC_ANON_KEY[] = {0x38,0x32,0x0C,0x51,0x03,0x50,0x5F,0x22,0x23,0x3B,0x40,0x14,0x5E,0x56,0x14,0x08,0x01,0x11,0x5B,0x07,0x69,0x1E,0x09,0x24,0x6F,0x3A,0x74,0x07,0x0E,0x69,0x60,0x7B,0x40,0x64,0x04,0x0E,0x01,0x0C,0x43,0x23,0x05,0x59,0x03,0x7D,0x1C,0x56,0x00};
+static const int ENC_ANON_KEY_len = 46;
 
 static std::string xorDecrypt(const unsigned char* data, int len){
     static const unsigned char K[]={0x4B,0x50,0x53,0x21,0x76,0x32,0x33};
@@ -61,11 +78,11 @@ static std::string xorDecrypt(const unsigned char* data, int len){
 }
 #define DECRYPT(x) xorDecrypt(x,x##_len)
 // Runtime-decrypted - use DECRYPT(ENC_*) not these directly
+// Only the anon key ships in the client. Never embed the service_role key here:
+// XOR obfuscation is not encryption, and service_role bypasses RLS entirely.
+// The HWID claim works under anon via the "Allow hwid activation" policy.
 #define SUPABASE_URL_STR() (xorDecrypt(ENC_SUPABASE_URL,ENC_SUPABASE_URL_len))
 #define SUPABASE_ANON_STR() (xorDecrypt(ENC_ANON_KEY,ENC_ANON_KEY_len))
-#define SERVICE_KEY_STR() (xorDecrypt(ENC_SERVICE_KEY,ENC_SERVICE_KEY_len))
-#define LICENSE_FILE  L"license.dat"
-#define SETTINGS_FILE L"settings.dat"
 #define LOG_FILE      L"logs.txt"
 #define APP_W         420
 #define APP_H         600
@@ -95,7 +112,7 @@ void addLog(const wchar_t* type, const wchar_t* msg) {
 
     // Build wide string for in-memory log display
     wchar_t wbuf[512];
-    swprintf(wbuf, 512, L"[%02d:%02d:%02d] [%s] %s",
+    swprintf(wbuf, 512, L"[%02d:%02d:%02d] [%ls] %ls",
         st.wHour, st.wMinute, st.wSecond, type, msg);
     {
         std::lock_guard<std::mutex> lk(logMutex);
@@ -131,6 +148,53 @@ void addLog(const wchar_t* type, const wchar_t* msg) {
         fclose(f);
     }
 }
+
+// Keeps only the last hour of log lines - both the in-memory panel and the
+// physical file. The old approach only checked the whole FILE's last-modified
+// time once at startup, but active use keeps refreshing that timestamp on
+// every write, so in practice it almost never actually fired. This parses
+// each line's own [HH:MM:SS] prefix and prunes by real elapsed time instead.
+void pruneOldLogs(){
+    SYSTEMTIME st; GetLocalTime(&st);
+    int nowSec = st.wHour*3600 + st.wMinute*60 + st.wSecond;
+    auto withinHour = [&](int h,int mi,int s)->bool{
+        int lineSec = h*3600+mi*60+s;
+        int diff = nowSec - lineSec;
+        if (diff < 0) diff += 86400; // handles crossing midnight since app started
+        return diff <= 3600;
+    };
+
+    // Prune in-memory panel
+    {
+        std::lock_guard<std::mutex> lk(logMutex);
+        std::vector<std::wstring> kept;
+        for (auto& line : logEntries) {
+            int h,mi,s;
+            if (line.size()>=9 && line[0]==L'[' && swscanf(line.c_str(),L"[%d:%d:%d]",&h,&mi,&s)==3 && withinHour(h,mi,s))
+                kept.push_back(line);
+        }
+        logEntries = std::move(kept);
+    }
+
+    // Prune physical file - read, filter, rewrite
+    std::wstring path = exePath(LOG_FILE);
+    FILE* fin = _wfopen(path.c_str(), L"r");
+    if (!fin) return;
+    std::vector<std::string> keptLines;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), fin)) {
+        int h=0,mi=0,s=0;
+        if (buf[0]=='[' && sscanf(buf,"[%d:%d:%d]",&h,&mi,&s)==3 && withinHour(h,mi,s))
+            keptLines.push_back(buf);
+    }
+    fclose(fin);
+    FILE* fout = _wfopen(path.c_str(), L"w");
+    if (fout) {
+        for (auto& l : keptLines) fputs(l.c_str(), fout);
+        fclose(fout);
+    }
+}
+
 #define LOG_OK(m)   addLog(L"OK",   m)
 #define LOG_ERR(m)  addLog(L"ERR",  m)
 #define LOG_INFO(m) addLog(L"INFO", m)
@@ -248,8 +312,20 @@ void initVoidStars(){
 }
 void updateVoidStars(){
     if(!voidStarsInit) initVoidStars();
+    // Delta-time based motion instead of a fixed per-tick step - the old
+    // code assumed updateVoidStars() fired at a perfectly uniform interval,
+    // but WM_TIMER doesn't guarantee that (timer granularity + variable
+    // frame processing time), so stars visually sped up/slowed down between
+    // ticks. Scaling by actual elapsed time keeps motion smooth regardless.
+    static ULONGLONG lastTick=0;
+    ULONGLONG nowTick=GetTickCount64();
+    if(lastTick==0) lastTick=nowTick;
+    float dtMs=(float)(nowTick-lastTick);
+    lastTick=nowTick;
+    if(dtMs<=0.0f||dtMs>100.0f) dtMs=16.6667f; // clamp huge gaps (e.g. app was idle/minimized)
+    float scale=dtMs/16.6667f; // 1.0 at a perfect 60fps tick
     for(int i=0;i<120;i++){
-        voidStars[i].y+=voidStars[i].speed;
+        voidStars[i].y+=voidStars[i].speed*scale;
         if(voidStars[i].y>APP_H+4){
             voidStars[i].y=-2.0f;
             voidStars[i].x=(float)(rand()%APP_W);
@@ -259,16 +335,41 @@ void updateVoidStars(){
 }
 void drawVoidStars(HDC hdc,int W,int H){
     if(!voidStarsInit) initVoidStars();
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeNone); // stars are 1-2px - AA would only blur/slow this down
+
+    // Bucket stars by brightness tier so each tier can be drawn in a single
+    // batched FillRectangles call instead of one GDI call per star (or per
+    // pixel, as the old SetPixel version did).
+    const int TIERS=8;
+    std::vector<RectF> mainRects[TIERS];
+    std::vector<RectF> glowRects[TIERS];
+
     for(int i=0;i<120;i++){
         int x=(int)voidStars[i].x;
         int y=(int)voidStars[i].y;
         if(x<0||x>=W||y<0||y>=H) continue;
         int bright=(int)(voidStars[i].alpha*255.0f);
         bright=std::max(0,std::min(255,bright));
-        SetPixel(hdc,x,y,RGB(bright,bright,bright));
+        int tier=std::min(TIERS-1, bright*TIERS/256);
+        mainRects[tier].push_back(RectF((REAL)x,(REAL)y,1.0f,1.0f));
         if(voidStars[i].alpha>0.6f){
-            if(x+1<W) SetPixel(hdc,x+1,y,RGB(bright/3,bright/3,bright/3));
-            if(y+1<H) SetPixel(hdc,x,y+1,RGB(bright/3,bright/3,bright/3));
+            int glowTier=std::min(TIERS-1,(bright/3)*TIERS/256);
+            if(x+1<W) glowRects[glowTier].push_back(RectF((REAL)(x+1),(REAL)y,1.0f,1.0f));
+            if(y+1<H) glowRects[glowTier].push_back(RectF((REAL)x,(REAL)(y+1),1.0f,1.0f));
+        }
+    }
+    for(int t=0;t<TIERS;t++){
+        if(mainRects[t].empty()&&glowRects[t].empty()) continue;
+        int bright=(t*256/TIERS)+16;
+        if(!mainRects[t].empty()){
+            SolidBrush b(Color(255,bright,bright,bright));
+            g.FillRectangles(&b,mainRects[t].data(),(INT)mainRects[t].size());
+        }
+        if(!glowRects[t].empty()){
+            SolidBrush b(Color(255,bright,bright,bright));
+            g.FillRectangles(&b,glowRects[t].data(),(INT)glowRects[t].size());
         }
     }
 }
@@ -12520,6 +12621,56 @@ static void playClick(){
     }).detach();
 }
 
+// Soft success chime - distinct from the plain UI click, used alongside
+// showSuccessToast(). Procedurally generated rather than a pre-recorded
+// sample: a gentle two-tone rise (740Hz -> 988Hz) with a quiet octave-up
+// harmonic layered in for warmth, shaped by a 12ms soft attack and a long
+// ~180ms release so there's no clicking transient at either end - the
+// harshness of a raw on/off tone comes almost entirely from a sharp
+// envelope edge, not the waveform itself.
+static void playChime(){
+    if(!uiSoundsEnabled) return;
+    if(s_sndActive.load()>=6) return;
+    s_sndActive++;
+    std::thread([]{
+        const int sampleRate=44100;
+        const float durSec=0.34f;
+        const int nSamples=(int)(sampleRate*durSec);
+        std::vector<short> pcm((size_t)nSamples*2);
+
+        const float f1=740.0f, f2=988.0f;
+        for(int i=0;i<nSamples;i++){
+            float t=(float)i/sampleRate;
+            float attack=std::min(1.0f,t/0.012f);
+            float release=std::min(1.0f,(durSec-t)/0.18f);
+            float env=std::min(attack,release);
+            env=env*env;
+
+            float freq=f1+(f2-f1)*std::min(1.0f,t/0.16f);
+            float s=sinf(2.0f*3.14159265f*freq*t)*0.6f
+                   +sinf(2.0f*3.14159265f*freq*2.0f*t)*0.15f;
+            s*=env*0.5f;
+            short v=(short)std::max(-32000.0f,std::min(32000.0f,s*32000.0f));
+            pcm[(size_t)i*2]=v; pcm[(size_t)i*2+1]=v;
+        }
+
+        WAVEFORMATEX wfx={WAVE_FORMAT_PCM,2,(DWORD)sampleRate,(DWORD)(sampleRate*4),4,16,0};
+        HWAVEOUT hWave=NULL;
+        if(waveOutOpen(&hWave,WAVE_MAPPER,&wfx,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){
+            s_sndActive--; return;
+        }
+        WAVEHDR hdr={};
+        hdr.lpData=(LPSTR)pcm.data();
+        hdr.dwBufferLength=(DWORD)(pcm.size()*sizeof(short));
+        waveOutPrepareHeader(hWave,&hdr,sizeof(WAVEHDR));
+        waveOutWrite(hWave,&hdr,sizeof(WAVEHDR));
+        for(int t=0;t<600&&!(hdr.dwFlags&WHDR_DONE);t++) Sleep(5);
+        waveOutUnprepareHeader(hWave,&hdr,sizeof(WAVEHDR));
+        waveOutClose(hWave);
+        s_sndActive--;
+    }).detach();
+}
+
 // ===================== IDs =====================
 #define ID_SET_HOTKEY    101
 #define ID_ADD_KEY       103
@@ -12539,8 +12690,6 @@ static void playClick(){
 #define ID_KPS_INPUT     206
 #define ID_OPEN_LOGS     207
 #define ID_MEM_CLEAN     208
-#define ID_EXPORT_CFG    209
-#define ID_IMPORT_CFG    210
 #define TIMER_ANIM       300
 #define TIMER_SETT       301  // slower timer for settings refresh
 #define ID_TRAY_ICON     400
@@ -12601,6 +12750,7 @@ int  fontDropHov=-1;
 
 HFONT hFontBig, hFontMed, hFontSmall, hFontMono;
 HWND hwndHovered=NULL;
+POINT g_lastMousePos={-1,-1};
 
 // Animation globals
 float animMacroStatus=0.0f;
@@ -12698,130 +12848,135 @@ HINSTANCE gInst;
 ULONG_PTR gdiplusToken=0;
 
 // ===================== SETTINGS =====================
+// ===================== REGISTRY STORAGE =====================
+// Replaces the old settings.dat/settings.dat.ver/license.dat files - nothing
+// visible in the app folder, and named values mean adding a new setting
+// later can't accidentally shift/corrupt every value that used to come after
+// it in a fixed-order file stream.
+#define REG_KEY_PATH L"Software\\wrathic"
+
+static bool regSetDWORD(const wchar_t* name, DWORD val){
+    HKEY hk; if(RegCreateKeyExW(HKEY_CURRENT_USER,REG_KEY_PATH,0,NULL,0,KEY_SET_VALUE,NULL,&hk,NULL)!=ERROR_SUCCESS) return false;
+    LONG r=RegSetValueExW(hk,name,0,REG_DWORD,(const BYTE*)&val,sizeof(val));
+    RegCloseKey(hk); return r==ERROR_SUCCESS;
+}
+static DWORD regGetDWORD(const wchar_t* name, DWORD defVal, bool* found=nullptr){
+    HKEY hk; if(found)*found=false;
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,REG_KEY_PATH,0,KEY_QUERY_VALUE,&hk)!=ERROR_SUCCESS) return defVal;
+    DWORD val=defVal, sz=sizeof(val), type=0;
+    LONG r=RegQueryValueExW(hk,name,NULL,&type,(BYTE*)&val,&sz);
+    RegCloseKey(hk);
+    if(r==ERROR_SUCCESS&&type==REG_DWORD){ if(found)*found=true; return val; }
+    return defVal;
+}
+static bool regSetString(const wchar_t* name, const std::wstring& val){
+    HKEY hk; if(RegCreateKeyExW(HKEY_CURRENT_USER,REG_KEY_PATH,0,NULL,0,KEY_SET_VALUE,NULL,&hk,NULL)!=ERROR_SUCCESS) return false;
+    LONG r=RegSetValueExW(hk,name,0,REG_SZ,(const BYTE*)val.c_str(),(DWORD)((val.size()+1)*sizeof(wchar_t)));
+    RegCloseKey(hk); return r==ERROR_SUCCESS;
+}
+static std::wstring regGetString(const wchar_t* name, const std::wstring& defVal=L""){
+    HKEY hk; if(RegOpenKeyExW(HKEY_CURRENT_USER,REG_KEY_PATH,0,KEY_QUERY_VALUE,&hk)!=ERROR_SUCCESS) return defVal;
+    wchar_t buf[512]={}; DWORD sz=sizeof(buf), type=0;
+    LONG r=RegQueryValueExW(hk,name,NULL,&type,(BYTE*)buf,&sz);
+    RegCloseKey(hk);
+    if(r==ERROR_SUCCESS&&type==REG_SZ) return std::wstring(buf);
+    return defVal;
+}
+static void regDeleteValue(const wchar_t* name){
+    HKEY hk; if(RegOpenKeyExW(HKEY_CURRENT_USER,REG_KEY_PATH,0,KEY_SET_VALUE,&hk)!=ERROR_SUCCESS) return;
+    RegDeleteValueW(hk,name); RegCloseKey(hk);
+}
+
 void saveSettings() {
-    std::wofstream f(exePath(SETTINGS_FILE).c_str());
-    if (!f.is_open()) { LOG_ERR(L"Failed to open settings file for writing"); return; }
-    f << themeIdx << L"\n"
-      << kps.load() << L"\n"
-      << hotkeyVK.load() << L"\n"
-      << (int)holdMode.load() << L"\n"
-      << (int)kpsOverlayEnabled << L"\n"
-      << (int)resOverlayEnabled << L"\n"
-      << fontIdx << L"\n"
-      << (int)autoLaunchEnabled << L"\n"
-      << (int)minimiseToTray << L"\n"
-      << CHANGELOG_VERSION << L"\n";
-    EnterCriticalSection(&keyListCS);
-    f << keysToSend.size() << L"\n";
-    for (int v : keysToSend) f << v << L"\n";
-    LeaveCriticalSection(&keyListCS);
-    f << overlayX << L"\n" << overlayY << L"\n" << showChangelogOnStartup << L"\n";
-    f << usageMinutes << L"\n" << (int)vouchPrompted << L"\n";
-    f << (int)overlayShowCpu << L"\n" << (int)overlayShowRam << L"\n"
-      << (int)overlayShowGpu << L"\n" << (int)overlayShowDisk << L"\n";
-    f << (int)uiSoundsEnabled << L"\n" << (int)overlaySysStats << L"\n" << (int)discordRpcEnabled << L"\n";
+    regSetDWORD(L"ThemeIdx",(DWORD)themeIdx);
+    regSetDWORD(L"Kps",(DWORD)kps.load());
+    regSetDWORD(L"HotkeyVK",(DWORD)hotkeyVK.load());
+    regSetDWORD(L"HoldMode",(DWORD)holdMode.load());
+    regSetDWORD(L"KpsOverlayEnabled",(DWORD)kpsOverlayEnabled);
+    regSetDWORD(L"ResOverlayEnabled",(DWORD)resOverlayEnabled);
+    regSetDWORD(L"FontIdx",(DWORD)fontIdx);
+    regSetDWORD(L"AutoLaunchEnabled",(DWORD)autoLaunchEnabled);
+    regSetDWORD(L"MinimiseToTray",(DWORD)minimiseToTray);
+    regSetString(L"ChangelogVersion",CHANGELOG_VERSION);
+    {
+        EnterCriticalSection(&keyListCS);
+        std::wstring keysStr;
+        for(int v:keysToSend){ keysStr+=std::to_wstring(v); keysStr+=L","; }
+        LeaveCriticalSection(&keyListCS);
+        regSetString(L"KeysToSend",keysStr);
+    }
+    regSetDWORD(L"OverlayX",(DWORD)overlayX);
+    regSetDWORD(L"OverlayY",(DWORD)overlayY);
+    regSetDWORD(L"ShowChangelogOnStartup",(DWORD)showChangelogOnStartup);
+    regSetDWORD(L"UsageMinutes",(DWORD)usageMinutes);
+    regSetDWORD(L"VouchPrompted",(DWORD)vouchPrompted);
+    regSetDWORD(L"OverlayShowCpu",(DWORD)overlayShowCpu);
+    regSetDWORD(L"OverlayShowRam",(DWORD)overlayShowRam);
+    regSetDWORD(L"OverlayShowGpu",(DWORD)overlayShowGpu);
+    regSetDWORD(L"OverlayShowDisk",(DWORD)overlayShowDisk);
+    regSetDWORD(L"UiSoundsEnabled",(DWORD)uiSoundsEnabled);
+    regSetDWORD(L"OverlaySysStats",(DWORD)overlaySysStats);
+    regSetDWORD(L"DiscordRpcEnabled",(DWORD)discordRpcEnabled);
     LOG_OK(L"Settings saved");
 }
 
 void loadSettings() {
-    std::wifstream f(exePath(SETTINGS_FILE).c_str());
-    if (!f.is_open()) {
+    bool found=false;
+    int ti=(int)regGetDWORD(L"ThemeIdx",0,&found);
+    if (!found) {
         LOG_INFO(L"First launch - using default settings");
         EnterCriticalSection(&keyListCS);
         keysToSend.push_back(VK_LBUTTON);
         LeaveCriticalSection(&keyListCS);
         return;
     }
-    int ti, k, hk, hm, kov, rov, fi, al, ksz;
-    wchar_t savedVer[32]={};
-    if (!(f >> ti >> k >> hk >> hm >> kov >> rov >> fi >> al)) {
-        LOG_ERR(L"Settings file is corrupt - reverting to defaults"); return;
-    }
     if (ti>=0&&ti<6) themeIdx=ti;
-    kps = std::max(MIN_KPS, std::min(MAX_KPS, k));
+    kps = std::max(MIN_KPS, std::min(MAX_KPS, (int)regGetDWORD(L"Kps",kps.load())));
+    int hk=(int)regGetDWORD(L"HotkeyVK",VK_F8);
     hotkeyVK = hk ? hk : VK_F8;
-    holdMode = hm != 0;
-    kpsOverlayEnabled = kov != 0;
-    resOverlayEnabled = rov != 0;
+    holdMode = regGetDWORD(L"HoldMode",0)!=0;
+    kpsOverlayEnabled = regGetDWORD(L"KpsOverlayEnabled",1)!=0;
+    resOverlayEnabled = regGetDWORD(L"ResOverlayEnabled",0)!=0;
+    int fi=(int)regGetDWORD(L"FontIdx",fontIdx);
     if (fi>=0&&fi<5) fontIdx=fi;
-    autoLaunchEnabled = al!=0;
-    int mtt=1; if(f>>mtt) minimiseToTray=(mtt!=0);
-    // Read optional changelog version then keys size
-    std::wstring savedChangelogVer;
-    if (f >> savedChangelogVer) {
-        changelogShown = (savedChangelogVer == std::wstring(CHANGELOG_VERSION));
-        f >> ksz;
-    } else {
-        changelogShown = false;
-        ksz = 0;
+    autoLaunchEnabled = regGetDWORD(L"AutoLaunchEnabled",0)!=0;
+    minimiseToTray = regGetDWORD(L"MinimiseToTray",0)!=0;
+
+    std::wstring savedChangelogVer = regGetString(L"ChangelogVersion",L"");
+    changelogShown = (!savedChangelogVer.empty() && savedChangelogVer == std::wstring(CHANGELOG_VERSION));
+
+    {
+        std::wstring keysStr = regGetString(L"KeysToSend",L"");
+        EnterCriticalSection(&keyListCS);
+        keysToSend.clear();
+        size_t pos=0;
+        while(pos<keysStr.size()){
+            size_t comma=keysStr.find(L',',pos);
+            if(comma==std::wstring::npos) break;
+            int v=_wtoi(keysStr.substr(pos,comma-pos).c_str());
+            if(v>0&&v<256) keysToSend.push_back(v);
+            pos=comma+1;
+        }
+        LeaveCriticalSection(&keyListCS);
     }
-    EnterCriticalSection(&keyListCS);
-    keysToSend.clear();
-    for (int i=0; i<ksz; i++) {
-        int v; if (f>>v && v>0 && v<256) keysToSend.push_back(v);
-    }
-    LeaveCriticalSection(&keyListCS);
-    { int ox=0,oy=80,scl=1; if(f>>ox>>oy){overlayX=ox;overlayY=oy;} if(f>>scl)showChangelogOnStartup=(scl!=0); }
-    { int um=0,vp=0; if(f>>um>>vp){ usageMinutes=um; vouchPrompted=(vp!=0); } }
-    { int a=1,b=1,c=0,d=0; if(f>>a>>b>>c>>d){ overlayShowCpu=(a!=0); overlayShowRam=(b!=0); overlayShowGpu=(c!=0); overlayShowDisk=(d!=0); } }
-    { int us=1,ss=1,dr=0; if(f>>us) uiSoundsEnabled=(us!=0); if(f>>ss) overlaySysStats=(ss!=0); if(f>>dr) discordRpcEnabled=(dr!=0); }
+
+    overlayX=(int)regGetDWORD(L"OverlayX",0);
+    overlayY=(int)regGetDWORD(L"OverlayY",80);
+    showChangelogOnStartup=regGetDWORD(L"ShowChangelogOnStartup",1)!=0;
+    usageMinutes=(int)regGetDWORD(L"UsageMinutes",0);
+    vouchPrompted=regGetDWORD(L"VouchPrompted",0)!=0;
+    overlayShowCpu=regGetDWORD(L"OverlayShowCpu",1)!=0;
+    overlayShowRam=regGetDWORD(L"OverlayShowRam",1)!=0;
+    overlayShowGpu=regGetDWORD(L"OverlayShowGpu",0)!=0;
+    overlayShowDisk=regGetDWORD(L"OverlayShowDisk",0)!=0;
+    uiSoundsEnabled=regGetDWORD(L"UiSoundsEnabled",1)!=0;
+    overlaySysStats=regGetDWORD(L"OverlaySysStats",1)!=0;
+    discordRpcEnabled=regGetDWORD(L"DiscordRpcEnabled",0)!=0;
+
     LOG_OK(L"Settings loaded");
-    // If no keys saved, add F as default
     EnterCriticalSection(&keyListCS);
     if(keysToSend.empty()) keysToSend.push_back(VK_LBUTTON); // M1 default - mouse sim = best perf
     LeaveCriticalSection(&keyListCS);
-}
-
-void exportConfig() {
-    wchar_t path[MAX_PATH]={};
-    OPENFILENAME ofn={};
-    ofn.lStructSize=sizeof(ofn);
-    ofn.hwndOwner=hwndMain;
-    ofn.lpstrFilter=L"Macro Config (*.mcfg)\0*.mcfg\0";
-    ofn.lpstrFile=path;
-    ofn.nMaxFile=MAX_PATH;
-    ofn.lpstrDefExt=L"mcfg";
-    ofn.Flags=OFN_OVERWRITEPROMPT;
-    if (!GetSaveFileName(&ofn)) return;
-    std::wofstream f(path);
-    if (!f.is_open()) { LOG_ERR(L"Export failed - could not write file"); return; }
-    f << themeIdx << L"\n" << kps.load() << L"\n"
-      << hotkeyVK.load() << L"\n" << (int)holdMode.load() << L"\n"
-      << fontIdx << L"\n";
-    EnterCriticalSection(&keyListCS);
-    f << keysToSend.size() << L"\n";
-    for (int v : keysToSend) f << v << L"\n";
-    LeaveCriticalSection(&keyListCS);
-    LOG_OK(L"Config exported successfully");
-}
-
-void importConfig() {
-    wchar_t path[MAX_PATH]={};
-    OPENFILENAME ofn={};
-    ofn.lStructSize=sizeof(ofn);
-    ofn.hwndOwner=hwndMain;
-    ofn.lpstrFilter=L"Macro Config (*.mcfg)\0*.mcfg\0";
-    ofn.lpstrFile=path;
-    ofn.nMaxFile=MAX_PATH;
-    ofn.Flags=OFN_FILEMUSTEXIST;
-    if (!GetOpenFileName(&ofn)) return;
-    std::wifstream f(path);
-    if (!f.is_open()) { LOG_ERR(L"Import failed - could not read file"); return; }
-    int ti, k, hk, hm, fi, ksz;
-    if (!(f>>ti>>k>>hk>>hm>>fi>>ksz)) { LOG_ERR(L"Import failed - file is corrupt or wrong format"); return; }
-    if (ti>=0&&ti<6) themeIdx=ti;
-    kps=std::max(MIN_KPS,std::min(MAX_KPS,k));
-    hotkeyVK=hk?hk:VK_F8;
-    holdMode=hm!=0;
-    if (fi>=0&&fi<5) fontIdx=fi;
-    // importConfig does not touch autoLaunch or changelog state
-    EnterCriticalSection(&keyListCS);
-    keysToSend.clear();
-    for (int i=0;i<ksz;i++){int v;if(f>>v&&v>0&&v<256)keysToSend.push_back(v);}
-    LeaveCriticalSection(&keyListCS);
-    saveSettings();
-    LOG_OK(L"Config imported successfully - settings applied");
-    InvalidateRect(hwndMain,NULL,FALSE);
 }
 
 // ===================== FONTS =====================
@@ -12909,7 +13064,6 @@ void initTrial() {
 
     // Calculate days elapsed
     SYSTEMTIME st; GetLocalTime(&st);
-    DWORD today = st.wYear*10000 + st.wMonth*100 + st.wDay;
 
     // Simple day diff (good enough for 2 day trial)
     SYSTEMTIME trialSt = {};
@@ -12941,9 +13095,71 @@ void initTrial() {
 // ===================== AUTO-UPDATE =====================
 std::wstring latestVersion = L"";
 
+// Generalized in-app lock state. Any blocking condition (outdated version,
+// revoked/invalid license, expired trial) routes through this instead of
+// each having its own popup/behaviour. paintMain renders a single overlay
+// on top of the normal (blurred) UI, and the KPS/resource overlay window
+// is force-hidden while any lock is active - see spawnOverlay/updateOverlay.
+enum LockKind { LOCK_NONE=0, LOCK_UPDATE=1, LOCK_LICENSE=2 };
+LockKind g_lockKind = LOCK_NONE;
+std::wstring g_lockTitle;
+std::wstring g_lockSubtitle;
+std::wstring g_lockButtonText;   // empty = no button rendered
+std::wstring g_lockRedirectUrl;  // empty = button (if any) is non-interactive
+std::wstring g_lockFooter;       // small helper line under the button/card
+
+// Optimise confirmation modal state
+bool g_optimiseConfirmOpen=false;
+bool g_optimiseRestorePoint=true; // default checked - safer default
+bool g_optimiseRunning=false;
+bool g_optimiseDecisionPending=false; // true while waiting on user's continue/cancel choice after a restore-point failure
+bool g_optimiseUserCancelled=false;
+std::wstring g_optimiseStatus;
+int g_optimiseRestoreResult=0; // 0=not attempted, 1=succeeded, 2=failed
+static const wchar_t* UPDATE_DOWNLOAD_URL = L"https://github.com/vernoh/wrathic/releases/latest";
+
+// Shared geometry for the lock overlay card - computed once here so the
+// painter and the click hit-test always agree, instead of duplicating
+// magic numbers in two places.
+struct LockLayout{ int cardX,cardY,cardW,cardH,iconCx,iconCy; RECT titleRect,subtitleRect,btnRect,footerRect; };
+static LockLayout computeLockLayout(int W,int H){
+    LockLayout L{};
+    bool hasBtn=!g_lockButtonText.empty();
+    bool hasFooter=!g_lockFooter.empty();
+    L.cardW=std::min(300,W-64);
+
+    // Sequential vertical flow, all gaps explicit and generous - the old
+    // layout had titleRect starting at the exact same pixel as the icon
+    // body's bottom edge (zero gap), which is why it looked cramped.
+    int iconCyRel=60;             // icon centre, relative to card top
+    int iconBodyBottomRel=iconCyRel+34;
+    int titleTopRel=iconBodyBottomRel+16;   // icon -> title
+    int titleH=26;
+    int subTopRel=titleTopRel+titleH+8;     // title -> subtitle
+    int subH=40;
+    int y=subTopRel+subH;
+
+    int btnTopRel=0, footerTopRel=0;
+    if(hasBtn){ y+=20; btnTopRel=y; y+=38; }              // subtitle/btn gap -> button
+    if(hasFooter){ y+=(hasBtn?12:18); footerTopRel=y; y+=16; } // -> footer
+    y+=hasBtn||hasFooter?16:22;                            // bottom padding
+
+    L.cardH=y;
+    L.cardX=(W-L.cardW)/2; L.cardY=(H-L.cardH)/2;
+    L.iconCx=L.cardX+L.cardW/2; L.iconCy=L.cardY+iconCyRel;
+    L.titleRect={L.cardX+16,L.cardY+titleTopRel,L.cardX+L.cardW-16,L.cardY+titleTopRel+titleH};
+    L.subtitleRect={L.cardX+22,L.cardY+subTopRel,L.cardX+L.cardW-22,L.cardY+subTopRel+subH};
+    int bw=180;
+    L.btnRect=hasBtn?RECT{L.cardX+(L.cardW-bw)/2,L.cardY+btnTopRel,L.cardX+(L.cardW-bw)/2+bw,L.cardY+btnTopRel+38}:RECT{0,0,0,0};
+    L.footerRect=hasFooter?RECT{L.cardX+16,L.cardY+footerTopRel,L.cardX+L.cardW-16,L.cardY+footerTopRel+16}:RECT{0,0,0,0};
+    return L;
+}
+
 // Forward declarations needed by checkForUpdate
 std::string githubGet(const char* path);
-void showToast(const wchar_t* msg, COLORREF col);
+enum ToastIcon { TOAST_NONE=0, TOAST_CHECK=1 };
+void showToast(const wchar_t* msg, COLORREF col, ToastIcon icon=TOAST_NONE);
+void showSuccessToast(const wchar_t* msg);
 
 // Synchronous startup version check - blocks if outdated
 // Parse version string "vX.Y.Z" into comparable integer X*10000+Y*100+Z
@@ -12957,7 +13173,7 @@ static int parseVer(const wchar_t* v){
 
 bool checkVersionBlocking(){
     LOG_INFO(L"Checking version...");
-    std::string resp=githubGet("/repos/vernoh/pulsekps/releases/latest");
+    std::string resp=githubGet("/repos/vernoh/wrathic/releases/latest");
     if(resp.empty()){ LOG_ERR(L"Could not reach update server - allowing launch"); return true; }
     const char* tag=strstr(resp.c_str(),"tag_name");
     if(!tag) return true;
@@ -12973,26 +13189,39 @@ bool checkVersionBlocking(){
     int localV=parseVer(APP_VERSION);
     int remoteV=parseVer(wver);
 
+    // Diagnostic: always logged so a false lockout can be checked against
+    // the log file - if you're on an unreleased/ahead build and still get
+    // locked, these are the two numbers that decide it. localV >= remoteV
+    // is the only condition that allows launch; if it's blocking despite
+    // your local version looking newer, the values below will show exactly
+    // what was compared (likely APP_VERSION wasn't bumped past the tag
+    // that's actually published as "latest" on GitHub).
+    wchar_t diag[160];
+    swprintf(diag,160,L"Version check: local=%ls (%d)  latest release=%ls (%d)",APP_VERSION,localV,wver,remoteV);
+    LOG_INFO(diag);
+
     // Only block if local is strictly OLDER than GitHub release
     // If local is newer (unreleased build) or equal, allow through
     if(localV>=remoteV) return true;
 
-    // Local is older - block and redirect to download
-    wchar_t msg[256];
-    swprintf(msg,256,
-        L"wrathic requires an update before use.\n\n"
-        L"Your version:   %s\n"
-        L"Latest version: %s\n\n"
-        L"Click OK to open the download page.",
-        APP_VERSION, wver);
-    MessageBoxW(NULL,msg,L"Update Required",MB_OK|MB_ICONWARNING|MB_SYSTEMMODAL);
-    ShellExecuteW(NULL,L"open",L"https://github.com/vernoh/pulsekps/releases/latest",NULL,NULL,SW_SHOW);
+    // Local is older - lock the app into the in-window "update required"
+    // overlay (rendered by paintMain) instead of a separate MessageBox popup.
+    latestVersion=std::wstring(wver);
+    g_lockKind=LOCK_UPDATE;
+    g_lockTitle=L"Update Required";
+    wchar_t sub[160];
+    swprintf(sub,160,L"You're running %ls — the latest version is %ls",APP_VERSION,wver);
+    g_lockSubtitle=sub;
+    g_lockButtonText=L"Get the Latest Version";
+    g_lockRedirectUrl=UPDATE_DOWNLOAD_URL;
+    g_lockFooter=L"wrathic will unlock automatically once updated";
+    if(hwndOverlay&&IsWindow(hwndOverlay)){DestroyWindow(hwndOverlay);hwndOverlay=NULL;}
     return false;
 }
 
 void checkForUpdate() {
     LOG_INFO(L"Checking for updates...");
-    std::string resp = githubGet("/repos/vernoh/pulsekps/releases/latest");
+    std::string resp = githubGet("/repos/vernoh/wrathic/releases/latest");
     if(resp.empty()){LOG_ERR(L"Update server not reachable");return;}
     const char* tag = strstr(resp.c_str(),"tag_name");
     if(!tag){LOG_ERR(L"Update check failed - bad response");return;}
@@ -13005,9 +13234,14 @@ void checkForUpdate() {
     wchar_t wver[32]={};
     MultiByteToWideChar(CP_ACP,0,ver,-1,wver,32);
     latestVersion=std::wstring(wver);
-    if(latestVersion!=std::wstring(APP_VERSION)){
+    // Compare by parsed version number, not raw string equality - a local
+    // unreleased/dev build (e.g. ahead of the last published GitHub release)
+    // must not be reported as "update available".
+    int localV=parseVer(APP_VERSION);
+    int remoteV=parseVer(wver);
+    if(remoteV>localV){
         wchar_t msg[128];
-        swprintf(msg,128,L"Update available: %s (current: %s)",wver,APP_VERSION);
+        swprintf(msg,128,L"Update available: %ls (current: %ls)",wver,APP_VERSION);
         LOG_OK(msg);
         if(hwndMain&&IsWindow(hwndMain)){
             std::wstring t=L"Update available: "; t+=wver;
@@ -13107,6 +13341,65 @@ void loadAppIcon(){
     if(!gAppIcon) gAppIcon=LoadIcon(NULL,IDI_APPLICATION);
 }
 
+// Custom cursor: a soft glowing white circle, replacing the system arrow.
+// Built as a real 32bpp ARGB cursor (per-pixel alpha radial falloff) rather
+// than a plain filled circle, so it actually reads as a soft "glow" instead
+// of a hard-edged dot.
+HCURSOR createGlowCursor(){
+    const int SZ=32;
+    BITMAPV5HEADER bi={};
+    bi.bV5Size=sizeof(BITMAPV5HEADER);
+    bi.bV5Width=SZ; bi.bV5Height=-SZ; // top-down
+    bi.bV5Planes=1; bi.bV5BitCount=32;
+    bi.bV5Compression=BI_BITFIELDS;
+    bi.bV5RedMask=0x00FF0000; bi.bV5GreenMask=0x0000FF00;
+    bi.bV5BlueMask=0x000000FF; bi.bV5AlphaMask=0xFF000000;
+
+    void* bits=nullptr;
+    HDC screenDC=GetDC(NULL);
+    HBITMAP colorBmp=CreateDIBSection(screenDC,(BITMAPINFO*)&bi,DIB_RGB_COLORS,&bits,NULL,0);
+    ReleaseDC(NULL,screenDC);
+    if(!colorBmp||!bits) return NULL;
+
+    unsigned char* px=(unsigned char*)bits; // BGRA
+    float cx=SZ/2.0f-0.5f, cy=SZ/2.0f-0.5f;
+    float coreR=1.6f, glowR=7.0f;
+    for(int y=0;y<SZ;y++){
+        for(int x=0;x<SZ;x++){
+            float dx=x-cx, dy=y-cy;
+            float dist=sqrtf(dx*dx+dy*dy);
+            float alpha;
+            if(dist<=coreR) alpha=1.0f;
+            else if(dist>=glowR) alpha=0.0f;
+            else alpha=1.0f-(dist-coreR)/(glowR-coreR);
+            alpha=alpha*alpha; // ease-out falloff, softer edge
+            unsigned char a=(unsigned char)(alpha*255.0f);
+            unsigned char* p=px+(y*SZ+x)*4;
+            p[0]=255;p[1]=255;p[2]=255;p[3]=a; // premultiplied-equivalent since colour is pure white
+        }
+    }
+
+    HBITMAP maskBmp=CreateBitmap(SZ,SZ,1,1,NULL);
+    {
+        HDC mdc=CreateCompatibleDC(NULL);
+        HBITMAP old=(HBITMAP)SelectObject(mdc,maskBmp);
+        RECT full={0,0,SZ,SZ};
+        FillRect(mdc,&full,(HBRUSH)GetStockObject(BLACK_BRUSH));
+        SelectObject(mdc,old); DeleteDC(mdc);
+    }
+
+    ICONINFO ii={};
+    ii.fIcon=FALSE; // cursor, not icon
+    ii.xHotspot=SZ/2; ii.yHotspot=SZ/2; // hotspot at centre of the glow
+    ii.hbmMask=maskBmp; ii.hbmColor=colorBmp;
+    HCURSOR cur=CreateIconIndirect(&ii);
+
+    DeleteObject(colorBmp); DeleteObject(maskBmp);
+    return cur;
+}
+
+HCURSOR gGlowCursor=NULL;
+
 HICON getSmallIcon(){
     HICON small = (HICON)CreateIconFromResourceEx(
         (PBYTE)LOGO_16_PNG, LOGO_16_PNG_LEN,
@@ -13184,8 +13477,8 @@ std::string githubGet(const char* path){
 }
 
 // ===================== LICENSE =====================
-void saveLicense(const std::wstring& k){std::wofstream f(exePath(LICENSE_FILE).c_str());if(f.is_open())f<<k;}
-std::wstring loadLicense(){std::wifstream f(exePath(LICENSE_FILE).c_str());if(!f.is_open())return L"";std::wstring k;std::getline(f,k);return k;}
+void saveLicense(const std::wstring& k){ regSetString(L"LicenseKey",k); }
+std::wstring loadLicense(){ return regGetString(L"LicenseKey",L""); }
 
 // Returns: -1=network error, 0=invalid, 1=valid+match, 2=valid+just activated
 int validateLicense(const std::wstring& key, const std::wstring& hwid) {
@@ -13215,7 +13508,7 @@ int validateLicense(const std::wstring& key, const std::wstring& hwid) {
     bool match =resp.find("\"hwid\":\""+wtos(hwid)+"\"")!=std::string::npos;
     if(noHWID){
         std::wstring up=L"/rest/v1/licenses?license_key=eq."+key;
-        httpCall(up.c_str(),"{\"hwid\":\""+wtos(hwid)+"\",\"activated_at\":\"now()\"}",SERVICE_KEY_STR(),"PATCH");
+        httpCall(up.c_str(),"{\"hwid\":\""+wtos(hwid)+"\",\"activated_at\":\"now()\"}",SUPABASE_ANON_STR(),"PATCH");
         LOG_OK(isTrial?L"Trial activated":L"License activated");
         return 2;
     }
@@ -13250,6 +13543,8 @@ std::wstring vkToString(int vk){
 }
 
 // ===================== MACRO =====================
+HWND gRobloxHwnd=NULL;
+
 bool checkRoblox(){
     HWND fg=GetForegroundWindow();
     if(!fg){ return false; }
@@ -13257,7 +13552,7 @@ bool checkRoblox(){
     // Check foreground window title contains "Roblox"
     wchar_t t[256]={};
     GetWindowText(fg,t,256);
-    if(wcsstr(t,L"Roblox")){ return true; }
+    if(wcsstr(t,L"Roblox")){ gRobloxHwnd=fg; return true; }
 
     // Fallback: check foreground window belongs to RobloxPlayerBeta.exe process
     DWORD pid=0;
@@ -13278,6 +13573,7 @@ bool checkRoblox(){
         } while(Process32NextW(hSnap,&pe));
     }
     CloseHandle(hSnap);
+    if(found) gRobloxHwnd=fg;
     return found;
 }
 
@@ -13296,6 +13592,33 @@ void rebuildInputBuf() {
     }
 }
 
+static inline bool isMouseVk(int vk){ return vk==VK_LBUTTON||vk==VK_RBUTTON||vk==VK_MBUTTON||vk==VK_XBUTTON1||vk==VK_XBUTTON2; }
+
+// Supplementary click path for mouse buttons only. SendInput's mouse events
+// are delivered to whichever window is under the OS cursor on screen -
+// unlike keyboard SendInput, which goes to whichever window has focus. If
+// the cursor isn't sitting over the Roblox window at the moment a mouse
+// button fires (e.g. it's resting over wrathic's own UI), the SendInput
+// click has nowhere effective to land in-game even though Roblox is
+// focused. This posts the click directly to the Roblox window instead,
+// using the cursor's current position translated to that window's client
+// coordinates, so it lands correctly regardless of what's on top on screen.
+static void postMouseToRoblox(int vk,bool down){
+    if(!gRobloxHwnd||!IsWindow(gRobloxHwnd)) return;
+    POINT pt; GetCursorPos(&pt);
+    ScreenToClient(gRobloxHwnd,&pt);
+    LPARAM lp=MAKELPARAM((short)pt.x,(short)pt.y);
+    UINT msg; WPARAM wp;
+    switch(vk){
+        case VK_RBUTTON:   msg=down?WM_RBUTTONDOWN:WM_RBUTTONUP; wp=MK_RBUTTON; break;
+        case VK_MBUTTON:   msg=down?WM_MBUTTONDOWN:WM_MBUTTONUP; wp=MK_MBUTTON; break;
+        case VK_XBUTTON1:  msg=down?WM_XBUTTONDOWN:WM_XBUTTONUP; wp=MAKEWPARAM(MK_XBUTTON1,XBUTTON1); break;
+        case VK_XBUTTON2:  msg=down?WM_XBUTTONDOWN:WM_XBUTTONUP; wp=MAKEWPARAM(MK_XBUTTON2,XBUTTON2); break;
+        default:           msg=down?WM_LBUTTONDOWN:WM_LBUTTONUP; wp=MK_LBUTTON; break;
+    }
+    PostMessage(gRobloxHwnd,msg,wp,lp);
+}
+
 // Build INPUT structs for a single key (down + up)
 static void buildKeyInputs(int vk, INPUT* out) {
     if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) {
@@ -13303,6 +13626,10 @@ static void buildKeyInputs(int vk, INPUT* out) {
         DWORD up = (vk==VK_RBUTTON)?MOUSEEVENTF_RIGHTUP  :(vk==VK_MBUTTON)?MOUSEEVENTF_MIDDLEUP  :MOUSEEVENTF_LEFTUP;
         out[0]={};out[0].type=INPUT_MOUSE;out[0].mi.dwFlags=dn;
         out[1]={};out[1].type=INPUT_MOUSE;out[1].mi.dwFlags=up;
+    } else if (vk == VK_XBUTTON1 || vk == VK_XBUTTON2) {
+        WORD xb=(vk==VK_XBUTTON1)?XBUTTON1:XBUTTON2;
+        out[0]={};out[0].type=INPUT_MOUSE;out[0].mi.dwFlags=MOUSEEVENTF_XDOWN;out[0].mi.mouseData=xb;
+        out[1]={};out[1].type=INPUT_MOUSE;out[1].mi.dwFlags=MOUSEEVENTF_XUP;  out[1].mi.mouseData=xb;
     } else {
         UINT sc=MapVirtualKey(vk,MAPVK_VK_TO_VSC);
         out[0]={};out[0].type=INPUT_KEYBOARD;out[0].ki.wScan=(WORD)sc;out[0].ki.dwFlags=KEYEVENTF_SCANCODE;
@@ -13314,6 +13641,7 @@ void sendKey(int vk) {
     INPUT in[2]{};
     buildKeyInputs(vk, in);
     SendInput(2, in, sizeof(INPUT));
+    if(isMouseVk(vk)){ postMouseToRoblox(vk,true); postMouseToRoblox(vk,false); }
     keypressCount++;
 }
 
@@ -13359,6 +13687,7 @@ DWORD WINAPI macroWorkerThread(LPVOID) {
     // Pre-build input buffer immediately - no ramp-up
     std::vector<int> cachedKeys;
     std::vector<INPUT> downs, ups;
+    std::vector<int> cachedMouseKeys;
     int cachedKps = 0;
 
     // Version counter - incremented when keys/kps change (avoids lock per tick)
@@ -13371,11 +13700,13 @@ DWORD WINAPI macroWorkerThread(LPVOID) {
         cachedKps = std::max(1, kps.load());
         size_t n = cachedKeys.size();
         downs.resize(n); ups.resize(n);
+        cachedMouseKeys.clear();
         INPUT tmp[2];
         for (size_t i = 0; i < n; i++) {
             buildKeyInputs(cachedKeys[i], tmp);
             downs[i] = tmp[0];
             ups[i]   = tmp[1];
+            if(isMouseVk(cachedKeys[i])) cachedMouseKeys.push_back(cachedKeys[i]);
         }
     };
 
@@ -13421,6 +13752,8 @@ DWORD WINAPI macroWorkerThread(LPVOID) {
         // Fire: all DOWNs atomically then all UPs atomically
         SendInput((UINT)downs.size(), downs.data(), sizeof(INPUT));
         SendInput((UINT)ups.size(),   ups.data(),   sizeof(INPUT));
+        for(int mvk:cachedMouseKeys) postMouseToRoblox(mvk,true);
+        for(int mvk:cachedMouseKeys) postMouseToRoblox(mvk,false);
         keypressCount += (int)downs.size();
 
         // Precise wait: high-res timer for bulk + QPC spin for last ~0.5ms
@@ -13491,13 +13824,15 @@ void captureThread(bool isHotkey){
                     hotkeyVK=vk;capturingHotkey=false;
                     std::wstring msg=L"Hotkey set to: "+vkToString(vk);
                     LOG_OK(msg.c_str());
+                    showSuccessToast(msg.c_str());
                 }else{
                     EnterCriticalSection(&keyListCS);
                     keysToSend.push_back(vk);
                     LeaveCriticalSection(&keyListCS);
                     capturingKey=false;
-                    std::wstring msg=L"Key added to spam list: "+vkToString(vk);
+                    std::wstring msg=L"Key added: "+vkToString(vk);
                     LOG_OK(msg.c_str());
+                    showSuccessToast(msg.c_str());
                 }
                 InvalidateRect(hwndMain,NULL,FALSE);
                 return;
@@ -13656,7 +13991,7 @@ void resourceThread(){
         memUsageKB = (SIZE_T)((ms.ullTotalPhys - ms.ullAvailPhys) / 1024);
 
         // Process CPU (macro's own usage)
-        static FILETIME prevPK={},prevPU={},prevPCreate={},prevPExit={};
+        static FILETIME prevPK={},prevPU={};
         HANDLE hProc=GetCurrentProcess();
         FILETIME pk,pu,pCreate,pExit;
         if(GetProcessTimes(hProc,&pCreate,&pExit,&pk,&pu)){
@@ -13679,17 +14014,30 @@ void resourceThread(){
                 }
 
 
-        // Disk I/O via DeviceIoControl
-        {static LONGLONG prevR=0,prevW=0;
-        HANDLE hD=CreateFileW(L"\\\\.\\C:",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
-        if(hD!=INVALID_HANDLE_VALUE){DISK_PERFORMANCE dp={};DWORD ret=0;
-            if(DeviceIoControl(hD,IOCTL_DISK_PERFORMANCE,NULL,0,&dp,sizeof(dp),&ret,NULL)){
-                LONGLONG cur=dp.BytesRead.QuadPart+dp.BytesWritten.QuadPart;
-                LONGLONG delta=cur-(prevR+prevW);
-                diskUsage=std::min((float)delta/(50.0f*1024*1024)*100.0f,100.0f);
-                prevR=dp.BytesRead.QuadPart;prevW=dp.BytesWritten.QuadPart;}
-            CloseHandle(hD);}
+        // Disk I/O via PDH (%Disk Time) - the old approach opened a raw
+        // \\.\C: volume handle via CreateFileW, which requires admin
+        // privileges. Since most users don't run the macro elevated, that
+        // handle silently failed every time and diskUsage never moved off
+        // its 0.0f initial value. PDH counters don't need elevation - same
+        // mechanism already used successfully for GPU stats below.
+        {static PDH_HQUERY diskQ=NULL; static PDH_HCOUNTER diskC=NULL;
+        static bool diskOk=false, diskFail=false;
+        if(!diskFail && !diskOk){
+            if(PdhOpenQuery(NULL,0,&diskQ)==ERROR_SUCCESS){
+                if(PdhAddEnglishCounterW(diskQ,L"\\PhysicalDisk(_Total)\\% Disk Time",0,&diskC)==ERROR_SUCCESS){
+                    PdhCollectQueryData(diskQ);
+                    diskOk=true;
+                } else diskFail=true;
+            } else diskFail=true;
         }
+        if(diskOk && diskQ){
+            if(PdhCollectQueryData(diskQ)==ERROR_SUCCESS){
+                PDH_FMT_COUNTERVALUE val;
+                if(PdhGetFormattedCounterValue(diskC,PDH_FMT_DOUBLE,NULL,&val)==ERROR_SUCCESS){
+                    diskUsage=std::min((float)val.doubleValue,100.0f);
+                }
+            }
+        }}
         // GPU via PDH — tries 3D engine first, falls back to all engines
         {static PDH_HQUERY gpuQ=NULL; static PDH_HCOUNTER gpuC=NULL;
         static bool gpuOk=false, gpuFail=false;
@@ -13721,7 +14069,7 @@ void resourceThread(){
                     auto* items=reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
                     DWORD sz2=sz;
                     PDH_STATUS st=PdhGetFormattedCounterArrayW(gpuC,PDH_FMT_DOUBLE,&sz2,&cnt,items);
-                    if(st==ERROR_SUCCESS || st==(PDH_STATUS)0x800007D2L){
+                    if(st==ERROR_SUCCESS){
                         double total=0;
                         for(DWORD i=0;i<cnt;i++)
                             if(items[i].FmtValue.CStatus==ERROR_SUCCESS)
@@ -13750,12 +14098,33 @@ void resourceThread(){
             int r=validateLicense(savedLicenseKey,machineHWID);
             if(r==0){
                 macroRunning=false;
-                showToast(L"License revoked. Contact support.",RGB(248,113,113));
-                LOG_ERR(L"License revoked - macro disabled");
+                g_lockKind=LOCK_LICENSE;
+                g_lockTitle=L"License Invalid";
+                g_lockSubtitle=L"Your license was deactivated or revoked. Contact support to continue.";
+                g_lockButtonText.clear(); g_lockRedirectUrl.clear(); // no known support URL to redirect to yet
+                g_lockFooter=L"Reach out on the wrathic Discord for help";
+                if(hwndOverlay&&IsWindow(hwndOverlay)){DestroyWindow(hwndOverlay);hwndOverlay=NULL;}
+                if(hwndMain&&IsWindow(hwndMain)) InvalidateRect(hwndMain,NULL,TRUE);
+                LOG_ERR(L"License revoked - app locked");
+            } else if(r==4){
+                macroRunning=false;
+                g_lockKind=LOCK_LICENSE;
+                g_lockTitle=L"Trial Expired";
+                g_lockSubtitle=L"Your free trial has ended. A license is required to keep using wrathic.";
+                g_lockButtonText.clear(); g_lockRedirectUrl.clear();
+                g_lockFooter=L"Reach out on the wrathic Discord for help";
+                if(hwndOverlay&&IsWindow(hwndOverlay)){DestroyWindow(hwndOverlay);hwndOverlay=NULL;}
+                if(hwndMain&&IsWindow(hwndMain)) InvalidateRect(hwndMain,NULL,TRUE);
+                LOG_ERR(L"Trial expired - app locked");
             } else if(r==3){
                 // HWID mismatch can happen if network adapters change (VPN, etc.)
                 // Log as info only - don't kill the macro
                 LOG_INFO(L"HWID check warning - if this persists contact support");
+            } else if((r==1||r==2) && g_lockKind==LOCK_LICENSE){
+                // License is valid again (e.g. reactivated) - clear the lock
+                g_lockKind=LOCK_NONE;
+                if(hwndMain&&IsWindow(hwndMain)) InvalidateRect(hwndMain,NULL,TRUE);
+                LOG_OK(L"License valid - app unlocked");
             }
         }
 
@@ -13792,6 +14161,13 @@ int benchmarkSystem(){
 // ===================== MEMORY CLEANER =====================
 std::wstring cleanRamStatus = L"";
 bool licCopied = false;
+
+// Custom KPS/ms entry - click the speed label to type an exact value
+// instead of only dragging the slider or picking a preset.
+bool g_kpsEditing=false;
+bool g_kpsEditIsMs=false; // false = typing a KPS value directly, true = typing ms-between-clicks
+std::wstring g_kpsEditBuffer;
+float licCopiedAlpha = 0.0f; // animated toward licCopied?1:0 each frame for a smooth fade
 DWORD licCopiedTick = 0;
 
 // NtSetSystemInformation for standby list flush
@@ -13818,7 +14194,7 @@ void cleanMemory(){
     wchar_t buf[512];
     swprintf(buf,512,L"System RAM: %zu MB total, %zu MB free before",totalMB,beforeMB);
     addLog(L"INFO",buf);
-    lg(L"INFO",L"[1/6] Trimming process working sets...",L"[1/6] Trimming...");
+    lg(L"INFO",L"[1/7] Trimming process working sets...",L"[1/7] Trimming...");
     SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
     {int trimmed=0,failed=0;
     DWORD ownPid=GetCurrentProcessId();
@@ -13834,11 +14210,11 @@ void cleanMemory(){
         } while(Process32Next(hSnap,&pe));
         CloseHandle(hSnap);
     }
-    swprintf(buf,512,L"[1/6] Trimmed %d processes (%d skipped)",trimmed,failed);
-    lg(L"OK",buf,L"[1/6] Done");}
+    swprintf(buf,512,L"[1/7] Trimmed %d processes (%d skipped)",trimmed,failed);
+    lg(L"OK",buf,L"[1/7] Done");}
     SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_NORMAL);
     Sleep(60);
-    lg(L"INFO",L"[2/6] Throttling background bloat...",L"[2/6] Throttling...");
+    lg(L"INFO",L"[2/7] Throttling background bloat...",L"[2/7] Throttling...");
     {int throttled=0;
     HANDLE hSnap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
     if(hSnap!=INVALID_HANDLE_VALUE){
@@ -13848,7 +14224,7 @@ void cleanMemory(){
                 if(_wcsicmp(pe.szExeFile,THROTTLE_PROCS[i])==0){
                     HANDLE h=OpenProcess(PROCESS_SET_INFORMATION,FALSE,pe.th32ProcessID);
                     if(h){SetPriorityClass(h,IDLE_PRIORITY_CLASS);
-                    swprintf(buf,512,L"  Throttled %s",pe.szExeFile);
+                    swprintf(buf,512,L"  Throttled %ls",pe.szExeFile);
                     addLog(L"OK",buf);throttled++;CloseHandle(h);}
                     break;
                 }
@@ -13856,10 +14232,10 @@ void cleanMemory(){
         } while(Process32Next(hSnap,&pe));
         CloseHandle(hSnap);
     }
-    swprintf(buf,512,L"[2/6] Throttled %d bloat processes",throttled);
-    lg(L"OK",buf,L"[2/6] Done");}
+    swprintf(buf,512,L"[2/7] Throttled %d bloat processes",throttled);
+    lg(L"OK",buf,L"[2/7] Done");}
     Sleep(60);
-    lg(L"INFO",L"[3/6] Setting High Performance power plan...",L"[3/6] Power plan...");
+    lg(L"INFO",L"[3/7] Setting High Performance power plan...",L"[3/7] Power plan...");
     {SHELLEXECUTEINFOW sei={}; sei.cbSize=sizeof(sei);
     sei.fMask=SEE_MASK_NOCLOSEPROCESS|SEE_MASK_NO_CONSOLE;
     sei.lpVerb=L"open"; sei.lpFile=L"powercfg";
@@ -13867,14 +14243,14 @@ void cleanMemory(){
     sei.nShow=SW_HIDE;
     bool ok=ShellExecuteExW(&sei)&&(INT_PTR)sei.hInstApp>32;
     if(ok&&sei.hProcess){WaitForSingleObject(sei.hProcess,2000);CloseHandle(sei.hProcess);}
-    lg(L"OK",ok?L"[3/6] High Performance set":L"[3/6] Needs admin",ok?L"[3/6] Done":L"[3/6] Skipped");}
+    lg(L"OK",ok?L"[3/7] High Performance set":L"[3/7] Needs admin",ok?L"[3/7] Done":L"[3/7] Skipped");}
     Sleep(40);
-    lg(L"INFO",L"[4/6] Flushing DNS + disabling GameBar...",L"[4/6] DNS + GameBar...");
+    lg(L"INFO",L"[4/7] Flushing DNS + disabling GameBar...",L"[4/7] DNS + GameBar...");
     {bool dnsOk=false;
     typedef BOOL(WINAPI* DnsFlush_t)();
     HMODULE hDns=LoadLibraryW(L"dnsapi.dll");
     if(hDns){DnsFlush_t fn2=(DnsFlush_t)GetProcAddress(hDns,"DnsFlushResolverCache");
-        if(fn2&&fn2()) dnsOk=true; FreeLibrary(hDns);}
+        if(fn2&&fn2()){ dnsOk=true; } FreeLibrary(hDns);}
     addLog(L"OK",dnsOk?L"  DNS flushed":L"  DNS skipped");
     HKEY hk; DWORD v=0;
     if(RegOpenKeyExW(HKEY_CURRENT_USER,L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR",0,KEY_SET_VALUE,&hk)==ERROR_SUCCESS){
@@ -13883,9 +14259,9 @@ void cleanMemory(){
     if(RegOpenKeyExW(HKEY_CURRENT_USER,L"System\\GameConfigStore",0,KEY_SET_VALUE,&hk)==ERROR_SUCCESS){
         RegSetValueExW(hk,L"GameDVR_Enabled",0,REG_DWORD,(BYTE*)&v,4);RegCloseKey(hk);
         addLog(L"OK",L"  GameDVR disabled");}
-    lg(L"OK",L"[4/6] DNS + GameBar done",L"[4/6] Done");}
+    lg(L"OK",L"[4/7] DNS + GameBar done",L"[4/7] Done");}
     Sleep(40);
-    lg(L"INFO",L"[5/6] Flushing memory page lists...",L"[5/6] Page lists...");
+    lg(L"INFO",L"[5/7] Flushing memory page lists...",L"[5/7] Page lists...");
     {HANDLE hToken=NULL;
     if(OpenProcessToken(GetCurrentProcess(),TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,&hToken)){
         TOKEN_PRIVILEGES tp={}; LookupPrivilegeValue(NULL,SE_PROF_SINGLE_PROCESS_NAME,&tp.Privileges[0].Luid);
@@ -13893,22 +14269,108 @@ void cleanMemory(){
         AdjustTokenPrivileges(hToken,FALSE,&tp,0,NULL,NULL); CloseHandle(hToken);}
     NtSetSysInfo_t fn3=(NtSetSysInfo_t)GetProcAddress(GetModuleHandle(L"ntdll.dll"),"NtSetSystemInformation");
     if(fn3){UINT c=3;fn3(80,&c,4);c=4;fn3(80,&c,4);
-        lg(L"OK",L"[5/6] Page lists flushed",L"[5/6] Done");}
-    else lg(L"INFO",L"[5/6] Skipped (needs admin)",L"[5/6] Skipped");}
-    Sleep(500);
-    lg(L"INFO",L"[6/6] Measuring results...",L"[6/6] Measuring...");
+        lg(L"OK",L"[5/7] Page lists flushed",L"[5/7] Done");}
+    else lg(L"INFO",L"[5/7] Skipped (needs admin)",L"[5/7] Skipped");}
+    Sleep(40);
+    lg(L"INFO",L"[6/7] Clearing stale temp files...",L"[6/7] Temp files...");
+    SIZE_T tempFreedBytes=0; int tempDeleted=0;
+    {wchar_t tempPath[MAX_PATH]={};
+    DWORD tlen=GetTempPathW(MAX_PATH,tempPath);
+    if(tlen>0&&tlen<MAX_PATH){
+        std::wstring pattern=std::wstring(tempPath)+L"*";
+        WIN32_FIND_DATAW fd={};
+        HANDLE hFind=FindFirstFileW(pattern.c_str(),&fd);
+        if(hFind!=INVALID_HANDLE_VALUE){
+            FILETIME nowFt; SYSTEMTIME nowSt; GetSystemTime(&nowSt); SystemTimeToFileTime(&nowSt,&nowFt);
+            ULARGE_INTEGER nowU; nowU.LowPart=nowFt.dwLowDateTime; nowU.HighPart=nowFt.dwHighDateTime;
+            do{
+                if(wcscmp(fd.cFileName,L".")==0||wcscmp(fd.cFileName,L"..")==0) continue;
+                if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
+                // Only touch files untouched for 24h+ - never delete anything
+                // actively in use right now (also skips files locked by
+                // another process, which DeleteFile below just silently fails on)
+                ULARGE_INTEGER wU; wU.LowPart=fd.ftLastWriteTime.dwLowDateTime; wU.HighPart=fd.ftLastWriteTime.dwHighDateTime;
+                if(nowU.QuadPart-wU.QuadPart<864000000000ULL) continue;
+                ULARGE_INTEGER sz; sz.LowPart=fd.nFileSizeLow; sz.HighPart=fd.nFileSizeHigh;
+                std::wstring full=std::wstring(tempPath)+fd.cFileName;
+                if(DeleteFileW(full.c_str())){ tempFreedBytes+=sz.QuadPart; tempDeleted++; }
+            } while(FindNextFileW(hFind,&fd));
+            FindClose(hFind);
+        }
+    }
+    swprintf(buf,512,L"[6/7] Cleared %d temp files (%.1f MB)",tempDeleted,tempFreedBytes/1024.0/1024.0);
+    lg(L"OK",buf,L"[6/7] Done");}
+    Sleep(40);
+    lg(L"INFO",L"[7/7] Measuring results...",L"[7/7] Measuring...");
     GlobalMemoryStatusEx(&ms);
     SIZE_T afterMB=ms.ullAvailPhys/1024/1024;
     SIZE_T freed=afterMB>beforeMB?afterMB-beforeMB:0;
     swprintf(buf,512,L"RAM: %zu MB -> %zu MB free (+%zu MB)",beforeMB,afterMB,freed);
     addLog(L"OK",buf);
     addLog(L"OK",L"-------- Optimisation complete --------");
-    swprintf(buf,512,L"+ Freed %zu MB RAM  (%zu -> %zu MB free)\n+ Bloat throttled, DNS cleared, GameBar off",freed,beforeMB,afterMB);
+    swprintf(buf,512,L"+ Freed %zu MB RAM  (%zu -> %zu MB free)\n+ %d temp files cleared (%.1f MB)\n+ Bloat throttled, DNS cleared, GameBar off",freed,beforeMB,afterMB,tempDeleted,tempFreedBytes/1024.0/1024.0);
     cleanRamStatus=buf; InvalidateRect(hwndMain,NULL,FALSE);
+    showSuccessToast(L"Optimisation complete");
+}
+
+// Runs on a background thread from the Optimise confirmation modal. Creating
+// a restore point can take a few seconds and Windows only allows one every
+// ~24h by default - if it fails or is skipped, optimisation still proceeds.
+void runOptimiseFlow(bool withRestorePoint){
+    g_optimiseRunning=true;
+    g_optimiseDecisionPending=false;
+    g_optimiseUserCancelled=false;
+    g_optimiseRestoreResult=0;
+    g_optimiseStatus=L"Preparing...";
+    cleanRamStatus.clear();
+    InvalidateRect(hwndMain,NULL,FALSE);
+
+    if(withRestorePoint){
+        g_optimiseStatus=L"Creating System Restore point...";
+        InvalidateRect(hwndMain,NULL,FALSE);
+        LOG_INFO(L"Creating System Restore point...");
+        RESTOREPOINTINFOW rp={};
+        rp.dwEventType=BEGIN_SYSTEM_CHANGE;
+        rp.dwRestorePtType=MODIFY_SETTINGS;
+        wcsncpy(rp.szDescription,L"wrathic - before optimise",MAX_DESC_W-1);
+        STATEMGRSTATUS st={};
+        BOOL ok=SRSetRestorePointW(&rp,&st);
+        g_optimiseRestoreResult = ok?1:2;
+        if(ok){
+            LOG_OK(L"System Restore point created");
+        } else {
+            LOG_ERR(L"Could not create Restore point (Windows limits these to once/24h)");
+            // Don't silently proceed - pause here and let the user decide,
+            // per request. The modal shows Continue/Cancel while this waits.
+            g_optimiseDecisionPending=true;
+            g_optimiseStatus=L"Restore point failed - continue anyway?";
+            InvalidateRect(hwndMain,NULL,FALSE);
+            while(g_optimiseDecisionPending){ Sleep(50); }
+            if(g_optimiseUserCancelled){
+                LOG_INFO(L"Optimisation cancelled by user after restore point failure");
+                g_optimiseRunning=false;
+                g_optimiseConfirmOpen=false;
+                InvalidateRect(hwndMain,NULL,FALSE);
+                return;
+            }
+        }
+    }
+
+    cleanMemory(); // updates g_optimiseStatus-visible cleanRamStatus through its own phases
+
+    std::wstring extra;
+    if(g_optimiseRestoreResult==1) extra=L"\n+ Restore point created successfully";
+    else if(g_optimiseRestoreResult==2) extra=L"\n! Restore point failed (skipped, optimisation still ran)";
+    cleanRamStatus += extra;
+
+    g_optimiseRunning=false;
+    g_optimiseConfirmOpen=false;
+    InvalidateRect(hwndMain,NULL,FALSE);
 }
 
 // ===================== SPLASH =====================
 HWND hwndSplash=NULL;
+void showSplash(HINSTANCE hInst); // forward decl - reused by WndProc's version toast click
 std::wstring splashMsg=L"Starting...";
 bool splashShowChangelog=false;
 int  splashChangelogScroll=0;
@@ -13918,7 +14380,12 @@ float g_splashVeloc       = 0.0f;   // spring velocity
 bool  g_splashDone        = false;  // triggers "hope you enjoy" phase
 float g_splashDoneAlpha   = 0.0f;   // fades in the enjoy text
 const wchar_t* CHANGELOG_TEXT =
-    L"wrathic v2.5.1\n"
+    L"wrathic v3.0.1\n"
+    L"====================\n\n"
+    // TODO: fill in what actually changed in this build before shipping -
+    // not auto-generating fake entries here.
+    L"\n"
+    L"v2.5.1\n"
     L"====================\n\n"
     L"NEW FEATURES\n"
     L"--------------------\n"
@@ -13946,131 +14413,110 @@ const wchar_t* CHANGELOG_TEXT =
     L"~ Fixed multiple click/toggle bugs\n"
     L"~ Reduced idle CPU usage";
 void drawRR(HDC,int,int,int,int,int,COLORREF,COLORREF,int,float);
+// Cached splash resources - previously reloaded from disk (icon) and
+// recreated (fonts) on every single WM_PAINT, which fired at ~60fps during
+// the whole startup sequence. That was pure per-frame waste since none of
+// these change between frames (fontIdx only changes if the user changes
+// settings, which can't happen while the splash is up).
+static HICON s_splashIcon = NULL;
+static int   s_splashIconSize = -1;
+static HFONT s_splashFontTitle = NULL; // 30pt bold - "wrathic" title
+static HFONT s_splashFontSmall = NULL; // 11pt - status/version/changelog body
+static HFONT s_splashFontEnjoy = NULL; // 22pt bold - "Hope you enjoy!"
+static HFONT s_splashFontMed   = NULL; // 13pt bold - changelog header
+static int   s_splashFontIdx   = -1;   // fontIdx these were built for
+
+static void ensureSplashFonts(){
+    if(s_splashFontTitle && s_splashFontIdx==fontIdx) return;
+    if(s_splashFontTitle){
+        DeleteObject(s_splashFontTitle); DeleteObject(s_splashFontSmall);
+        DeleteObject(s_splashFontEnjoy); DeleteObject(s_splashFontMed);
+    }
+    s_splashFontTitle=CreateFont(30,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+        DEFAULT_PITCH,FONT_NAMES[fontIdx]);
+    s_splashFontSmall=CreateFont(11,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+        DEFAULT_PITCH,FONT_NAMES[fontIdx]);
+    s_splashFontEnjoy=CreateFont(22,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+        DEFAULT_PITCH,FONT_NAMES[fontIdx]);
+    s_splashFontMed=CreateFont(13,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+        DEFAULT_PITCH,FONT_NAMES[fontIdx]);
+    s_splashFontIdx=fontIdx;
+}
+
+static HICON getSplashIcon(int size){
+    if(s_splashIcon && s_splashIconSize==size) return s_splashIcon;
+    if(s_splashIcon) DestroyIcon(s_splashIcon);
+    wchar_t ePath[MAX_PATH]={};
+    GetModuleFileNameW(NULL,ePath,MAX_PATH);
+    wchar_t* sl=wcsrchr(ePath,L'\\'); if(sl){sl[1]=0;wcscat(ePath,L"wrathic.ico");}
+    s_splashIcon=(HICON)LoadImage(NULL,ePath,IMAGE_ICON,size,size,LR_LOADFROMFILE);
+    if(!s_splashIcon) s_splashIcon=(HICON)LoadImage(GetModuleHandle(NULL),L"IDI_APPICON",IMAGE_ICON,size,size,0);
+    s_splashIconSize=size;
+    return s_splashIcon;
+}
+
+static void freeSplashResources(){
+    if(s_splashIcon){ DestroyIcon(s_splashIcon); s_splashIcon=NULL; s_splashIconSize=-1; }
+    if(s_splashFontTitle){
+        DeleteObject(s_splashFontTitle); DeleteObject(s_splashFontSmall);
+        DeleteObject(s_splashFontEnjoy); DeleteObject(s_splashFontMed);
+        s_splashFontTitle=s_splashFontSmall=s_splashFontEnjoy=s_splashFontMed=NULL;
+        s_splashFontIdx=-1;
+    }
+}
+
 LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_TIMER:
-        {float diff=g_splashProgress-g_splashDisplayProg;
-        g_splashVeloc=g_splashVeloc*0.72f+diff*0.055f;
-        g_splashDisplayProg+=diff*0.10f+g_splashVeloc;
-        g_splashDisplayProg=std::max(0.0f,std::min(g_splashDisplayProg,1.05f));
-        if(g_splashDone) g_splashDoneAlpha=std::min(1.0f,g_splashDoneAlpha+0.035f);}
+        if(!splashShowChangelog) updateVoidStars();
         InvalidateRect(hwnd,NULL,FALSE); return 0;
     case WM_CREATE: SetTimer(hwnd,1,16,NULL); return 0; // 60fps animation
-    case WM_DESTROY: KillTimer(hwnd,1); return 0;
+    case WM_DESTROY: KillTimer(hwnd,1); freeSplashResources(); return 0;
     case WM_PAINT:{
         PAINTSTRUCT ps; HDC hdc=BeginPaint(hwnd,&ps);
         RECT cr; GetClientRect(hwnd,&cr);
         int W=cr.right, H=cr.bottom;
+        ensureSplashFonts();
 
         // Offscreen buffer
         HDC mdc=CreateCompatibleDC(hdc);
         HBITMAP bmp=CreateCompatibleBitmap(hdc,W,H);
         HBITMAP ob=(HBITMAP)SelectObject(mdc,bmp);
 
-        // Background — very dark, near black
+        // Background — pure black, matching the Void theme
         HBRUSH bg=CreateSolidBrush(RGB(0,0,0)); FillRect(mdc,&cr,bg); DeleteObject(bg);
 
-        // Subtle red vignette at edges using a dark overlay
-        // Thin top accent line (red)
-        HPEN redPen=CreatePen(PS_SOLID,2,RGB(160,20,20));
-        HPEN oldPen=(HPEN)SelectObject(mdc,redPen);
-        MoveToEx(mdc,0,0,NULL); LineTo(mdc,W,0);
-        SelectObject(mdc,oldPen); DeleteObject(redPen);
-
         if(!splashShowChangelog){
-            // ── Icon ─────────────────────────────────────────────────────
-            int iconSize=112;
-            int ix=(W-iconSize)/2, iy=70;
-            // Load from exe dir — no LR_SHARED (blocks custom size)
-            {wchar_t ePath[MAX_PATH]={};
-            GetModuleFileNameW(NULL,ePath,MAX_PATH);
-            wchar_t* sl=wcsrchr(ePath,L'\\'); if(sl){sl[1]=0;wcscat(ePath,L"wrathic.ico");}
-            HICON hic=(HICON)LoadImage(NULL,ePath,IMAGE_ICON,iconSize,iconSize,LR_LOADFROMFILE);
-            if(!hic) hic=(HICON)LoadImage(GetModuleHandle(NULL),L"IDI_APPICON",IMAGE_ICON,iconSize,iconSize,0);
-            if(hic){DrawIconEx(mdc,ix,iy,hic,iconSize,iconSize,0,NULL,DI_NORMAL);DestroyIcon(hic);}}
+            // ── Void background (same drifting-stars background used by the
+            //    in-app Void theme) instead of icon + progress bar + status
+            //    text - this is now just a brief identity splash, not a
+            //    fake loading sequence. ─────────────────────────────────────
+            drawVoidStars(mdc,W,H);
 
-            // ── "wrathic" title ───────────────────────────────────────────
-            HFONT ft=CreateFont(30,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-                DEFAULT_PITCH,FONT_NAMES[fontIdx]);
             SetBkMode(mdc,TRANSPARENT);
-            SelectObject(mdc,ft);
-            SetTextColor(mdc,RGB(99,102,241));
-            RECT tr={0,iy+iconSize+10,W,iy+iconSize+48};
-            DrawText(mdc,L"wrathic",-1,&tr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            DeleteObject(ft);
+            SelectObject(mdc,s_splashFontTitle);
+            SetTextColor(mdc,RGB(230,230,240));
+            RECT tr={0,0,W,H};
+            DrawText(mdc,L"WRATHIC",-1,&tr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
-            HFONT fs2=CreateFont(11,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-                DEFAULT_PITCH,FONT_NAMES[fontIdx]);
-            SelectObject(mdc,fs2);
-
-            if(!g_splashDone){
-                // ── Status text ───────────────────────────────────────────
-                SetTextColor(mdc,RGB(65,65,85));
-                RECT sr={16,iy+iconSize+54,W-16,iy+iconSize+74};
-                DrawText(mdc,splashMsg.c_str(),-1,&sr,DT_CENTER|DT_TOP|DT_SINGLELINE);
-
-                // ── Progress bar (spring-animated) ────────────────────────
-                int bx=30, bw=W-60, by=H-52, bh=4;
-                float disp=std::max(0.0f,std::min(g_splashDisplayProg,1.0f));
-                // Track
-                {HBRUSH tb=CreateSolidBrush(RGB(18,18,22));
-                HPEN np2=(HPEN)GetStockObject(NULL_PEN);
-                HBRUSH ob2=(HBRUSH)SelectObject(mdc,tb);
-                HPEN op2=(HPEN)SelectObject(mdc,np2);
-                RoundRect(mdc,bx,by,bx+bw,by+bh,bh,bh);
-                SelectObject(mdc,ob2); SelectObject(mdc,op2);
-                DeleteObject(tb);}
-                // Fill
-                if(disp>0.002f){
-                    int fw=std::max(bh,(int)(bw*disp));
-                    HBRUSH fb=CreateSolidBrush(RGB(99,102,241));
-                    HPEN np2=(HPEN)GetStockObject(NULL_PEN);
-                    HBRUSH ob2=(HBRUSH)SelectObject(mdc,fb);
-                    HPEN op2=(HPEN)SelectObject(mdc,np2);
-                    RoundRect(mdc,bx,by,bx+fw,by+bh,bh,bh);
-                    SelectObject(mdc,ob2); SelectObject(mdc,op2);
-                    DeleteObject(fb);}
-                // Pct label
-                wchar_t pctBuf[8]; swprintf(pctBuf,8,L"%d%%",(int)(disp*100.0f));
-                SetTextColor(mdc,RGB(40,40,55));
-                RECT pr={0,H-48,W,H-34};
-                DrawText(mdc,pctBuf,-1,&pr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            } else {
-                // ── "Hope you enjoy!" fade in (larger) ───────────────────
-                int alpha=(int)(g_splashDoneAlpha*240.0f);
-                HFONT fej=CreateFont(22,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH,FONT_NAMES[fontIdx]);
-                SelectObject(mdc,fej);
-                SetTextColor(mdc,RGB(alpha*99/240,alpha*102/240,alpha*241/240));
-                RECT er={0,iy+iconSize+46,W,iy+iconSize+80};
-                DrawText(mdc,L"Hope you enjoy!",-1,&er,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-                DeleteObject(fej);
-            }
-
-            // Version — bottom right, very dim
-            SetTextColor(mdc,RGB(25,25,38));
+            // Version - bottom right, very dim
+            SelectObject(mdc,s_splashFontSmall);
+            SetTextColor(mdc,RGB(70,70,85));
             RECT vr={0,H-16,W-8,H-2};
             DrawText(mdc,APP_VERSION,-1,&vr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-            DeleteObject(fs2);
 
         } else {
             // ── Changelog screen ──────────────────────────────────────────
-            HFONT fm2=CreateFont(13,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-                DEFAULT_PITCH,FONT_NAMES[fontIdx]);
-            HFONT fs3=CreateFont(11,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-                DEFAULT_PITCH,FONT_NAMES[fontIdx]);
-
             HBRUSH hb=CreateSolidBrush(RGB(10,10,16));
             RECT hr2={0,0,W,44}; FillRect(mdc,&hr2,hb); DeleteObject(hb);
 
-            SelectObject(mdc,fm2); SetTextColor(mdc,RGB(99,102,241)); SetBkMode(mdc,TRANSPARENT);
+            SelectObject(mdc,s_splashFontMed); SetTextColor(mdc,RGB(99,102,241)); SetBkMode(mdc,TRANSPARENT);
             RECT hr3={14,0,W/2,44}; DrawText(mdc,L"wrathic",-1,&hr3,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            SelectObject(mdc,fs3); SetTextColor(mdc,RGB(60,60,80));
+            SelectObject(mdc,s_splashFontSmall); SetTextColor(mdc,RGB(60,60,80));
             RECT hr4={0,0,W-14,44}; DrawText(mdc,L"WHAT'S NEW",-1,&hr4,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
 
             HPEN lp2=CreatePen(PS_SOLID,1,RGB(99,102,241));
@@ -14080,7 +14526,7 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
             HRGN clip=CreateRectRgn(14,48,W-14,H-44);
             SelectClipRgn(mdc,clip);
-            SelectObject(mdc,fs3); SetTextColor(mdc,RGB(170,170,200));
+            SelectObject(mdc,s_splashFontSmall); SetTextColor(mdc,RGB(170,170,200));
             RECT ctr={14,48-splashChangelogScroll,W-14,48-splashChangelogScroll+2000};
             DrawText(mdc,CHANGELOG_TEXT,-1,&ctr,DT_LEFT|DT_TOP|DT_WORDBREAK);
             SelectClipRgn(mdc,NULL); DeleteObject(clip);
@@ -14094,13 +14540,12 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
             // Continue button
             drawRR(mdc,W/2-55,H-30,110,22,11,RGB(99,102,241),RGB(0,0,0),0,0.0f);
-            SelectObject(mdc,fs3); SetTextColor(mdc,RGB(255,255,255));
+            SelectObject(mdc,s_splashFontSmall); SetTextColor(mdc,RGB(255,255,255));
             RECT cont={W/2-55,H-30,W/2+55,H-8};
             DrawText(mdc,L"Continue",-1,&cont,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
             SetTextColor(mdc,RGB(40,40,55));
             RECT sh2={0,H-40,W/2-60,H}; DrawText(mdc,L"scroll to read",-1,&sh2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            DeleteObject(fm2); DeleteObject(fs3);
         }
 
         BitBlt(hdc,0,0,W,H,mdc,0,0,SRCCOPY);
@@ -14219,16 +14664,15 @@ void drawSlider(HDC hdc,int x,int y,int w,int val,int minV,int maxV){
 }
 
 // ===================== LAYOUT =====================
-struct Layout{int W,pad,cw,yStatus,yHotkey,yMode,yKeys,yKps,yVouch;};
+struct Layout{int W,pad,cw,yHotkey,yMode,yKeys,yKps,yVouch;};
 Layout getLayout(HWND hwnd){
     RECT cr;GetClientRect(hwnd,&cr);
     Layout l;l.W=cr.right;l.pad=14;l.cw=l.W-l.pad*2;
     int off=-mainScrollPos; // scroll offset
-    l.yStatus      =70 +off;
-    l.yHotkey      =l.yStatus +74;
+    l.yHotkey      =70 +off;
     l.yMode        =l.yHotkey +68;
     l.yKeys        =l.yMode   +68;
-    l.yKps         =l.yKeys   +108;
+    l.yKps         =l.yKeys   +124;
     l.yVouch       =l.yKps    +102;
     mainTotalHeight=l.yVouch+54+mainScrollPos; // last card + padding
     return l;
@@ -14239,8 +14683,8 @@ int hitTest(HWND hwnd,int mx,int my){
     if(mx>=p+108&&mx<=p+224&&my>=l.yHotkey+22&&my<=l.yHotkey+50) return ID_SET_HOTKEY;
     if(mx>=p+14 &&mx<=p+112&&my>=l.yMode+22  &&my<=l.yMode+50)   return ID_MODE_TOGGLE;
     if(mx>=p+120&&mx<=p+218&&my>=l.yMode+22  &&my<=l.yMode+50)   return ID_MODE_HOLD;
-    if(mx>=p+14 &&mx<=p+50 &&my>=l.yKeys+66  &&my<=l.yKeys+90)   return ID_ADD_KEY;
-    if(mx>=p+56 &&mx<=p+92 &&my>=l.yKeys+66  &&my<=l.yKeys+90)   return ID_REMOVE_KEY;
+    if(mx>=p+14 &&mx<=p+50 &&my>=l.yKeys+82  &&my<=l.yKeys+106)   return ID_ADD_KEY;
+    if(mx>=p+56 &&mx<=p+92 &&my>=l.yKeys+82  &&my<=l.yKeys+106)   return ID_REMOVE_KEY;
     int pw=44,pg=5,px=p+14;
     for(int i=0;i<KPS_PRESET_COUNT;i++){
         if(mx>=px&&mx<=px+pw&&my>=l.yKps+56&&my<=l.yKps+78)return 500+i;
@@ -14253,6 +14697,17 @@ int hitTest(HWND hwnd,int mx,int my){
 bool isInSlider(HWND hwnd,int mx,int my){
     Layout l=getLayout(hwnd);
     return(my>=l.yKps+20&&my<=l.yKps+50&&mx>=l.pad+14&&mx<=l.W-l.pad-14);
+}
+bool isInKpsLabel(HWND hwnd,int mx,int my){
+    Layout l=getLayout(hwnd);
+    int unitPillW=34;
+    return(my>=l.yKps+4&&my<=l.yKps+24&&mx>=l.pad+76&&mx<=l.pad+l.cw-16-unitPillW-6);
+}
+bool isInKpsUnitPill(HWND hwnd,int mx,int my){
+    Layout l=getLayout(hwnd);
+    int unitPillW=34;
+    int pillX=l.pad+l.cw-16-unitPillW;
+    return(my>=l.yKps+4&&my<=l.yKps+24&&mx>=pillX&&mx<=pillX+unitPillW);
 }
 int sliderVal(HWND hwnd,int mx){
     Layout l=getLayout(hwnd);
@@ -14269,12 +14724,322 @@ int sliderVal(HWND hwnd,int mx){
 void drawToasts(HDC hdc,int W,int H);
 void paintSettingsInto(HDC hdc,int W,int H);
 
+// Cached offscreen backbuffer for the main window - recreated only when the
+// client area size changes, instead of every WM_PAINT. Avoids per-frame
+// CreateCompatibleDC/CreateCompatibleBitmap churn (was a real stutter source
+// with the Void theme repainting at 60fps).
+static HDC     s_mainBufDC   = NULL;
+static HBITMAP s_mainBufBmp  = NULL;
+static HBITMAP s_mainBufOld  = NULL;
+static int     s_mainBufW    = -1;
+static int     s_mainBufH    = -1;
+
+static void freeMainBackbuffer(){
+    if(s_mainBufDC){
+        SelectObject(s_mainBufDC,s_mainBufOld);
+        DeleteObject(s_mainBufBmp);
+        DeleteDC(s_mainBufDC);
+        s_mainBufDC=NULL; s_mainBufBmp=NULL; s_mainBufOld=NULL;
+        s_mainBufW=-1; s_mainBufH=-1;
+    }
+}
+
+// ===================== LOCK OVERLAY =====================
+// Draws the "app locked" state directly on top of whatever is already
+// rendered in hdc (the real app UI), instead of replacing it - the app
+// blurs and dims behind the card so it's still visible, matching a modern
+// modal-overlay look rather than a separate blocking page. Uses the current
+// theme (T) throughout so it always matches whatever theme is selected;
+// T.red supplies the "glowing red" lock accent per-theme.
+static void drawLockOverlay(HDC hdc,int W,int H){
+    using namespace Gdiplus;
+
+    // ---- Real blur: box-blur directly on pixel data ----
+    // GDI's StretchBlt (even HALFTONE) is a resampling filter, not a blur -
+    // shrinking+growing an image always leaves visible blocky/pixelated
+    // artifacts because it can't properly average across a moving window.
+    // A true box blur run 3x on the actual pixels approximates a gaussian
+    // blur and looks genuinely smooth. Uses a running-sum sliding window so
+    // each pass is O(W*H) regardless of blur radius, not O(W*H*radius).
+    {
+        BITMAPINFO bmi={};
+        bmi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth=W;
+        bmi.bmiHeader.biHeight=-H; // top-down DIB
+        bmi.bmiHeader.biPlanes=1;
+        bmi.bmiHeader.biBitCount=32;
+        bmi.bmiHeader.biCompression=BI_RGB;
+        void* bits=nullptr;
+        HDC dibDC=CreateCompatibleDC(hdc);
+        HBITMAP dibBmp=CreateDIBSection(dibDC,&bmi,DIB_RGB_COLORS,&bits,NULL,0);
+        HBITMAP dibOld=(HBITMAP)SelectObject(dibDC,dibBmp);
+        BitBlt(dibDC,0,0,W,H,hdc,0,0,SRCCOPY);
+
+        if(bits){
+            unsigned char* px=(unsigned char*)bits; // BGRA, W*4 stride (32bpp is always DWORD-aligned)
+            int stride=W*4;
+            std::vector<unsigned char> tmp((size_t)stride*H);
+
+            auto boxBlurPass=[&](int radius){
+                // Horizontal: px -> tmp, using a running sum per row
+                for(int y=0;y<H;y++){
+                    unsigned char* row=px+(size_t)y*stride;
+                    unsigned char* outRow=tmp.data()+(size_t)y*stride;
+                    int sumB=0,sumG=0,sumR=0,sumA=0;
+                    for(int xx=0;xx<=std::min(radius,W-1);xx++){
+                        unsigned char* p=row+xx*4;
+                        sumB+=p[0];sumG+=p[1];sumR+=p[2];sumA+=p[3];
+                    }
+                    int cnt=std::min(radius,W-1)+1;
+                    for(int x=0;x<W;x++){
+                        unsigned char* o=outRow+x*4;
+                        o[0]=(unsigned char)(sumB/cnt); o[1]=(unsigned char)(sumG/cnt);
+                        o[2]=(unsigned char)(sumR/cnt); o[3]=(unsigned char)(sumA/cnt);
+                        int addX=x+radius+1, remX=x-radius;
+                        if(addX<W){ unsigned char* p=row+addX*4; sumB+=p[0];sumG+=p[1];sumR+=p[2];sumA+=p[3]; cnt++; }
+                        if(remX>=0){ unsigned char* p=row+remX*4; sumB-=p[0];sumG-=p[1];sumR-=p[2];sumA-=p[3]; cnt--; }
+                    }
+                }
+                // Vertical: tmp -> px, using a running sum per column
+                for(int x=0;x<W;x++){
+                    int sumB=0,sumG=0,sumR=0,sumA=0;
+                    for(int yy=0;yy<=std::min(radius,H-1);yy++){
+                        unsigned char* p=tmp.data()+(size_t)yy*stride+x*4;
+                        sumB+=p[0];sumG+=p[1];sumR+=p[2];sumA+=p[3];
+                    }
+                    int cnt=std::min(radius,H-1)+1;
+                    for(int y=0;y<H;y++){
+                        unsigned char* o=px+(size_t)y*stride+x*4;
+                        o[0]=(unsigned char)(sumB/cnt); o[1]=(unsigned char)(sumG/cnt);
+                        o[2]=(unsigned char)(sumR/cnt); o[3]=(unsigned char)(sumA/cnt);
+                        int addY=y+radius+1, remY=y-radius;
+                        if(addY<H){ unsigned char* p=tmp.data()+(size_t)addY*stride+x*4; sumB+=p[0];sumG+=p[1];sumR+=p[2];sumA+=p[3]; cnt++; }
+                        if(remY>=0){ unsigned char* p=tmp.data()+(size_t)remY*stride+x*4; sumB-=p[0];sumG-=p[1];sumR-=p[2];sumA-=p[3]; cnt--; }
+                    }
+                }
+            };
+            boxBlurPass(5);
+            boxBlurPass(5);
+            boxBlurPass(6);
+        }
+
+        BitBlt(hdc,0,0,W,H,dibDC,0,0,SRCCOPY);
+        SelectObject(dibDC,dibOld);
+        DeleteObject(dibBmp);
+        DeleteDC(dibDC);
+    }
+
+    // ---- Dark scrim over the blurred background ----
+    {
+        Graphics g(hdc);
+        SolidBrush scrim(Color(160,GetRValue(T.bg),GetGValue(T.bg),GetBValue(T.bg)));
+        g.FillRectangle(&scrim,0,0,W,H);
+    }
+
+    LockLayout ll=computeLockLayout(W,H);
+    bool hasBtn=!g_lockButtonText.empty();
+
+    // ---- Glass card with soft layered shadow ----
+    {
+        Graphics g(hdc);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        int rr=24, d=rr*2;
+        for(int i=8;i>=1;i--){
+            int off=i;
+            SolidBrush shBrush(Color(6,0,0,0));
+            GraphicsPath sp;
+            int sx=ll.cardX-off,sy=ll.cardY-off+i*2,sw=ll.cardW+off*2,sh=ll.cardH+off*2;
+            sp.AddArc(sx,sy,d,d,180,90);
+            sp.AddArc(sx+sw-d,sy,d,d,270,90);
+            sp.AddArc(sx+sw-d,sy+sh-d,d,d,0,90);
+            sp.AddArc(sx,sy+sh-d,d,d,90,90);
+            sp.CloseFigure();
+            g.FillPath(&shBrush,&sp);
+        }
+        SolidBrush cardBrush(Color(238,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)));
+        GraphicsPath cp;
+        cp.AddArc(ll.cardX,ll.cardY,d,d,180,90);
+        cp.AddArc(ll.cardX+ll.cardW-d,ll.cardY,d,d,270,90);
+        cp.AddArc(ll.cardX+ll.cardW-d,ll.cardY+ll.cardH-d,d,d,0,90);
+        cp.AddArc(ll.cardX,ll.cardY+ll.cardH-d,d,d,90,90);
+        cp.CloseFigure();
+        g.FillPath(&cardBrush,&cp);
+        Pen borderPen(Color(70,GetRValue(T.red),GetGValue(T.red),GetBValue(T.red)),1.4f);
+        g.DrawPath(&borderPen,&cp);
+        Pen hiPen(Color(255,
+            (BYTE)std::min(255,GetRValue(T.card)+14),
+            (BYTE)std::min(255,GetGValue(T.card)+14),
+            (BYTE)std::min(255,GetBValue(T.card)+14)),1.0f);
+        g.DrawLine(&hiPen,(REAL)(ll.cardX+rr),(REAL)(ll.cardY+1),(REAL)(ll.cardX+ll.cardW-rr),(REAL)(ll.cardY+1));
+    }
+
+    // ---- Glowing padlock icon (real lock shape, not stacked rectangles) ----
+    {
+        Graphics g(hdc);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        int cx=ll.iconCx, cy=ll.iconCy;
+
+        // Bloom - stacked translucent circles, largest/faintest first
+        for(int i=6;i>=1;i--){
+            int rad=16+i*5;
+            int alpha=std::max(2,14-i*2);
+            SolidBrush glow(Color((BYTE)alpha,GetRValue(T.red),GetGValue(T.red),GetBValue(T.red)));
+            g.FillEllipse(&glow,cx-rad,cy-rad,rad*2,rad*2);
+        }
+
+        // Shackle - arch via arc + two straight legs, round caps
+        Pen shackle(Color(255,GetRValue(T.red),GetGValue(T.red),GetBValue(T.red)),6.0f);
+        shackle.SetStartCap(LineCapRound); shackle.SetEndCap(LineCapRound);
+        int shW=30, shH=30;
+        int sx=cx-shW/2, sy=cy-22;
+        g.DrawArc(&shackle,sx,sy,shW,shH,180.0f,180.0f);
+        g.DrawLine(&shackle,(REAL)sx,(REAL)(sy+shH/2),(REAL)sx,(REAL)(cy+2));
+        g.DrawLine(&shackle,(REAL)(sx+shW),(REAL)(sy+shH/2),(REAL)(sx+shW),(REAL)(cy+2));
+
+        // Body
+        SolidBrush bodyBrush(Color(255,GetRValue(T.red),GetGValue(T.red),GetBValue(T.red)));
+        GraphicsPath body;
+        int bw2=50,bh2=34,br=9,bd=br*2;
+        int bx2=cx-bw2/2, by2=cy;
+        body.AddArc(bx2,by2,bd,bd,180,90);
+        body.AddArc(bx2+bw2-bd,by2,bd,bd,270,90);
+        body.AddArc(bx2+bw2-bd,by2+bh2-bd,bd,bd,0,90);
+        body.AddArc(bx2,by2+bh2-bd,bd,bd,90,90);
+        body.CloseFigure();
+        g.FillPath(&bodyBrush,&body);
+
+        // Keyhole cutout (drawn in card colour so it reads as a hole)
+        SolidBrush holeBrush(Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)));
+        int khR=4, khCx=cx, khCy=by2+bh2/2-4;
+        g.FillEllipse(&holeBrush,khCx-khR,khCy-khR,khR*2,khR*2);
+        PointF tri[3]={ PointF((REAL)(khCx-4),(REAL)(khCy+2)), PointF((REAL)(khCx+4),(REAL)(khCy+2)), PointF((REAL)khCx,(REAL)(khCy+11)) };
+        g.FillPolygon(&holeBrush,tri,3);
+    }
+
+    // ---- Text ----
+    drawText(hdc,g_lockTitle.c_str(),ll.titleRect.left,ll.titleRect.top,
+        ll.titleRect.right-ll.titleRect.left,ll.titleRect.bottom-ll.titleRect.top,
+        T.text,hFontBig,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,g_lockSubtitle.c_str(),ll.subtitleRect.left,ll.subtitleRect.top,
+        ll.subtitleRect.right-ll.subtitleRect.left,ll.subtitleRect.bottom-ll.subtitleRect.top,
+        T.subtext,hFontSmall,DT_CENTER|DT_TOP|DT_WORDBREAK);
+
+    // ---- Button (only if a redirect is actually available) ----
+    if(hasBtn){
+        drawRR(hdc,ll.btnRect.left,ll.btnRect.top,
+            ll.btnRect.right-ll.btnRect.left,ll.btnRect.bottom-ll.btnRect.top,
+            12,T.red,0,0);
+        drawText(hdc,g_lockButtonText.c_str(),ll.btnRect.left,ll.btnRect.top,
+            ll.btnRect.right-ll.btnRect.left,ll.btnRect.bottom-ll.btnRect.top,
+            RGB(255,255,255),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+    if(!g_lockFooter.empty()){
+        drawText(hdc,g_lockFooter.c_str(),ll.footerRect.left,ll.footerRect.top,
+            ll.footerRect.right-ll.footerRect.left,ll.footerRect.bottom-ll.footerRect.top,
+            T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+}
+
+// ===================== OPTIMISE CONFIRM MODAL =====================
+struct OptimiseLayout{ int cardX,cardY,cardW,cardH; RECT checkboxRect,cancelRect,confirmRect,statusRect; };
+static OptimiseLayout computeOptimiseLayout(int W,int H){
+    OptimiseLayout L{};
+    L.cardW=std::min(320,W-64); L.cardH=200;
+    L.cardX=(W-L.cardW)/2; L.cardY=(H-L.cardH)/2;
+    int cbY=L.cardY+94;
+    L.checkboxRect={L.cardX+20,cbY,L.cardX+L.cardW-20,cbY+34};
+    L.statusRect={L.cardX+20,cbY,L.cardX+L.cardW-20,cbY+50};
+    int btnY=L.cardY+L.cardH-46;
+    int btnW=(L.cardW-20-10-20)/2;
+    L.cancelRect={L.cardX+20,btnY,L.cardX+20+btnW,btnY+34};
+    L.confirmRect={L.cardX+L.cardW-20-btnW,btnY,L.cardX+L.cardW-20,btnY+34};
+    return L;
+}
+static void drawOptimiseConfirm(HDC hdc,int W,int H){
+    using namespace Gdiplus;
+    // Simple dim scrim - no blur needed for a quick confirmation
+    { Graphics g(hdc); SolidBrush scrim(Color(150,GetRValue(T.bg),GetGValue(T.bg),GetBValue(T.bg))); g.FillRectangle(&scrim,0,0,W,H); }
+
+    OptimiseLayout ol=computeOptimiseLayout(W,H);
+    { Graphics g(hdc); g.SetSmoothingMode(SmoothingModeAntiAlias);
+      int rr=18,d=rr*2;
+      SolidBrush cardBrush(Color(240,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)));
+      GraphicsPath cp;
+      cp.AddArc(ol.cardX,ol.cardY,d,d,180,90);
+      cp.AddArc(ol.cardX+ol.cardW-d,ol.cardY,d,d,270,90);
+      cp.AddArc(ol.cardX+ol.cardW-d,ol.cardY+ol.cardH-d,d,d,0,90);
+      cp.AddArc(ol.cardX,ol.cardY+ol.cardH-d,d,d,90,90);
+      cp.CloseFigure();
+      g.FillPath(&cardBrush,&cp);
+      Pen borderPen(Color(60,GetRValue(T.accent),GetGValue(T.accent),GetBValue(T.accent)),1.2f);
+      g.DrawPath(&borderPen,&cp);
+    }
+
+    bool showingStatus = g_optimiseRunning || g_optimiseDecisionPending;
+    drawText(hdc,showingStatus?L"Optimising...":L"Optimise Memory?",ol.cardX+20,ol.cardY+18,ol.cardW-40,24,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"Trims wrathic's working set and throttles background bloat.",ol.cardX+20,ol.cardY+44,ol.cardW-40,42,T.subtext,hFontSmall,DT_LEFT|DT_TOP|DT_WORDBREAK);
+
+    if(showingStatus){
+        // Spinner - simple rotating arc, ticks with GetTickCount so it
+        // animates smoothly without needing its own state
+        RECT& sr=ol.statusRect;
+        int spSz=16, spCx=sr.left+spSz/2, spCy=sr.top+spSz/2+2;
+        float ang=(float)(GetTickCount()%1000)/1000.0f*360.0f;
+        Graphics g(hdc); g.SetSmoothingMode(SmoothingModeAntiAlias);
+        Pen spinPen(Color(220,GetRValue(T.accent),GetGValue(T.accent),GetBValue(T.accent)),2.5f);
+        spinPen.SetStartCap(LineCapRound); spinPen.SetEndCap(LineCapRound);
+        g.DrawArc(&spinPen,spCx-spSz/2,spCy-spSz/2,spSz,spSz,ang,270.0f);
+
+        std::wstring statusText = cleanRamStatus.empty()?g_optimiseStatus:cleanRamStatus;
+        // Only show the first line here (cleanRamStatus can have multiple lines by the end)
+        size_t nl=statusText.find(L'\n');
+        if(nl!=std::wstring::npos) statusText=statusText.substr(0,nl);
+        drawText(hdc,statusText.c_str(),sr.left+spSz+10,sr.top,sr.right-sr.left-spSz-10,20,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    } else {
+        // Checkbox - single-line label. DT_VCENTER is documented as only
+        // supported with DT_SINGLELINE; combining it with DT_WORDBREAK (as
+        // before) silently drops the vertical centering once text could
+        // wrap, which is why the box and label used to drift apart.
+        RECT& cb=ol.checkboxRect;
+        int boxSz=18, boxY=cb.top+(34-boxSz)/2;
+        drawRR(hdc,cb.left,boxY,boxSz,boxSz,4,g_optimiseRestorePoint?T.accent:T.btn,T.border,1);
+        if(g_optimiseRestorePoint){
+            drawText(hdc,L"\u2713",cb.left,boxY,boxSz,boxSz,RGB(255,255,255),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+        drawText(hdc,L"Create a Windows Restore point first",cb.left+boxSz+8,cb.top,cb.right-cb.left-boxSz-8,34,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    }
+
+    // Buttons
+    bool decisionMode = g_optimiseDecisionPending;
+    const wchar_t* cancelLabel = L"Cancel";
+    const wchar_t* confirmLabel = decisionMode?L"Continue Anyway":L"Optimise";
+    bool buttonsDimmed = g_optimiseRunning && !decisionMode;
+    BYTE btnA = buttonsDimmed?90:255;
+    drawRR(hdc,ol.cancelRect.left,ol.cancelRect.top,ol.cancelRect.right-ol.cancelRect.left,34,10,T.btn,T.border,1);
+    drawText(hdc,cancelLabel,ol.cancelRect.left,ol.cancelRect.top,ol.cancelRect.right-ol.cancelRect.left,34,buttonsDimmed?T.subtext:T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    COLORREF confirmBg = decisionMode?T.red:T.accent;
+    { Graphics g(hdc); g.SetSmoothingMode(SmoothingModeAntiAlias);
+      SolidBrush cb2(Color(btnA,GetRValue(confirmBg),GetGValue(confirmBg),GetBValue(confirmBg)));
+      GraphicsPath p2; int rr2=10,d2=rr2*2;
+      int bx=ol.confirmRect.left, by=ol.confirmRect.top, bw2=ol.confirmRect.right-ol.confirmRect.left, bh2=34;
+      p2.AddArc(bx,by,d2,d2,180,90); p2.AddArc(bx+bw2-d2,by,d2,d2,270,90);
+      p2.AddArc(bx+bw2-d2,by+bh2-d2,d2,d2,0,90); p2.AddArc(bx,by+bh2-d2,d2,d2,90,90);
+      p2.CloseFigure(); g.FillPath(&cb2,&p2);
+    }
+    drawText(hdc,confirmLabel,ol.confirmRect.left,ol.confirmRect.top,ol.confirmRect.right-ol.confirmRect.left,34,RGB(255,255,255),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+}
+
 void paintMain(HWND hwnd){
     PAINTSTRUCT ps;HDC hdc_real=BeginPaint(hwnd,&ps);
     RECT cr;GetClientRect(hwnd,&cr);int W=cr.right,H=cr.bottom;
-    HDC hdc=CreateCompatibleDC(hdc_real);
-    HBITMAP bmp=CreateCompatibleBitmap(hdc_real,W,H);
-    HBITMAP obmp=(HBITMAP)SelectObject(hdc,bmp);
+    if(!s_mainBufDC||W!=s_mainBufW||H!=s_mainBufH){
+        freeMainBackbuffer();
+        s_mainBufDC=CreateCompatibleDC(hdc_real);
+        s_mainBufBmp=CreateCompatibleBitmap(hdc_real,W,H);
+        s_mainBufOld=(HBITMAP)SelectObject(s_mainBufDC,s_mainBufBmp);
+        s_mainBufW=W; s_mainBufH=H;
+    }
+    HDC hdc=s_mainBufDC;
 
     Layout l=getLayout(hwnd);int p=l.pad,cw=l.cw;
 
@@ -14289,9 +15054,6 @@ void paintMain(HWND hwnd){
     si.nPos=mainScrollPos;
     SetScrollInfo(hwnd,SB_VERT,&si,TRUE);}
 
-    // Compute fade-driven Y offset - elements float down into place
-    int fadeY=(int)((1.0f-easeOut(fadeAlpha))*18.0f);
-
     fillRect(hdc,0,0,W,H,T.bg);
     if(themeIdx==5) drawVoidStars(hdc,W,H);
 
@@ -14303,29 +15065,7 @@ void paintMain(HWND hwnd){
     drawText(hdc,L"WRATHIC",gAppIcon?52:16,0,120,56,T.text,hFontBig,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawText(hdc,APP_VERSION,W-84,0,70,56,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
 
-    int y=l.yStatus;
-
-    // STATUS CARD
-    drawCard(hdc,p,y,cw,58);
-    bool running=macroRunning.load();
-    // Smooth status colour transition using animRunning
-    float ar=easeInOut(animRunning);
-    COLORREF dotCol=lerpCol(T.red,T.green,ar);
-    COLORREF textCol=lerpCol(T.red,T.green,ar);
-    // Pulse glow when running
-    if(animRunning>0.5f){
-        int glowR=(int)(10+4*animMacroStatus);
-        COLORREF glowCol=RGB(
-            (int)(GetRValue(T.green)*animMacroStatus*0.3f),
-            (int)(GetGValue(T.green)*animMacroStatus*0.3f),
-            (int)(GetBValue(T.green)*animMacroStatus*0.3f)
-        );
-        drawDot(hdc,p+26,y+29,glowR,glowCol);
-    }
-    drawDot(hdc,p+26,y+29,7,dotCol);
-    // Status text fades between STOPPED and RUNNING
-    drawText(hdc,ar>0.5f?L"RUNNING":L"STOPPED",p+42,y,130,58,textCol,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    y=l.yHotkey;
+    int y=l.yHotkey;
 
     // ---- HOTKEY CARD ----
     drawCard(hdc,p,y,cw,62);
@@ -14349,8 +15089,6 @@ void paintMain(HWND hwnd){
     float mh=easeInOut(animModeHold);
     COLORREF togBg=lerpCol(T.accent,lerpCol(T.btn,T.btnHov,getHoverAlpha(ID_MODE_TOGGLE)),mh);
     COLORREF holBg=lerpCol(lerpCol(T.btn,T.btnHov,getHoverAlpha(ID_MODE_HOLD)),T.accent,mh);
-    COLORREF togBorder=lerpCol(T.accent,T.border,mh);
-    COLORREF holBorder=lerpCol(T.border,T.accent,mh);
     COLORREF togText=lerpCol(T.text,T.subtext,mh);
     COLORREF holText=lerpCol(T.subtext,T.text,mh);
     float togH=getHoverAlpha(ID_MODE_TOGGLE),holH=getHoverAlpha(ID_MODE_HOLD);
@@ -14361,13 +15099,13 @@ void paintMain(HWND hwnd){
     y=l.yKeys;
 
     // KEYS CARD
-    drawCard(hdc,p,y,cw,98);
-    drawText(hdc,L"KEYS TO SPAM",p+16,y+10,cw/2,14,T.subtext,hFontSmall);
-    drawText(hdc,L"M1 = lower CPU, less stable KPS",p+cw/2,y+10,cw/2-16,14,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    drawCard(hdc,p,y,cw,114);
+    drawText(hdc,L"KEYS TO SPAM",p+16,y+10,cw-32,14,T.subtext,hFontSmall);
+    drawText(hdc,L"M1 = lower CPU, less stable KPS",p+16,y+26,cw-32,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     EnterCriticalSection(&keyListCS);
     std::vector<int> keys=keysToSend;
     LeaveCriticalSection(&keyListCS);
-    int kx=p+14,ky=y+24;
+    int kx=p+14,ky=y+42;
     if(keys.empty()){
         drawText(hdc,L"No keys - tap + to add",kx,ky,cw-28,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     }else{
@@ -14379,17 +15117,36 @@ void paintMain(HWND hwnd){
     }
     float addHov=getHoverAlpha(ID_ADD_KEY);
     float remHov=getHoverAlpha(ID_REMOVE_KEY);
-    drawRR(hdc,p+16,y+68,32,22,12,lerpCol(T.btn,T.btnHov,addHov),RGB(0,0,0),0);
-    drawText(hdc,capturingKey?L"...":L"+",p+16,y+68,32,22,lerpCol(T.subtext,T.accent,addHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    drawRR(hdc,p+54,y+68,32,22,12,lerpCol(T.btn,T.btnHov,remHov),RGB(0,0,0),0);
-    drawText(hdc,L"−",p+54,y+68,32,22,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    drawRR(hdc,p+16,y+84,32,22,12,lerpCol(T.btn,T.btnHov,addHov),RGB(0,0,0),0);
+    drawText(hdc,capturingKey?L"...":L"+",p+16,y+84,32,22,lerpCol(T.subtext,T.accent,addHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    drawRR(hdc,p+54,y+84,32,22,12,lerpCol(T.btn,T.btnHov,remHov),RGB(0,0,0),0);
+    drawText(hdc,L"−",p+54,y+84,32,22,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     y=l.yKps;
 
     // KPS CARD - presets inside
     drawCard(hdc,p,y,cw,90);
-    wchar_t kpsBuf[32];swprintf(kpsBuf,32,L"%d KPS",kps.load());
     drawText(hdc,L"SPEED",p+16,y+10,60,12,T.subtext,hFontSmall);
-    drawText(hdc,kpsBuf,p+76,y+6,140,18,T.accent,hFontMed);
+    int unitPillW=34;
+    if(g_kpsEditing){
+        // Editing: show typed digits with a blinking cursor, unit shown via the toggle pill
+        std::wstring disp=g_kpsEditBuffer.empty()?L"_":g_kpsEditBuffer;
+        bool cursorOn=((GetTickCount()/500)%2)==0;
+        if(cursorOn) disp+=L"_";
+        drawRR(hdc,p+76,y+4,cw-92-unitPillW-6,20,6,T.btn,T.accent,1);
+        drawText(hdc,disp.c_str(),p+82,y+4,cw-92-unitPillW-16,20,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    } else {
+        wchar_t kpsBuf[48];
+        int curKpsVal=kps.load();
+        float msPerClick=1000.0f/std::max(1,curKpsVal);
+        swprintf(kpsBuf,48,L"%d KPS  (%.1fms)",curKpsVal,msPerClick);
+        drawText(hdc,kpsBuf,p+76,y+6,cw-92-unitPillW-6,18,T.accent,hFontMed);
+    }
+    // Unit toggle pill - switches which unit typed digits are interpreted as
+    {
+        int pillX=p+cw-16-unitPillW;
+        drawRR(hdc,pillX,y+4,unitPillW,20,6,g_kpsEditIsMs?T.accent:T.btn,T.border,1);
+        drawText(hdc,g_kpsEditIsMs?L"ms":L"KPS",pillX,y+4,unitPillW,20,g_kpsEditIsMs?T.bg:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
     drawSlider(hdc,p+16,y+30,cw-32,kps.load(),MIN_KPS,MAX_KPS);
     // Presets inside card
     int pw=44,pg=5,px=p+14;
@@ -14397,7 +15154,6 @@ void paintMain(HWND hwnd){
         bool active=(kps.load()==KPS_PRESETS[i]);
         float hov=getHoverAlpha(500+i);
         COLORREF pbg=active?T.accent:lerpCol(T.btn,T.btnHov,hov);
-        COLORREF pbd=active?T.accent:lerpCol(T.border,T.accent,hov*0.5f);
         COLORREF ptx=active?T.text:lerpCol(T.subtext,T.text,hov);
         drawRR(hdc,px,y+58,pw,20,12,pbg,RGB(0,0,0),0,hov);
         wchar_t pb[8];
@@ -14413,6 +15169,9 @@ void paintMain(HWND hwnd){
     if(activeTab==1){
         paintSettingsInto(hdc,W,H-DOCK_H);
     }
+
+    // ── TOASTS (drawn before the dock so they slide up from behind it) ──
+    drawToasts(hdc,W,H);
 
     // ── BOTTOM DOCK ───────────────────────────────────────────
     {int dy=H-DOCK_H;
@@ -14431,18 +15190,19 @@ void paintMain(HWND hwnd){
 
     // Vouch card moved to settings tab
 
-    drawToasts(hdc,W,H);
-
     // Version toast - only in main app window, shown once per version
     if(g_versionToast){
-        int tw=W-28, th=34, tx=14, ty=H-50;
+        int tw=W-28, th=34, tx=14, ty=H-DOCK_H-8-th;
         drawRR(hdc,tx,ty,tw,th,8,T.accent,T.accent,0);
-        drawText(hdc,L"\u2728  What\u2019s new in " APP_VERSION L"  \u2192",tx,ty,tw,th,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        int closeW=28;
+        drawText(hdc,L"\u2728  What\u2019s new in " APP_VERSION,tx+10,ty,tw-closeW-10,th,T.bg,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        drawText(hdc,L"\u2715",tx+tw-closeW,ty,closeW,th,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
+    if(g_lockKind!=LOCK_NONE) drawLockOverlay(hdc,W,H);
+    else if(g_optimiseConfirmOpen) drawOptimiseConfirm(hdc,W,H);
+
     BitBlt(hdc_real,0,0,W,H,hdc,0,0,SRCCOPY);
-    SelectObject(hdc,obmp);
-    DeleteObject(bmp);DeleteDC(hdc);
     EndPaint(hwnd,&ps);
 }
 
@@ -14473,9 +15233,21 @@ static int calcUtilsCardH(){
     int h=10;
     h+=14+6;                           // header label
     h+=28+6;                           // Optimise / Open Logs
-    h+=28+6;                           // Export / Import CFG
     if(!cleanRamStatus.empty()){
-        int lines=1+(int)(cleanRamStatus.size()/32);
+        // Count real \n-separated segments, each further estimated for
+        // word-wrap at ~40 chars/line - the old size()/32 guess ignored
+        // actual line breaks entirely and badly undercounted once this
+        // grew to multiple real lines (temp files + restore point etc.)
+        int lines=0;
+        size_t pos=0;
+        while(pos<=cleanRamStatus.size()){
+            size_t nl=cleanRamStatus.find(L'\n',pos);
+            size_t segLen=(nl==std::wstring::npos?cleanRamStatus.size():nl)-pos;
+            int segLines=(int)(segLen/40)+1;
+            lines+=segLines;
+            if(nl==std::wstring::npos) break;
+            pos=nl+1;
+        }
         h+=lines*16+6;
     }
     h+=8;
@@ -14584,7 +15356,6 @@ void paintSettingsInto(HDC hdc,int W,int H){
     int rH=calcOverlayCardH();
     drawCard(hdc,p,y,cw,rH);
     int cx=y+10;
-    int hw=(cw-28-8)/2;
 
     drawText(hdc,L"OVERLAY",p+14,cx,cw-28,20,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     cx+=20+6;
@@ -14651,15 +15422,19 @@ void paintSettingsInto(HDC hdc,int W,int H){
     drawRR(hdc,p+14,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Optimise",p+14,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     drawRR(hdc,p+14+hw2+8,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Open Logs",p+14+hw2+8,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     cx+=28+6;
-    drawRR(hdc,p+14,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Export CFG",p+14,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    drawRR(hdc,p+14+hw2+8,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Import CFG",p+14+hw2+8,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    cx+=28+6;
     if(!cleanRamStatus.empty()){
         bool done=cleanRamStatus.find(L"Freed")!=std::wstring::npos;
-        std::wstring sl=(done?L"+ ":L"\u2248 ")+cleanRamStatus;
         SetTextColor(hdc,done?T.green:T.accent); SetBkMode(hdc,TRANSPARENT);
         SelectObject(hdc,hFontSmall);
-        RECT sr={p+14,cx,p+14+cw-28,cx+48}; DrawText(hdc,sl.c_str(),-1,&sr,DT_LEFT|DT_TOP|DT_WORDBREAK);
+        int lines=0; size_t pos=0;
+        while(pos<=cleanRamStatus.size()){
+            size_t nl=cleanRamStatus.find(L'\n',pos);
+            size_t segLen=(nl==std::wstring::npos?cleanRamStatus.size():nl)-pos;
+            lines+=(int)(segLen/40)+1;
+            if(nl==std::wstring::npos) break;
+            pos=nl+1;
+        }
+        RECT sr={p+14,cx,p+14+cw-28,cx+lines*16+8}; DrawText(hdc,cleanRamStatus.c_str(),-1,&sr,DT_LEFT|DT_TOP|DT_WORDBREAK);
     }(void)cx;}
 
     // ── APPEARANCE CARD ─────────────────────────────────────────────────────
@@ -14716,15 +15491,23 @@ void paintSettingsInto(HDC hdc,int W,int H){
 
     // ── LICENSE CARD ────────────────────────────────────────────────────────
     y=l.yLic+sfadeY;
-    {int licH=licCopied?62:48; drawCard(hdc,p,y,cw,licH);
+    animateTo(licCopiedAlpha, licCopied?1.0f:0.0f, 0.12f);
+    float lca=licCopiedAlpha;
+    {int licH=(int)(48+(62-48)*lca); drawCard(hdc,p,y,cw,licH);
     drawText(hdc,L"LICENSE",p+14,y+8,100,12,T.subtext,hFontSmall);
     std::wstring dk2=savedLicenseKey.empty()?L"No license key":keyVisible?savedLicenseKey:std::wstring(savedLicenseKey.size(),L'*');
     drawText(hdc,dk2.c_str(),p+14,y+22,cw-106,18,T.text,hFontMono,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawRR(hdc,p+cw-92,y+15,40,20,6,T.btn,T.border,1);
     drawText(hdc,keyVisible?L"HIDE":L"SHOW",p+cw-92,y+15,40,20,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    drawRR(hdc,p+cw-46,y+15,40,20,6,licCopied?RGB(20,60,30):T.btn,licCopied?T.green:T.border,1);
-    drawText(hdc,licCopied?L"\u2713":L"COPY",p+cw-46,y+15,40,20,licCopied?T.green:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    if(licCopied) drawText(hdc,L"Copied to clipboard",p+14,y+44,cw-28,14,T.green,hFontSmall);}
+    COLORREF copyBg=lerpCol(T.btn,RGB(20,60,30),lca);
+    COLORREF copyBorder=lerpCol(T.border,T.green,lca);
+    COLORREF copyText=lerpCol(T.subtext,T.green,lca);
+    drawRR(hdc,p+cw-46,y+15,40,20,6,copyBg,copyBorder,1);
+    drawText(hdc,lca>0.5f?L"\u2713":L"COPY",p+cw-46,y+15,40,20,copyText,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    if(lca>0.02f){
+        COLORREF fadeText=lerpCol(T.card,T.green,lca);
+        drawText(hdc,L"Copied to clipboard",p+14,y+44,cw-28,14,fadeText,hFontSmall);
+    }}
 
     // ── TRIAL CARD ──────────────────────────────────────────────────────────
     if(trialMode){y=l.yTrial+sfadeY;
@@ -14748,7 +15531,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
 }
 
 // ===================== TOAST SYSTEM =====================
-struct ToastItem { std::wstring msg; COLORREF col; DWORD start; };
+struct ToastItem { std::wstring msg; COLORREF col; DWORD start; float animY; bool animInit; ToastIcon icon; float hoverAlpha; };
 static std::vector<ToastItem> g_toasts;
 static CRITICAL_SECTION g_toastCS;
 static bool g_toastCSInit = false;
@@ -14777,14 +15560,16 @@ static bool drawTipIcon(HDC hdc, int x, int y, int id, COLORREF col){
     return (g_tipHoverId==id);
 }
 
-void showToast(const wchar_t* msg, COLORREF col = RGB(99,102,241)) {
+void showToast(const wchar_t* msg, COLORREF col, ToastIcon icon) {
     if (!g_toastCSInit) { InitializeCriticalSection(&g_toastCS); g_toastCSInit = true; }
     EnterCriticalSection(&g_toastCS);
-    g_toasts.push_back({ msg, col, GetTickCount() });
+    ToastItem t; t.msg=msg; t.col=col; t.start=GetTickCount(); t.animY=0; t.animInit=false; t.icon=icon; t.hoverAlpha=0.0f;
+    g_toasts.push_back(t);
     if (g_toasts.size() > 3) g_toasts.erase(g_toasts.begin());
     LeaveCriticalSection(&g_toastCS);
     if (hwndMain) InvalidateRect(hwndMain, NULL, FALSE);
 }
+void showSuccessToast(const wchar_t* msg){ showToast(msg, T.green, TOAST_CHECK); playChime(); }
 
 void drawToasts(HDC hdc, int W, int H) {
     if (!g_toastCSInit) return;
@@ -14793,30 +15578,92 @@ void drawToasts(HDC hdc, int W, int H) {
     // Remove expired toasts (3s lifetime)
     g_toasts.erase(std::remove_if(g_toasts.begin(), g_toasts.end(),
         [now](const ToastItem& t){ return now - t.start > 3000; }), g_toasts.end());
-    int y = H - DOCK_H - 8;
-    for (int i = (int)g_toasts.size()-1; i >= 0; i--) {
+
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    Font gfont(hdc, hFontSmall);
+    StringFormat fmt;
+    fmt.SetAlignment(StringAlignmentNear);
+    fmt.SetLineAlignment(StringAlignmentCenter);
+    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+
+    int n = (int)g_toasts.size();
+    int th = 40, tw = W - 32, tx = 16;
+    int restBottom = H - DOCK_H - 8; // bottom edge of the newest (bottom-most) toast's resting slot
+
+    for (int i = 0; i < n; i++) {
         auto& t = g_toasts[i];
-        float age = (now - t.start) / 3000.0f;
-        // Fade in first 150ms, fade out last 400ms
-        float alpha = 1.0f;
+        int slot = n - 1 - i; // newest = slot 0 = closest to the dock
+        int targetTy = restBottom - th - slot * (th + 8);
+
+        if (!t.animInit) { t.animY = (float)H; t.animInit = true; } // starts hidden behind the dock
+        animateTo(t.animY, (float)targetTy, 0.09f); // Apple-ish snappy-but-smooth slide
+
         float elapsed = (float)(now - t.start);
+        float alpha = 1.0f;
         if (elapsed < 150.f) alpha = elapsed / 150.f;
         else if (elapsed > 2600.f) alpha = 1.0f - (elapsed - 2600.f) / 400.f;
         alpha = std::max(0.0f, std::min(1.0f, alpha));
-        int tw = W - 32, th = 36;
-        int tx = 16, ty = y - th;
-        // Draw toast background
+        BYTE a = (BYTE)(alpha * 255);
+        if (a == 0) continue;
+
+        int tyBase = (int)t.animY;
+        bool hovered = g_lastMousePos.x>=tx && g_lastMousePos.x<=tx+tw && g_lastMousePos.y>=tyBase && g_lastMousePos.y<=tyBase+th;
+        animateTo(t.hoverAlpha, hovered?1.0f:0.0f, 0.10f);
+        float hv = t.hoverAlpha;
+
+        // Expand slightly on hover - grows outward from centre, doesn't
+        // shift the toast's anchor position
+        int expand=(int)(4*hv);
+        int ty = tyBase - expand;
+        int txH = tx - expand, twH = tw + expand*2, thH = th + expand*2;
+
         COLORREF bg = RGB(
             (int)(GetRValue(t.col)*0.15f + GetRValue(T.card)*0.85f),
             (int)(GetGValue(t.col)*0.15f + GetGValue(T.card)*0.85f),
             (int)(GetBValue(t.col)*0.15f + GetBValue(T.card)*0.85f));
-        drawRR(hdc, tx, ty, tw, th, 8, bg, t.col, 1);
-        // Accent left bar
-        fillRect(hdc, tx+1, ty+6, 3, th-12, t.col);
-        // Message text
-        drawText(hdc, t.msg.c_str(), tx+12, ty, tw-16, th, T.text, hFontSmall, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        y = ty - 6;
-        (void)alpha; // alpha applied via the erase logic above
+
+        int rr=10, d=rr*2;
+        GraphicsPath path;
+        path.AddArc(txH,ty,d,d,180,90);
+        path.AddArc(txH+twH-d,ty,d,d,270,90);
+        path.AddArc(txH+twH-d,ty+thH-d,d,d,0,90);
+        path.AddArc(txH,ty+thH-d,d,d,90,90);
+        path.CloseFigure();
+        SolidBrush bgBrush(Color(a,GetRValue(bg),GetGValue(bg),GetBValue(bg)));
+        g.FillPath(&bgBrush,&path);
+        // Border brightens on hover (border alpha isn't scaled by a here since
+        // BYTE + float mixing needs the cast; hoverBorderA stays full-alpha
+        // multiplied by the toast's own fade alpha)
+        BYTE hoverBorderA=(BYTE)std::min(255.0f,a*(1.0f+hv*0.3f));
+        Pen borderPen(Color(hoverBorderA,GetRValue(t.col),GetGValue(t.col),GetBValue(t.col)),1.0f+hv*0.6f);
+        g.DrawPath(&borderPen,&path);
+
+        SolidBrush accentBrush(Color(a,GetRValue(t.col),GetGValue(t.col),GetBValue(t.col)));
+        g.FillRectangle(&accentBrush,(REAL)(txH+1),(REAL)(ty+6),3.0f,(REAL)(thH-12));
+
+        int textX = txH+12;
+        if (t.icon==TOAST_CHECK) {
+            int iconCx=txH+12+9, iconCy=ty+thH/2;
+            for(int gi=4;gi>=1;gi--){
+                int rad=6+gi*3;
+                BYTE ga=(BYTE)(alpha*std::max(2,14-gi*2));
+                SolidBrush glow(Color(ga,GetRValue(T.green),GetGValue(T.green),GetBValue(T.green)));
+                g.FillEllipse(&glow,iconCx-rad,iconCy-rad,rad*2,rad*2);
+            }
+            SolidBrush circleBrush(Color(a,GetRValue(T.green),GetGValue(T.green),GetBValue(T.green)));
+            g.FillEllipse(&circleBrush,iconCx-9,iconCy-9,18,18);
+            Pen checkPen(Color(a,255,255,255),2.0f);
+            checkPen.SetStartCap(LineCapRound); checkPen.SetEndCap(LineCapRound);
+            g.DrawLine(&checkPen,(REAL)(iconCx-4),(REAL)(iconCy),(REAL)(iconCx-1),(REAL)(iconCy+3));
+            g.DrawLine(&checkPen,(REAL)(iconCx-1),(REAL)(iconCy+3),(REAL)(iconCx+5),(REAL)(iconCy-4));
+            textX = iconCx+9+8;
+        }
+
+        SolidBrush textBrush(Color(a,GetRValue(T.text),GetGValue(T.text),GetBValue(T.text)));
+        RectF layoutRect((REAL)textX,(REAL)ty,(REAL)(txH+twH-(textX-txH)-8),(REAL)thH);
+        g.DrawString(t.msg.c_str(),-1,&gfont,layoutRect,&fmt,&textBrush);
     }
     LeaveCriticalSection(&g_toastCS);
 }
@@ -14892,7 +15739,6 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
     if(kpsOverlayEnabled||resOverlayEnabled){
         int gy0 = l.yRes + calcOverlayCardH() + GAP;
         const int GBH=28, GBG=4;
-        int gcH = 22 + 3*(GBH+GBG) - GBG + 10;
         int gW=(cw-28)/3;
 
         for(int i=0;i<9;i++){
@@ -14930,23 +15776,25 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
     // ── UTILITIES CARD (l.yAutoLaunch = card top) ─────────────────────────────
     { int cx=l.yAutoLaunch+10+14+6; // top + header
       int hw=(cw-28-8)/2;
-      if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();std::thread(cleanMemory).detach();}
+      if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();g_optimiseConfirmOpen=true;InvalidateRect(hwnd,NULL,FALSE);}
       if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",exePath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
-      cx+=28+6;
-      if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();exportConfig();InvalidateRect(hwnd,NULL,FALSE);}
-      if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();importConfig();InvalidateRect(hwnd,NULL,FALSE);}
     }
 
     // ── APPEARANCE CARD (l.yFont = card top) ─────────────────────────────────
     { int cx=l.yFont+10+14+6; // top + header
       // Font dropdown row
       if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+22){
-          playClick();fontDropOpen=!fontDropOpen;InvalidateRect(hwnd,NULL,FALSE);}
+          playClick();fontDropOpen=!fontDropOpen;InvalidateRect(hwnd,NULL,FALSE);return;}
       if(fontDropOpen){
           int dy3=cx+26;
           int n=(int)(sizeof(FONT_NAMES)/sizeof(FONT_NAMES[0]));
           for(int i=0;i<n;i++) if(mx>=p+14&&mx<=p+cw-14&&my>=dy3+i*22&&my<=dy3+(i+1)*22){
-              playClick();fontIdx=i;fontDropOpen=false;createFonts();saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
+              playClick();fontIdx=i;fontDropOpen=false;createFonts();saveSettings();InvalidateRect(hwnd,NULL,FALSE);return;}
+          // Click landed inside the open dropdown's footprint but not on an
+          // item (e.g. its own padding) - still consume it so it can't fall
+          // through to whatever sits underneath at the collapsed position.
+          int listBottom=dy3+n*22;
+          if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<listBottom) return;
       }
       // Theme buttons (2 rows x 3)
       int thX=cx+22+(fontDropOpen?5*22:0)+4+1+6+14+6;
@@ -14956,7 +15804,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
           int bx2=p+14+col*(btnW2+gap3), by2=thX+row*(btnH2+gap3);
           if(mx>=bx2&&mx<=bx2+btnW2&&my>=by2&&my<=by2+btnH2){
               playClick();themeIdx=i;saveSettings();InvalidateRect(hwnd,NULL,FALSE);
-              if(hwndOverlay)InvalidateRect(hwndOverlay,NULL,FALSE);}
+              if(hwndOverlay){InvalidateRect(hwndOverlay,NULL,FALSE);} return;}
       }
     }
 
@@ -14987,12 +15835,37 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
 
 // ===================== OVERLAY SYSTEM =====================
 
+// Cached offscreen backbuffer for the in-game overlay - same rationale as
+// the main window backbuffer above. The overlay repaints every TIMER_ANIM
+// tick while the macro runs, so this directly reduces GDI overhead during
+// active gameplay.
+static HDC     s_ovlBufDC  = NULL;
+static HBITMAP s_ovlBufBmp = NULL;
+static HBITMAP s_ovlBufOld = NULL;
+static int     s_ovlBufW   = -1;
+static int     s_ovlBufH   = -1;
+
+static void freeOverlayBackbuffer(){
+    if(s_ovlBufDC){
+        SelectObject(s_ovlBufDC,s_ovlBufOld);
+        DeleteObject(s_ovlBufBmp);
+        DeleteDC(s_ovlBufDC);
+        s_ovlBufDC=NULL; s_ovlBufBmp=NULL; s_ovlBufOld=NULL;
+        s_ovlBufW=-1; s_ovlBufH=-1;
+    }
+}
+
 static void paintOverlay(HWND hwnd){
     PAINTSTRUCT ps; HDC hr=BeginPaint(hwnd,&ps);
     RECT cr; GetClientRect(hwnd,&cr); int W=cr.right,H=cr.bottom;
-    HDC hdc=CreateCompatibleDC(hr);
-    HBITMAP bmp=CreateCompatibleBitmap(hr,W,H);
-    HBITMAP ob=(HBITMAP)SelectObject(hdc,bmp);
+    if(!s_ovlBufDC||W!=s_ovlBufW||H!=s_ovlBufH){
+        freeOverlayBackbuffer();
+        s_ovlBufDC=CreateCompatibleDC(hr);
+        s_ovlBufBmp=CreateCompatibleBitmap(hr,W,H);
+        s_ovlBufOld=(HBITMAP)SelectObject(s_ovlBufDC,s_ovlBufBmp);
+        s_ovlBufW=W; s_ovlBufH=H;
+    }
+    HDC hdc=s_ovlBufDC;
     const Theme& OT=THEMES[themeIdx];
 
     fillRect(hdc,0,0,W,H,OT.bg);
@@ -15062,7 +15935,7 @@ static void paintOverlay(HWND hwnd){
                 if(!r.show) continue;
                 float dispVal2=overlaySysStats?r.sys:r.pulse;
                 wchar_t chunk[20];
-                swprintf(chunk,20,L"%s %.0f%%  ",r.lbl,dispVal2);
+                swprintf(chunk,20,L"%ls %.0f%%  ",r.lbl,dispVal2);
                 wcscat(line,chunk);
             }
             int ln=(int)wcslen(line);
@@ -15086,7 +15959,7 @@ static void paintOverlay(HWND hwnd){
     (void)cy;
 
     BitBlt(hr,0,0,W,H,hdc,0,0,SRCCOPY);
-    SelectObject(hdc,ob); DeleteObject(bmp); DeleteDC(hdc); EndPaint(hwnd,&ps);
+    EndPaint(hwnd,&ps);
 }
 
 
@@ -15094,6 +15967,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_PAINT: paintOverlay(hwnd); return 0;
     case WM_ERASEBKGND: return 1;
+    case WM_DESTROY: freeOverlayBackbuffer(); return 0;
     case WM_LBUTTONDOWN:
         ReleaseCapture();
         SendMessage(hwnd,WM_SYSCOMMAND,SC_MOVE|HTCAPTION,0);
@@ -15108,7 +15982,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
 void updateOverlay(){
     if(!hwndOverlay||!IsWindow(hwndOverlay))return;
-    bool any=kpsOverlayEnabled||resOverlayEnabled;
+    bool any=(kpsOverlayEnabled||resOverlayEnabled)&&g_lockKind==LOCK_NONE;
     if(!any){DestroyWindow(hwndOverlay);hwndOverlay=NULL;return;}
 
     RECT wa={0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};
@@ -15129,7 +16003,33 @@ void updateOverlay(){
         }
     }
     h+=8; if(h<40)h=40;
+
     int ow=horiz2?220:140;
+    if(horiz2&&resOverlayEnabled){
+        // Measure the worst case (every enabled stat at 100%, i.e. 3 digits)
+        // so the window is never narrower than the text it needs to show -
+        // a fixed guess here is what caused stats to look squished/clipped
+        // once any value reached 3 digits.
+        wchar_t line[128]=L"";
+        struct{ const wchar_t* lbl; bool show; } statsList[]={
+            {L"CPU", overlayShowCpu}, {L"RAM", overlayShowRam},
+            {L"GPU", overlayShowGpu}, {L"Disk",overlayShowDisk}
+        };
+        for(auto& s:statsList){
+            if(!s.show) continue;
+            wchar_t chunk[24]; swprintf(chunk,24,L"%ls 100%%  ",s.lbl);
+            wcscat(line,chunk);
+        }
+        int ln=(int)wcslen(line); while(ln>0&&line[ln-1]==L' '){line[--ln]=0;}
+        if(line[0]&&hFontSmall){
+            HDC mdc=GetDC(NULL);
+            HFONT oldF=(HFONT)SelectObject(mdc,hFontSmall);
+            SIZE sz{}; GetTextExtentPoint32W(mdc,line,(int)wcslen(line),&sz);
+            SelectObject(mdc,oldF);
+            ReleaseDC(NULL,mdc);
+            ow=std::max(ow,(int)sz.cx+40);
+        }
+    }
 
     SetWindowPos(hwndOverlay,NULL,0,0,ow,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
 
@@ -15144,7 +16044,7 @@ void updateOverlay(){
 }
 
 void spawnOverlay(){
-    bool any=kpsOverlayEnabled||resOverlayEnabled;
+    bool any=(kpsOverlayEnabled||resOverlayEnabled)&&g_lockKind==LOCK_NONE;
     if(!any){
         if(hwndOverlay&&IsWindow(hwndOverlay)){DestroyWindow(hwndOverlay);hwndOverlay=NULL;}
         return;
@@ -15205,6 +16105,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // Uncomment to debug paint frequency: LOG_INFO(L"WM_PAINT");
         paintMain(hwnd);return 0;
     case WM_TIMER:
+        if(wp==20){
+            KillTimer(hwnd,20);
+            licCopied=false;
+            InvalidateRect(hwnd,NULL,FALSE);
+            break;
+        }
         if(wp==TIMER_SETT){
             if(activeTab==1){
                 InvalidateRect(hwnd,NULL,FALSE); // settings always needs refresh for cpu/ram
@@ -15216,6 +16122,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 tickCount=0;
                 usageMinutes++;
                 if(usageMinutes%5==0) saveSettings(); // save every 5 mins
+                if(usageMinutes%5==0) std::thread(pruneOldLogs).detach(); // keep logs.txt to the last hour
                 // Show vouch prompt after 5-10 minutes cumulative use
                 if(!vouchPrompted && usageMinutes>=7){
                     vouchPrompted=true;
@@ -15275,6 +16182,18 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 for(int i=0;i<16;i++){
                     if(hoverBtn[i]>0.002f&&hoverBtn[i]<0.998f){needRepaint=true;break;}
                 }
+                if(g_optimiseRunning||g_optimiseDecisionPending) needRepaint=true;
+                if(g_kpsEditing) needRepaint=true;
+                // Active toasts need continuous repaints too (slide-in/stack
+                // animation, fade in/out) - a single InvalidateRect from
+                // showToast() only produces one frame, which froze the
+                // animation and broke stacking/sliding entirely.
+                if(g_toastCSInit){
+                    EnterCriticalSection(&g_toastCS);
+                    bool hasToasts=!g_toasts.empty();
+                    LeaveCriticalSection(&g_toastCS);
+                    if(hasToasts) needRepaint=true;
+                }
                 // Reduce UI to 30fps when Roblox is focused - more headroom for game
           static int uiSkip=0;
           bool uiThrottle=robloxFocused.load()&&macroRunning.load();
@@ -15287,13 +16206,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         break;
     case WM_MOUSEMOVE:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
+        g_lastMousePos.x=mx; g_lastMousePos.y=my;
+        {TRACKMOUSEEVENT tme={sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};TrackMouseEvent(&tme);}
         if(activeTab==1){
             // Tooltip hover tracking for ? icons
             SLayout tl=getSLayout(hwnd);
-            int tp=tl.pad, tcw=tl.cw;
+            int tp=tl.pad;
             // Map ? icon IDs to positions and text
             struct TipDef{int id;int lx,ly;const wchar_t* txt;};
-            int tcx=tl.yRes+10+20+6+24+4; // after header+resOverlay
             int pillH=resOverlayEnabled?(6+14+32+8):0; // matches calcOverlayCardH exactly
             TipDef tips[]={
                 {1,tp+14,tl.yRes+10+20+6+5,   L"Shows CPU/RAM/GPU/Disk bars over your game"},
@@ -15325,26 +16245,121 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 if(hwndHovered!=prev)InvalidateRect(hwnd,NULL,FALSE);
             }
         }
+        // Toast hover tracking (expand-on-hover) - independent of active tab
+        if(g_toastCSInit){
+            RECT crM; GetClientRect(hwnd,&crM);
+            EnterCriticalSection(&g_toastCS);
+            int tw2=crM.right-32, tx2=16;
+            for(auto& t:g_toasts){
+                bool inside=mx>=tx2&&mx<=tx2+tw2&&my>=(int)t.animY&&my<=(int)t.animY+40;
+                bool wasHot=t.hoverAlpha>0.5f;
+                if(inside!=wasHot) InvalidateRect(hwnd,NULL,FALSE);
+            }
+            LeaveCriticalSection(&g_toastCS);
+        }
+        break;
+    }
+    case WM_MOUSELEAVE:{
+        g_lastMousePos.x=-1; g_lastMousePos.y=-1;
+        if(hwndHovered){hwndHovered=NULL;InvalidateRect(hwnd,NULL,FALSE);}
+        break;
+    }
+    case WM_CHAR:{
+        if(g_kpsEditing && wp>=L'0' && wp<=L'9' && g_kpsEditBuffer.size()<5){
+            g_kpsEditBuffer+=(wchar_t)wp;
+            InvalidateRect(hwnd,NULL,FALSE);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN:{
+        if(g_kpsEditing){
+            if(wp==VK_BACK){
+                if(!g_kpsEditBuffer.empty()) g_kpsEditBuffer.pop_back();
+                InvalidateRect(hwnd,NULL,FALSE);
+            } else if(wp==VK_RETURN){
+                if(!g_kpsEditBuffer.empty()){
+                    int val=_wtoi(g_kpsEditBuffer.c_str());
+                    int newKps;
+                    if(g_kpsEditIsMs){
+                        if(val<1) val=1;
+                        newKps=(int)(1000.0/val+0.5);
+                    } else {
+                        newKps=val;
+                    }
+                    newKps=std::max(MIN_KPS,std::min(MAX_KPS,newKps));
+                    kps=newKps;
+                    wchar_t lb[64];swprintf(lb,64,L"Custom KPS set: %d",newKps);LOG_INFO(lb);
+                    showSuccessToast(L"Speed updated");
+                }
+                g_kpsEditing=false;
+                InvalidateRect(hwnd,NULL,FALSE);
+            } else if(wp==VK_ESCAPE){
+                g_kpsEditing=false;
+                InvalidateRect(hwnd,NULL,FALSE);
+            }
+            return 0;
+        }
         break;
     }
     case WM_LBUTTONDOWN:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
+        if(g_lockKind!=LOCK_NONE){
+            if(!g_lockRedirectUrl.empty()){
+                RECT crL;GetClientRect(hwnd,&crL);
+                LockLayout ll=computeLockLayout(crL.right,crL.bottom);
+                if(mx>=ll.btnRect.left&&mx<=ll.btnRect.right&&my>=ll.btnRect.top&&my<=ll.btnRect.bottom){
+                    ShellExecuteW(NULL,L"open",g_lockRedirectUrl.c_str(),NULL,NULL,SW_SHOW);
+                }
+            }
+            return 0;
+        }
+        if(g_optimiseConfirmOpen){
+            RECT crO;GetClientRect(hwnd,&crO);
+            OptimiseLayout ol=computeOptimiseLayout(crO.right,crO.bottom);
+            if(g_optimiseDecisionPending){
+                // Restore point failed - Confirm is relabelled "Continue Anyway", Cancel aborts the whole flow
+                if(mx>=ol.cancelRect.left&&mx<=ol.cancelRect.right&&my>=ol.cancelRect.top&&my<=ol.cancelRect.bottom){
+                    playClick(); g_optimiseUserCancelled=true; g_optimiseDecisionPending=false; InvalidateRect(hwnd,NULL,FALSE);
+                } else if(mx>=ol.confirmRect.left&&mx<=ol.confirmRect.right&&my>=ol.confirmRect.top&&my<=ol.confirmRect.bottom){
+                    playClick(); g_optimiseDecisionPending=false; InvalidateRect(hwnd,NULL,FALSE);
+                }
+            } else if(!g_optimiseRunning){
+                RECT& cb=ol.checkboxRect;
+                if(mx>=cb.left&&mx<=cb.right&&my>=cb.top&&my<=cb.bottom){
+                    playClick(); g_optimiseRestorePoint=!g_optimiseRestorePoint; InvalidateRect(hwnd,NULL,FALSE);
+                } else if(mx>=ol.cancelRect.left&&mx<=ol.cancelRect.right&&my>=ol.cancelRect.top&&my<=ol.cancelRect.bottom){
+                    playClick(); g_optimiseConfirmOpen=false; InvalidateRect(hwnd,NULL,FALSE);
+                } else if(mx>=ol.confirmRect.left&&mx<=ol.confirmRect.right&&my>=ol.confirmRect.top&&my<=ol.confirmRect.bottom){
+                    playClick();
+                    std::thread(runOptimiseFlow,g_optimiseRestorePoint).detach();
+                    InvalidateRect(hwnd,NULL,FALSE);
+                }
+            }
+            // while running (and not awaiting a decision) the modal is
+            // non-interactive - just shows progress
+            return 0;
+        }
         {RECT cr10;GetClientRect(hwnd,&cr10);
         int dockY=cr10.bottom-DOCK_H;
         // Dock tab bar always handled first
         if(my>=dockY){
             if(mx<cr10.right/2){ activeTab=0; }
-            else { activeTab=1; settScrollPos=0; settFadeAlpha=0.0f; SetTimer(hwnd,TIMER_SETT,500,NULL); }
+            else { activeTab=1; settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; SetTimer(hwnd,TIMER_SETT,500,NULL); }
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
         }
-        // Version toast click
+        // Version toast click - previously unreachable: its Y-range sat
+        // entirely inside the dock's clickable area, so the dock's own
+        // tab-switch handler above always intercepted the click first and
+        // returned before this code ever ran. Now positioned above the
+        // dock (matches the render fix) so it's actually clickable.
         if(g_versionToast){
-            int W2=cr10.right;
-            if(mx>=14&&mx<=W2-14&&my>=cr10.bottom-52&&my<=cr10.bottom-16){
+            int tw2=cr10.right-28, th2=34, tx2=14, ty2=cr10.bottom-DOCK_H-8-th2;
+            bool inToast=mx>=tx2&&mx<=tx2+tw2&&my>=ty2&&my<=ty2+th2;
+            if(inToast){
                 g_versionToast=false;
-                activeTab=2; // open changelog tab
                 InvalidateRect(hwnd,NULL,FALSE);
+                return 0;
             }
         }
         // Settings tab: absolute hard block - nothing below runs
@@ -15364,20 +16379,47 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(hit==ID_REMOVE_KEY){playClick();
             EnterCriticalSection(&keyListCS);
             if(!keysToSend.empty()){
-                wchar_t buf[64];swprintf(buf,64,L"Key removed: %s",vkToString(keysToSend.back()).c_str());
+                wchar_t buf[64];swprintf(buf,64,L"Key removed: %ls",vkToString(keysToSend.back()).c_str());
                 LOG_INFO(buf);keysToSend.pop_back();
             }
             LeaveCriticalSection(&keyListCS);
             InvalidateRect(hwnd,NULL,FALSE);
         }
-        if(hit==ID_MODE_TOGGLE){playClick();holdMode=false;LOG_OK(L"Mode set to Toggle");showToast(L"Mode: Toggle",RGB(99,102,241));InvalidateRect(hwnd,NULL,FALSE);}
-        if(hit==ID_MODE_HOLD){playClick();holdMode=true;macroRunning=false;LOG_OK(L"Mode set to Hold");showToast(L"Mode: Hold",RGB(139,92,246));InvalidateRect(hwnd,NULL,FALSE);}
+        if(hit==ID_MODE_TOGGLE){
+            playClick();
+            if(!holdMode){ showToast(L"Toggle mode is already enabled",RGB(99,102,241)); }
+            else { holdMode=false; LOG_OK(L"Mode set to Toggle"); showSuccessToast(L"Toggle mode enabled"); }
+            InvalidateRect(hwnd,NULL,FALSE);
+        }
+        if(hit==ID_MODE_HOLD){
+            playClick();
+            if(holdMode){ showToast(L"Hold mode is already enabled",RGB(139,92,246)); }
+            else { holdMode=true; macroRunning=false; LOG_OK(L"Mode set to Hold"); showSuccessToast(L"Hold mode enabled"); }
+            InvalidateRect(hwnd,NULL,FALSE);
+        }
         if(hit>=500&&hit<500+KPS_PRESET_COUNT){
             playClick();int v=KPS_PRESETS[hit-500];kps=v;
+            g_kpsEditing=false;
             wchar_t buf[48];swprintf(buf,48,L"KPS preset selected: %d",v);LOG_INFO(buf);
             InvalidateRect(hwnd,NULL,FALSE);
         }
+        if(isInKpsUnitPill(hwnd,mx,my)){
+            playClick();
+            g_kpsEditIsMs=!g_kpsEditIsMs;
+            if(!g_kpsEditing){ g_kpsEditing=true; g_kpsEditBuffer.clear(); SetFocus(hwnd); }
+            InvalidateRect(hwnd,NULL,FALSE);
+        } else if(isInKpsLabel(hwnd,mx,my)){
+            playClick();
+            g_kpsEditing=true; g_kpsEditBuffer.clear();
+            SetFocus(hwnd);
+            InvalidateRect(hwnd,NULL,FALSE);
+        } else if(g_kpsEditing && !isInSlider(hwnd,mx,my)){
+            // Clicked away from the field without confirming - cancel
+            g_kpsEditing=false;
+            InvalidateRect(hwnd,NULL,FALSE);
+        }
         if(isInSlider(hwnd,mx,my)){
+            g_kpsEditing=false;
             kps=sliderVal(hwnd,mx);
             InvalidateRect(hwnd,NULL,FALSE);
         }
@@ -15487,6 +16529,7 @@ int maxS=std::max(0,(int)contentH6-(int)cr5.bottom);
     case WM_DESTROY:
         saveSettings();KillTimer(hwnd,TIMER_ANIM);
         hideTrayIcon();
+        freeMainBackbuffer();
         appRunning=false;macroRunning=false;
         PostQuitMessage(0);break;
     default:return DefWindowProc(hwnd,msg,wp,lp);
@@ -15509,9 +16552,9 @@ static void splashWait(int ms){
     }
 }
 void showSplash(HINSTANCE hInst){
-    WNDCLASS wc={};wc.lpfnWndProc=SplashProc;wc.hInstance=hInst;wc.lpszClassName=L"Sp4";wc.hCursor=LoadCursor(NULL,IDC_ARROW);wc.hbrBackground=NULL;RegisterClass(&wc);
+    WNDCLASS wc={};wc.lpfnWndProc=SplashProc;wc.hInstance=hInst;wc.lpszClassName=L"Sp4";wc.hCursor=gGlowCursor?gGlowCursor:LoadCursor(NULL,IDC_ARROW);wc.hbrBackground=NULL;RegisterClass(&wc);
     int sw=GetSystemMetrics(SM_CXSCREEN),sh=GetSystemMetrics(SM_CYSCREEN);
-    int sW=380,sH=480;
+    int sW=480,sH=280;
     hwndSplash=CreateWindowEx(WS_EX_TOPMOST|WS_EX_LAYERED,L"Sp4",L"",WS_POPUP,sw/2-sW/2,sh/2-sH/2,sW,sH,NULL,NULL,hInst,NULL);
     // Rounded corners via region
     HRGN rgn=CreateRoundRectRgn(0,0,sW+1,sH+1,28,28);
@@ -15575,7 +16618,7 @@ break;
 }
 
 bool showLicenseWindow(HINSTANCE hInst){
-    WNDCLASS wc={};wc.lpfnWndProc=LicenseProc;wc.hInstance=hInst;wc.lpszClassName=L"Lic4";wc.hCursor=LoadCursor(NULL,IDC_ARROW);RegisterClass(&wc);
+    WNDCLASS wc={};wc.lpfnWndProc=LicenseProc;wc.hInstance=hInst;wc.lpszClassName=L"Lic4";wc.hCursor=gGlowCursor?gGlowCursor:LoadCursor(NULL,IDC_ARROW);RegisterClass(&wc);
     HWND hwnd=CreateWindow(L"Lic4",L"Macro \u2014 Activate",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,370,250,NULL,NULL,hInst,NULL);
     BOOL dark=TRUE;DwmSetWindowAttribute(hwnd,(DWORD)20,&dark,sizeof(dark));
     ShowWindow(hwnd,SW_SHOW);UpdateWindow(hwnd);
@@ -15596,22 +16639,11 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     Gdiplus::GdiplusStartup(&gdiplusToken,&gdipInput,NULL);
     InitializeCriticalSection(&keyListCS);
     loadAppIcon();
+    gGlowCursor=createGlowCursor();
     lastKpsTick=GetTickCount();
 
-    // Delete logs if older than 24 hours
-    {
-        HANDLE hf=CreateFile(exePath(LOG_FILE).c_str(),GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
-        if(hf!=INVALID_HANDLE_VALUE){
-            FILETIME ft;GetFileTime(hf,NULL,NULL,&ft);CloseHandle(hf);
-            FILETIME now;SYSTEMTIME st;GetSystemTime(&st);SystemTimeToFileTime(&st,&now);
-            ULARGE_INTEGER tNow,tFile;
-            tNow.LowPart=now.dwLowDateTime;tNow.HighPart=now.dwHighDateTime;
-            tFile.LowPart=ft.dwLowDateTime;tFile.HighPart=ft.dwHighDateTime;
-            // 24 hours in 100-nanosecond intervals = 864000000000
-            if(tNow.QuadPart-tFile.QuadPart>864000000000ULL)
-                DeleteFile(exePath(LOG_FILE).c_str());
-        }
-    }
+    // Trim logs to the last hour on startup (old sessions' stale entries)
+    pruneOldLogs();
     LOG_INFO(L"Macro " APP_VERSION L" starting up");
 
     machineHWID=generateHWID();
@@ -15627,7 +16659,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
         int r=validateLicense(savedLicenseKey,machineHWID);
         if(r==0){
             // Key genuinely not found or deactivated - delete and re-ask
-            DeleteFile(LICENSE_FILE);
+            regDeleteValue(L"LicenseKey");
             savedLicenseKey=L"";
             LOG_ERR(L"License removed - key was not found or has been deactivated");
         }
@@ -15654,50 +16686,36 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     }
 
     showSplash(hInst);
-    updateSplash(L"Loading settings..."); g_splashProgress=0.10f; splashWait(700);
-    updateSplash(L"Benchmarking your system..."); g_splashProgress=0.22f;
+    DWORD splashStartTick=GetTickCount();
+    // Real init work - no artificial delays between these anymore, the
+    // splash is now a brief identity screen, not a fake loading sequence.
     recommendedKPS=benchmarkSystem();
-    g_splashProgress=0.45f; splashWait(300);
     // Check if this is the first run after an update
-    {std::wifstream vf((SETTINGS_FILE+std::wstring(L".ver")).c_str());
-    std::wstring sv; if(vf&&std::getline(vf,sv)) g_versionToast=(sv!=APP_VERSION);
-    else g_versionToast=true;}
-    // Save current version
-    {std::wofstream vf2((SETTINGS_FILE+std::wstring(L".ver")).c_str()); vf2<<APP_VERSION;}
-    {std::wifstream chk(SETTINGS_FILE);if(!chk.is_open())kps=recommendedKPS;}
-    updateSplash(L"Validating license..."); g_splashProgress=0.62f; splashWait(700);
-    updateSplash(L"Starting macro engine..."); g_splashProgress=0.80f; splashWait(700);
-    updateSplash(L"Almost ready..."); g_splashProgress=0.95f; splashWait(600);
-    g_splashProgress=1.0f; splashWait(500);
-    g_splashDone=true; splashWait(1800);
-    // Show changelog on startup if toggle is enabled
-    if(showChangelogOnStartup){
-        splashShowChangelog=true;
-        splashChangelogScroll=0;
-        InvalidateRect(hwndSplash,NULL,TRUE);
-        UpdateWindow(hwndSplash);
-        // Wait for user to click Continue - block here until dismissed
-        MSG msg;
-        while(hwndSplash&&IsWindow(hwndSplash)){
-            if(PeekMessage(&msg,NULL,0,0,PM_REMOVE)){
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            } else {
-                Sleep(16);
-            }
-        }
-        hwndSplash=NULL;
-        changelogShown=true;
-        saveSettings();
-    } else {
-        hideSplash();
+    {
+        std::wstring sv = regGetString(L"SeenVersion",L"");
+        g_versionToast = sv.empty() || (sv != std::wstring(APP_VERSION));
     }
+    regSetString(L"SeenVersion",APP_VERSION);
+    {
+        bool hasExisting=false;
+        regGetDWORD(L"ThemeIdx",0,&hasExisting);
+        if(!hasExisting) kps=recommendedKPS;
+    }
+    // Hold the splash visible for ~2s total (not stacked on top of the real
+    // work above - if that work took a while, this just tops up whatever's
+    // left; if it was fast, most of the 2s comes from here).
+    {DWORD elapsed=GetTickCount()-splashStartTick;
+    if(elapsed<2000) splashWait(2000-(int)elapsed);}
+    // Startup changelog display removed - was never kept up to date and
+    // didn't match the app's theme. The version toast still shows briefly
+    // after an update, but no longer opens a changelog viewer on click.
+    hideSplash();
 
     InitCommonControls();
 
     WNDCLASS wc={};
     wc.lpfnWndProc=WndProc;wc.hInstance=hInst;wc.lpszClassName=L"MApp_91x";
-    wc.hCursor=LoadCursor(NULL,IDC_ARROW);
+    wc.hCursor=gGlowCursor?gGlowCursor:LoadCursor(NULL,IDC_ARROW);
     wc.hbrBackground=NULL; // WM_ERASEBKGND handles all background painting
     {wchar_t ep[MAX_PATH]={}; GetModuleFileNameW(NULL,ep,MAX_PATH);
     wchar_t* sl=wcsrchr(ep,L'\\'); if(sl){sl[1]=0;wcscat(ep,L"wrathic.ico");}
@@ -15771,7 +16789,19 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     updateSplash(L"Checking for updates...");
     if(!checkVersionBlocking()){
         hideSplash();
-        return 0; // outdated - sent to download page
+        // g_lockKind is now LOCK_UPDATE - paintMain renders the lock overlay
+        // (blurred app behind a glass card) and WM_LBUTTONDOWN only responds
+        // to the redirect button. Skip macro engine/hotkey/resource threads
+        // entirely and just keep the window alive and responsive until the
+        // user closes it or updates and relaunches.
+        InvalidateRect(hwndMain,NULL,TRUE);
+        MSG lockMsg;
+        while(GetMessage(&lockMsg,NULL,0,0)){TranslateMessage(&lockMsg);DispatchMessage(&lockMsg);}
+        stopMacroEngine();
+        DeleteCriticalSection(&keyListCS);
+        if(gInputBufCSInit) DeleteCriticalSection(&gInputBufCS);
+        if(gdiplusToken) Gdiplus::GdiplusShutdown(gdiplusToken);
+        return 0;
     }
     // Background check just to update the settings display
     std::thread(checkForUpdate).detach();
