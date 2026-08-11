@@ -14753,17 +14753,15 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // the card grows slightly (coming toward you), rises, and its shadow slides
     // well away from the pointer so the near corner looks furthest off the surface.
     // All of it in floats so the card glides rather than stepping pixel by pixel.
-    REAL grow=hv*3.5f, lift=hv*7.0f;
+    // A card's text is drawn by the caller afterwards, in screen space, so the
+    // surface cannot actually rotate without the content sliding off it - and
+    // rotating the text too (via a GDI world transform) would cost ClearType on
+    // every label. Tilt is therefore faked, but with the cues turned up far enough
+    // to actually register: the card scales up, rises, and the corner nearest the
+    // cursor drops a much longer shadow than the far one.
+    REAL grow=hv*6.0f, lift=hv*10.0f;
     REAL cx=(REAL)x-grow, cy=(REAL)y-grow-lift, cw=(REAL)w+grow*2, ch=(REAL)h+grow*2;
-    REAL shX=-dx*11.0f*hv, shY=-dy*8.0f*hv;
-
-    // Actually roll the surface toward the cursor. GDI+ only rotates in-plane, and
-    // the caller draws this card's text afterwards in screen space, so the angle is
-    // held under a degree: enough that the edges visibly pivot, small enough that
-    // the content still sits where it should.
-    Matrix tilt;
-    tilt.RotateAt(-dx*0.85f*hv, PointF(cx+cw*0.5f, cy+ch*0.5f));
-    g.SetTransform(&tilt);
+    REAL shX=-dx*18.0f*hv, shY=-dy*13.0f*hv;
 
     // 1. Ambient drop shadow. Two passes rather than three - the third was costing a
     //    full extra path fill per card per frame for a barely visible difference.
@@ -14829,7 +14827,29 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         g.FillPath(&pg,&spot);
         g.ResetClip();
     }
-    g.ResetTransform();
+
+    // Directional sheen across the face, brightest on the side the cursor is on.
+    // This is what carries the sense of a tilted plane catching light, now that the
+    // surface itself cannot rotate.
+    if(hv>0.01f && (fabsf(dx)>0.01f || fabsf(dy)>0.01f)){
+        REAL nx=-dx, ny=-dy;
+        REAL len=(REAL)sqrt(nx*nx+ny*ny); if(len<0.001f) len=1.0f;
+        nx/=len; ny/=len;
+        // Span the full diagonal, not half the width: a shorter span leaves the rest
+        // of the card outside the gradient, and GDI+ tiles by default, which drew a
+        // hard repeating band across the face.
+        REAL reach=(REAL)sqrt(cw*cw+ch*ch)*0.62f;
+        PointF ctr(cx+cw*0.5f, cy+ch*0.5f);
+        PointF p1(ctr.X-nx*reach, ctr.Y-ny*reach);
+        PointF p2(ctr.X+nx*reach, ctr.Y+ny*reach);
+        if(fabsf(p1.X-p2.X)>0.5f||fabsf(p1.Y-p2.Y)>0.5f){
+            LinearGradientBrush sheen(p1,p2,Color((BYTE)(34*hv),255,255,255),Color(0,255,255,255));
+            sheen.SetWrapMode(WrapModeTileFlipXY); // mirrors instead of hard-repeating
+            g.SetClip(&body);
+            g.FillPath(&sheen,&body);
+            g.ResetClip();
+        }
+    }
 }
 // The card's resting appearance with none of the hover work: same gradient body,
 // same caught-light top edge, same hairline border. Used by the in-game overlay so
