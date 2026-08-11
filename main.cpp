@@ -317,11 +317,14 @@ void updateVoidStars(){
     // but WM_TIMER doesn't guarantee that (timer granularity + variable
     // frame processing time), so stars visually sped up/slowed down between
     // ticks. Scaling by actual elapsed time keeps motion smooth regardless.
-    static ULONGLONG lastTick=0;
-    ULONGLONG nowTick=GetTickCount64();
-    if(lastTick==0) lastTick=nowTick;
-    float dtMs=(float)(nowTick-lastTick);
-    lastTick=nowTick;
+    // GetTickCount64 only advances every ~15.6ms, so at a 16ms timer the measured
+    // delta quantised to 0 / 16 / 31 and the scale factor lurched between 0 and ~1.9
+    // every frame. That quantisation *was* the jitter. QPC is sub-microsecond.
+    static LARGE_INTEGER freq={}, last={};
+    if(freq.QuadPart==0){ QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
+    LARGE_INTEGER nowQ; QueryPerformanceCounter(&nowQ);
+    float dtMs=(float)((double)(nowQ.QuadPart-last.QuadPart)*1000.0/(double)freq.QuadPart);
+    last=nowQ;
     if(dtMs<=0.0f||dtMs>100.0f) dtMs=16.6667f; // clamp huge gaps (e.g. app was idle/minimized)
     float scale=dtMs/16.6667f; // 1.0 at a perfect 60fps tick
     for(int i=0;i<120;i++){
@@ -347,17 +350,21 @@ void drawVoidStars(HDC hdc,int W,int H){
     std::vector<RectF> glowRects[TIERS];
 
     for(int i=0;i<120;i++){
-        int x=(int)voidStars[i].x;
-        int y=(int)voidStars[i].y;
-        if(x<0||x>=W||y<0||y>=H) continue;
+        // Keep the sub-pixel position. Truncating to int made a star moving at 0.3px
+        // per frame sit still for three frames and then jump a whole pixel, which
+        // read as stutter on top of the timing jitter. GDI+ antialiases the
+        // fractional offset instead, so slow stars drift smoothly.
+        REAL x=(REAL)voidStars[i].x;
+        REAL y=(REAL)voidStars[i].y;
+        if(x<0||x>=(REAL)W||y<0||y>=(REAL)H) continue;
         int bright=(int)(voidStars[i].alpha*255.0f);
         bright=std::max(0,std::min(255,bright));
         int tier=std::min(TIERS-1, bright*TIERS/256);
-        mainRects[tier].push_back(RectF((REAL)x,(REAL)y,1.0f,1.0f));
+        mainRects[tier].push_back(RectF(x,y,1.0f,1.0f));
         if(voidStars[i].alpha>0.6f){
             int glowTier=std::min(TIERS-1,(bright/3)*TIERS/256);
-            if(x+1<W) glowRects[glowTier].push_back(RectF((REAL)(x+1),(REAL)y,1.0f,1.0f));
-            if(y+1<H) glowRects[glowTier].push_back(RectF((REAL)x,(REAL)(y+1),1.0f,1.0f));
+            if(x+1<(REAL)W) glowRects[glowTier].push_back(RectF(x+1,y,1.0f,1.0f));
+            if(y+1<(REAL)H) glowRects[glowTier].push_back(RectF(x,y+1,1.0f,1.0f));
         }
     }
     for(int t=0;t<TIERS;t++){
@@ -12751,6 +12758,9 @@ int  fontDropHov=-1;
 HFONT hFontBig, hFontMed, hFontSmall, hFontMono;
 HWND hwndHovered=NULL;
 POINT g_lastMousePos={-1,-1};
+// Set by drawCard() whenever a card's hover fade is mid-flight, so the animation
+// tick knows to keep painting after the mouse has stopped moving.
+bool g_cardAnimActive=false;
 
 // Animation globals
 float animMacroStatus=0.0f;
@@ -13215,7 +13225,7 @@ bool checkVersionBlocking(){
     g_lockKind=LOCK_UPDATE;
     g_lockTitle=L"Update Required";
     wchar_t sub[160];
-    swprintf(sub,160,L"You're running %ls  the latest version is %ls",APP_VERSION,wver);
+    swprintf(sub,160,L"You're running %ls \u2014 the latest version is %ls",APP_VERSION,wver);
     g_lockSubtitle=sub;
     g_lockButtonText=L"Get the Latest Version";
     g_lockRedirectUrl=UPDATE_DOWNLOAD_URL;
@@ -14391,6 +14401,7 @@ void runOptimiseFlow(bool withRestorePoint){
 // ===================== SPLASH =====================
 HWND hwndSplash=NULL;
 void showSplash(HINSTANCE hInst); // forward decl - reused by WndProc's version toast click
+void fadeSplash(int from,int to,int step); // pumps messages so animation keeps running
 std::wstring splashMsg=L"Starting...";
 bool splashShowChangelog=false;
 int  splashChangelogScroll=0;
@@ -14492,7 +14503,10 @@ static void freeSplashResources(){
 LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_TIMER:
-        if(!splashShowChangelog) updateVoidStars();
+        // Always step the field. Gating this on the changelog froze the background
+        // the moment that screen appeared, which is what made the animation visibly
+        // stop and restart around the transitions.
+        updateVoidStars();
         InvalidateRect(hwnd,NULL,FALSE); return 0;
     case WM_CREATE: SetTimer(hwnd,1,16,NULL); return 0; // 60fps animation
     case WM_DESTROY: KillTimer(hwnd,1); freeSplashResources(); return 0;
@@ -14635,6 +14649,16 @@ static void addRoundRectPath(Gdiplus::GraphicsPath& p,int x,int y,int w,int h,in
 // (lit from above), a 1px caught-light line inside the top edge, and a hairline
 // border. Performance mode skips all of it for one flat fill - the geometry is
 // identical, so no layout shifts when it is switched.
+// Per-card hover amount, keyed by the card's own position so each animates
+// independently without every call site having to own a float.
+static float* cardHoverSlot(int key){
+    static int  keys[24]={0};
+    static float vals[24]={0};
+    for(int i=0;i<24;i++){ if(keys[i]==key) return &vals[i]; }
+    for(int i=0;i<24;i++){ if(keys[i]==0){ keys[i]=key; vals[i]=0.0f; return &vals[i]; } }
+    return &vals[0];
+}
+
 void drawCard(HDC hdc,int x,int y,int w,int h){
     const int R=14;
     if(performanceMode){
@@ -14645,13 +14669,35 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     Graphics g(hdc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
 
+    // Where the cursor sits relative to the card centre, -1..1 on each axis. The
+    // corner nearest the cursor is the one that should read as lifted.
+    POINT m=g_lastMousePos;
+    bool inside = m.x>=x && m.x<=x+w && m.y>=y && m.y<=y+h;
+    float* hovA=cardHoverSlot(y*4096+x);
+    animateTo(*hovA, inside?1.0f:0.0f, inside?0.06f:0.10f);
+    float hv=*hovA;
+    if(hv>0.002f&&hv<0.998f) g_cardAnimActive=true;
+    float dx=0.0f, dy=0.0f;
+    if(hv>0.001f && m.x>=0){
+        dx=((float)m.x-(x+w*0.5f))/(w*0.5f);
+        dy=((float)m.y-(y+h*0.5f))/(h*0.5f);
+        dx=std::max(-1.0f,std::min(1.0f,dx));
+        dy=std::max(-1.0f,std::min(1.0f,dy));
+    }
+    // The whole card rises a touch, and the shadow slides *away* from the cursor -
+    // the cue the eye reads as that corner tilting up toward you.
+    int lift=(int)(hv*2.0f);
+    y-=lift;
+    int shX=(int)(-dx*3.0f*hv), shY=(int)(-dy*2.0f*hv);
+
     // 1. Ambient drop shadow - three offset passes, widest and faintest first, so
-    //    the falloff is smooth without needing a real blur.
+    //    the falloff is smooth without needing a real blur. Deepens on hover
+    //    because the card is now further off its background.
     for(int i=3;i>=1;i--){
         int sp=i*2;
         GraphicsPath sh;
-        addRoundRectPath(sh,x-sp/2,y+sp,w+sp,h,R+sp/2);
-        SolidBrush sb(Color((BYTE)(9-i*2),0,0,0));
+        addRoundRectPath(sh,x-sp/2+shX,y+sp+lift*2+shY,w+sp,h,R+sp/2);
+        SolidBrush sb(Color((BYTE)((9-i*2)+(int)(hv*5.0f)),0,0,0));
         g.FillPath(&sb,&sh);
     }
 
@@ -14679,6 +14725,36 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // 4. Hairline border.
     Pen bp(Color(38,255,255,255),1.0f);
     g.DrawPath(&bp,&body);
+
+    // 5. Specular sweep - a soft light centred on the cursor, clipped to a 2px ring
+    //    just inside the border so it reads as light catching the card's edge
+    //    rather than a blob floating on its face.
+    if(hv>0.01f && m.x>=0){
+        GraphicsPath innerEdge;
+        addRoundRectPath(innerEdge,x+2,y+2,w-4,h-4,R-2);
+        g.SetClip(&body);
+        g.SetClip(&innerEdge,CombineModeExclude);
+        REAL rad=(REAL)std::max(w,h)*0.62f;
+        GraphicsPath spot;
+        spot.AddEllipse((REAL)m.x-rad,(REAL)m.y-rad,rad*2,rad*2);
+        PathGradientBrush pg(&spot);
+        pg.SetCenterPoint(PointF((REAL)m.x,(REAL)m.y));
+        pg.SetCenterColor(Color((BYTE)(165*hv),255,255,255));
+        Color edge(0,255,255,255); int cnt=1;
+        pg.SetSurroundColors(&edge,&cnt);
+        g.FillPath(&pg,&spot);
+        g.ResetClip();
+
+        // A far fainter version across the face, so the lit edge has something to
+        // fall off into instead of stopping dead at the border.
+        g.SetClip(&body);
+        PathGradientBrush pf(&spot);
+        pf.SetCenterPoint(PointF((REAL)m.x,(REAL)m.y));
+        pf.SetCenterColor(Color((BYTE)(26*hv),255,255,255));
+        pf.SetSurroundColors(&edge,&cnt);
+        g.FillPath(&pf,&spot);
+        g.ResetClip();
+    }
 }
 void drawDot(HDC hdc,int cx,int cy,int r,COLORREF c){
     using namespace Gdiplus;
@@ -15188,7 +15264,7 @@ void paintMain(HWND hwnd){
     drawRR(hdc,p+16,y+84,32,22,12,lerpCol(T.btn,T.btnHov,addHov),RGB(0,0,0),0);
     drawText(hdc,capturingKey?L"...":L"+",p+16,y+84,32,22,lerpCol(T.subtext,T.accent,addHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     drawRR(hdc,p+54,y+84,32,22,12,lerpCol(T.btn,T.btnHov,remHov),RGB(0,0,0),0);
-    drawText(hdc,L"",p+54,y+84,32,22,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"\u2212",p+54,y+84,32,22,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     y=l.yKps;
 
     // KPS CARD - presets inside
@@ -16266,6 +16342,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
                 if(g_optimiseRunning||g_optimiseDecisionPending) needRepaint=true;
                 if(g_kpsEditing) needRepaint=true;
+                if(g_cardAnimActive) needRepaint=true; // card hover fade still settling
                 // Active toasts need continuous repaints too (slide-in/stack
                 // animation, fade in/out) - a single InvalidateRect from
                 // showToast() only produces one frame, which froze the
@@ -16644,14 +16721,26 @@ void showSplash(HINSTANCE hInst){
     // Rounded corners via region
     HRGN rgn=CreateRoundRectRgn(0,0,sW+1,sH+1,28,28);
     SetWindowRgn(hwndSplash,rgn,FALSE);
-    // Show at full opacity — no fade-in to prevent DWM compositing flicker
-    SetLayeredWindowAttributes(hwndSplash,0,255,LWA_ALPHA);
+    // Start fully transparent, then fade up. Setting 255 before ShowWindow made the
+    // splash appear at full opacity for a frame and then blink back to 0.
+    SetLayeredWindowAttributes(hwndSplash,0,0,LWA_ALPHA);
     ShowWindow(hwndSplash,SW_SHOW);
-    {MSG m; while(PeekMessage(&m,NULL,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessage(&m);}}
-    for(int a=0;a<=255;a+=3){SetLayeredWindowAttributes(hwndSplash,0,(BYTE)a,LWA_ALPHA);Sleep(4);}
+    fadeSplash(0,255,3);
+}
+// Both fades used to be a bare Sleep() loop with no message pump, so for the ~340ms
+// they ran, WM_TIMER never fired and the starfield sat frozen - the "paused, then it
+// starts playing" on launch, and the stall during the fade out. Pumping here keeps
+// the splash's own animation timer ticking for the whole transition.
+void fadeSplash(int from,int to,int step){
+    int dir = (to>from) ? step : -step;
+    for(int a=from; (dir>0 ? a<=to : a>=to); a+=dir){
+        SetLayeredWindowAttributes(hwndSplash,0,(BYTE)std::max(0,std::min(255,a)),LWA_ALPHA);
+        MSG m; while(PeekMessage(&m,NULL,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessage(&m);}
+        Sleep(4);
+    }
 }
 void hideSplash(){
-    for(int a=255;a>=0;a-=3){SetLayeredWindowAttributes(hwndSplash,0,(BYTE)a,LWA_ALPHA);Sleep(4);}
+    fadeSplash(255,0,3);
     DestroyWindow(hwndSplash);hwndSplash=NULL;
 }
 
