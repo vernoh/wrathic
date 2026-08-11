@@ -13446,7 +13446,11 @@ static std::wstring generateHWID(){
 
 // ===================== HTTP =====================
 std::string wtos(const std::wstring& w){return std::string(w.begin(),w.end());}
-std::string httpCall(const wchar_t* path,const std::string& body,const std::string& key,const std::string& method){
+// outStatus (optional) receives the HTTP status code. Needed because an auth failure
+// returns a non-empty JSON error body, which is otherwise indistinguishable from a
+// normal response and would fall through the checks in validateLicense().
+std::string httpCall(const wchar_t* path,const std::string& body,const std::string& key,const std::string& method,int* outStatus=nullptr){
+    if(outStatus)*outStatus=0;
     HINTERNET hN=InternetOpen(L"Macro/1.0",INTERNET_OPEN_TYPE_DIRECT,NULL,NULL,0);if(!hN)return"";
     static std::wstring _surl; if(_surl.empty()){auto _s=SUPABASE_URL_STR();_surl=std::wstring(_s.begin(),_s.end());}
     HINTERNET hC=InternetConnect(hN,_surl.c_str(),INTERNET_DEFAULT_HTTPS_PORT,NULL,NULL,INTERNET_SERVICE_HTTP,0,0);if(!hC){InternetCloseHandle(hN);return"";}
@@ -13454,6 +13458,7 @@ std::string httpCall(const wchar_t* path,const std::string& body,const std::stri
     HINTERNET hR=HttpOpenRequest(hC,wm.c_str(),path,NULL,NULL,t,INTERNET_FLAG_SECURE|INTERNET_FLAG_RELOAD|INTERNET_FLAG_NO_CACHE_WRITE,0);if(!hR){InternetCloseHandle(hC);InternetCloseHandle(hN);return"";}
     std::string h="Content-Type: application/json\r\napikey: "+key+"\r\nAuthorization: Bearer "+key+"\r\nPrefer: return=representation\r\n";
     HttpSendRequestA(hR,h.c_str(),(DWORD)h.size(),(LPVOID)body.c_str(),(DWORD)body.size());
+    if(outStatus){DWORD code=0,sz=sizeof(code);if(HttpQueryInfo(hR,HTTP_QUERY_STATUS_CODE|HTTP_QUERY_FLAG_NUMBER,&code,&sz,NULL))*outStatus=(int)code;}
     std::string resp;char buf[4096];DWORD rd=0;
     while(InternetReadFile(hR,buf,sizeof(buf)-1,&rd)&&rd>0){buf[rd]=0;resp+=buf;rd=0;}
     InternetCloseHandle(hR);InternetCloseHandle(hC);InternetCloseHandle(hN);
@@ -13480,11 +13485,17 @@ std::string githubGet(const char* path){
 void saveLicense(const std::wstring& k){ regSetString(L"LicenseKey",k); }
 std::wstring loadLicense(){ return regGetString(L"LicenseKey",L""); }
 
-// Returns: -1=network error, 0=invalid, 1=valid+match, 2=valid+just activated
+// Returns: -1=network error, 0=invalid, 1=valid+match, 2=valid+just activated,
+//          3=hwid mismatch, 4=trial expired, 5=client key rejected (build out of date)
 int validateLicense(const std::wstring& key, const std::wstring& hwid) {
     // Silently validate - only log issues
     std::wstring path=L"/rest/v1/licenses?license_key=eq."+key+L"&select=license_key,hwid,is_active,trial,expires_at";
-    std::string resp=httpCall(path.c_str(),"",SUPABASE_ANON_STR(),"GET");
+    int status=0;
+    std::string resp=httpCall(path.c_str(),"",SUPABASE_ANON_STR(),"GET",&status);
+    // 401/403 means the key this build ships with is no longer accepted, not that
+    // anything is wrong with the user's license. Must be checked before the parsing
+    // below, since the error body is non-empty and would otherwise read as a mismatch.
+    if (status==401||status==403) { LOG_ERR(L"Client key rejected - this build is out of date"); return 5; }
     if (resp.empty()) { LOG_ERR(L"Network error - using cached license"); return -1; }
     if (resp=="[]") { LOG_ERR(L"License key not found"); return 0; }
     if (resp.find("\"is_active\":false")!=std::string::npos) { LOG_ERR(L"License deactivated"); return 0; }
@@ -14120,6 +14131,10 @@ void resourceThread(){
                 // HWID mismatch can happen if network adapters change (VPN, etc.)
                 // Log as info only - don't kill the macro
                 LOG_INFO(L"HWID check warning - if this persists contact support");
+            } else if(r==5){
+                // Our own client key was rejected - the user's licence is fine, this
+                // build just needs updating. Never lock them out for our problem.
+                LOG_ERR(L"This build is out of date - please download the latest version");
             } else if((r==1||r==2) && g_lockKind==LOCK_LICENSE){
                 // License is valid again (e.g. reactivated) - clear the lock
                 g_lockKind=LOCK_NONE;
@@ -16606,6 +16621,10 @@ LRESULT CALLBACK LicenseProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             int r=validateLicense(key,machineHWID);
             if(r==-1)SetWindowText(hwndMsg,L"Network error - check your connection and try again.");
             else if(r==0)SetWindowText(hwndMsg,L"Invalid key or already used on another machine.");
+            // r==5 must not fall into the success branch below: the server never saw
+            // the key, so saving it would report success on an unvalidated licence.
+            else if(r==5)SetWindowText(hwndMsg,L"This version is out of date - download the latest from GitHub, then activate.");
+            else if(r==3)SetWindowText(hwndMsg,L"This key is already active on another machine.");
             else{saveLicense(key);savedLicenseKey=key;SetWindowText(hwndMsg,L"Activated successfully!");Sleep(700);DestroyWindow(hwnd);}
         }
         break;
@@ -16663,7 +16682,9 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
             savedLicenseKey=L"";
             LOG_ERR(L"License removed - key was not found or has been deactivated");
         }
-        // r==-1 (network error), r==3 (hwid mismatch) - keep license, just warn
+        // r==-1 (network error), r==3 (hwid mismatch), r==5 (build out of date)
+        // - keep the license, just warn. Never delete a key over our own problem.
+        if(r==5) LOG_ERR(L"This build is out of date - please download the latest version");
     }
 
     // License / trial gate
