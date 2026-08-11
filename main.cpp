@@ -297,94 +297,110 @@ Theme THEMES[] = {
 int themeIdx = 5;
 
 // ===================== VOID STARS =====================
-struct Star { float x, y, speed, alpha; };
-static Star voidStars[120];
-static bool voidStarsInit=false;
-// Seeded against APP_W/APP_H, the field left the 480x280 splash bare down one side
-// and never refilled it. These track whichever surface is actually drawing.
-static int gStarW=APP_W, gStarH=APP_H;
-void initVoidStars(){
-    srand(12345);
-    for(int i=0;i<120;i++){
-        voidStars[i].x=(float)(rand()%gStarW);
-        voidStars[i].y=(float)(rand()%gStarH);
-        voidStars[i].speed=0.3f+((float)(rand()%100)/100.0f)*1.2f;
-        voidStars[i].alpha=0.2f+((float)(rand()%80)/100.0f)*0.8f;
+// Drawn as three pre-rendered parallax layers that scroll, rather than 120 stars
+// positioned individually every frame.
+//
+// The per-star version had problems that were inherent to it, not tuning issues: a
+// 1px dot drawn at a fractional position gets antialiased across two pixels, so its
+// brightness flickered as it drifted; each star crossed pixel boundaries at its own
+// moment, so the field shimmered; and it cost 120 antialiased fills per frame.
+//
+// Here each layer is rendered once into a bitmap and then blitted at a scrolling
+// offset. Every star in a layer moves in lockstep, so motion reads as one coherent
+// drift with no shimmer, and a frame costs six BitBlts - straight memory copies -
+// instead of 120 GDI+ fills. Three layers at different speeds also give the field
+// some depth, which the flat version never had.
+static const int   STAR_LAYERS      = 3;
+static const float STAR_LAYER_SPEED[STAR_LAYERS] = { 0.16f, 0.38f, 0.78f }; // px per 60fps frame
+static const int   STAR_LAYER_COUNT[STAR_LAYERS] = { 64, 40, 22 };
+static const int   STAR_LAYER_LUM  [STAR_LAYERS] = { 78, 148, 236 };
+
+static HDC     s_starDC [STAR_LAYERS] = {};
+static HBITMAP s_starBmp[STAR_LAYERS] = {};
+static HBITMAP s_starOld[STAR_LAYERS] = {};
+static int     s_starW = 0, s_starH = 0;
+static float   s_starOff[STAR_LAYERS] = {};
+
+static void freeStarLayers(){
+    for(int i=0;i<STAR_LAYERS;i++){
+        if(s_starDC[i]){
+            if(s_starOld[i]) SelectObject(s_starDC[i],s_starOld[i]);
+            if(s_starBmp[i]) DeleteObject(s_starBmp[i]);
+            DeleteDC(s_starDC[i]);
+        }
+        s_starDC[i]=NULL; s_starBmp[i]=NULL; s_starOld[i]=NULL;
     }
-    voidStarsInit=true;
+    s_starW=s_starH=0;
 }
+
+// One canvas large enough for every surface that draws stars (the 480x280 splash and
+// the 420x600 window), built once. Sizing it to whoever drew first would mean
+// rebuilding all three layers on every switch - and rebuilding every frame if the
+// splash and the main window are ever alive together.
+static const int STAR_CANVAS_W = 512, STAR_CANVAS_H = 768;
+
+static void buildStarLayers(HDC ref,int W,int H){
+    (void)W; (void)H;
+    freeStarLayers();
+    W=STAR_CANVAS_W; H=STAR_CANVAS_H;
+    s_starW=W; s_starH=H;
+    srand(12345); // fixed seed so the field is identical every launch
+    for(int L=0;L<STAR_LAYERS;L++){
+        s_starDC[L]=CreateCompatibleDC(ref);
+        s_starBmp[L]=CreateCompatibleBitmap(ref,W,H);
+        s_starOld[L]=(HBITMAP)SelectObject(s_starDC[L],s_starBmp[L]);
+        RECT full={0,0,W,H};
+        HBRUSH black=CreateSolidBrush(RGB(0,0,0));
+        FillRect(s_starDC[L],&full,black);
+        DeleteObject(black);
+        int lum=STAR_LAYER_LUM[L];
+        for(int i=0;i<STAR_LAYER_COUNT[L];i++){
+            int sx=rand()%W, sy=rand()%H;
+            int v=lum-(rand()%40); if(v<12) v=12;
+            SetPixelV(s_starDC[L],sx,sy,RGB(v,v,v));
+            // Brightest layer gets a faint cross of bleed so it reads as a star
+            // rather than a lone pixel.
+            if(L==STAR_LAYERS-1){
+                int d=v/3;
+                if(sx+1<W) SetPixelV(s_starDC[L],sx+1,sy,RGB(d,d,d));
+                if(sy+1<H) SetPixelV(s_starDC[L],sx,sy+1,RGB(d,d,d));
+            }
+        }
+        s_starOff[L]=0.0f;
+    }
+}
+
+void initVoidStars(){ /* layers are built lazily by drawVoidStars */ }
+
 void updateVoidStars(){
-    if(!voidStarsInit) initVoidStars();
-    // Delta-time based motion instead of a fixed per-tick step - the old
-    // code assumed updateVoidStars() fired at a perfectly uniform interval,
-    // but WM_TIMER doesn't guarantee that (timer granularity + variable
-    // frame processing time), so stars visually sped up/slowed down between
-    // ticks. Scaling by actual elapsed time keeps motion smooth regardless.
-    // GetTickCount64 only advances every ~15.6ms, so at a 16ms timer the measured
-    // delta quantised to 0 / 16 / 31 and the scale factor lurched between 0 and ~1.9
-    // every frame. That quantisation *was* the jitter. QPC is sub-microsecond.
+    // Delta-time scaled so the drift speed is identical whatever the repaint rate.
+    // QPC rather than GetTickCount64, whose ~15.6ms resolution quantised the delta
+    // at a 16ms timer and made the scale factor lurch between 0 and ~1.9.
     static LARGE_INTEGER freq={}, last={};
     if(freq.QuadPart==0){ QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
     LARGE_INTEGER nowQ; QueryPerformanceCounter(&nowQ);
     float dtMs=(float)((double)(nowQ.QuadPart-last.QuadPart)*1000.0/(double)freq.QuadPart);
     last=nowQ;
-    if(dtMs<=0.0f||dtMs>100.0f) dtMs=16.6667f; // clamp huge gaps (e.g. app was idle/minimized)
-    float scale=dtMs/16.6667f; // 1.0 at a perfect 60fps tick
-    for(int i=0;i<120;i++){
-        voidStars[i].y+=voidStars[i].speed*scale;
-        if(voidStars[i].y>(float)gStarH+4){
-            voidStars[i].y=-2.0f;
-            voidStars[i].x=(float)(rand()%gStarW);
-            voidStars[i].alpha=0.2f+((float)(rand()%80)/100.0f)*0.8f;
-        }
+    if(dtMs<=0.0f||dtMs>100.0f) dtMs=16.6667f; // app was idle or minimised
+    float scale=dtMs/16.6667f;
+    for(int L=0;L<STAR_LAYERS;L++){
+        s_starOff[L]+=STAR_LAYER_SPEED[L]*scale;
+        if(s_starH>0) while(s_starOff[L]>=(float)s_starH) s_starOff[L]-=(float)s_starH;
     }
 }
+
 void drawVoidStars(HDC hdc,int W,int H){
-    // Adopt the surface we are actually painting before seeding, and reseed if it
-    // changes (the splash is 480x280, the main window 420x600) so the field always
-    // covers the full area instead of leaving a bare strip.
-    if(W>0&&H>0&&(W!=gStarW||H!=gStarH)){ gStarW=W; gStarH=H; voidStarsInit=false; }
-    if(!voidStarsInit) initVoidStars();
-    using namespace Gdiplus;
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeNone); // stars are 1-2px - AA would only blur/slow this down
-
-    // Bucket stars by brightness tier so each tier can be drawn in a single
-    // batched FillRectangles call instead of one GDI call per star (or per
-    // pixel, as the old SetPixel version did).
-    const int TIERS=8;
-    std::vector<RectF> mainRects[TIERS];
-    std::vector<RectF> glowRects[TIERS];
-
-    for(int i=0;i<120;i++){
-        // Keep the sub-pixel position. Truncating to int made a star moving at 0.3px
-        // per frame sit still for three frames and then jump a whole pixel, which
-        // read as stutter on top of the timing jitter. GDI+ antialiases the
-        // fractional offset instead, so slow stars drift smoothly.
-        REAL x=(REAL)voidStars[i].x;
-        REAL y=(REAL)voidStars[i].y;
-        if(x<0||x>=(REAL)W||y<0||y>=(REAL)H) continue;
-        int bright=(int)(voidStars[i].alpha*255.0f);
-        bright=std::max(0,std::min(255,bright));
-        int tier=std::min(TIERS-1, bright*TIERS/256);
-        mainRects[tier].push_back(RectF(x,y,1.0f,1.0f));
-        if(voidStars[i].alpha>0.6f){
-            int glowTier=std::min(TIERS-1,(bright/3)*TIERS/256);
-            if(x+1<(REAL)W) glowRects[glowTier].push_back(RectF(x+1,y,1.0f,1.0f));
-            if(y+1<(REAL)H) glowRects[glowTier].push_back(RectF(x,y+1,1.0f,1.0f));
-        }
-    }
-    for(int t=0;t<TIERS;t++){
-        if(mainRects[t].empty()&&glowRects[t].empty()) continue;
-        int bright=(t*256/TIERS)+16;
-        if(!mainRects[t].empty()){
-            SolidBrush b(Color(255,bright,bright,bright));
-            g.FillRectangles(&b,mainRects[t].data(),(INT)mainRects[t].size());
-        }
-        if(!glowRects[t].empty()){
-            SolidBrush b(Color(255,bright,bright,bright));
-            g.FillRectangles(&b,glowRects[t].data(),(INT)glowRects[t].size());
-        }
+    if(W<=0||H<=0) return;
+    if(!s_starDC[0]) buildStarLayers(hdc,W,H);
+    // The canvas is larger than any window that draws it, so blit only the width we
+    // need and let the DC clip the height. Wrapping uses the canvas height, which is
+    // why the seam never lands inside the visible area.
+    for(int L=0;L<STAR_LAYERS;L++){
+        int oy=(int)s_starOff[L];
+        // Two blits per layer wrap it seamlessly. SRCPAINT ORs the white dots onto
+        // whatever is already there, so the layers composite without needing alpha.
+        BitBlt(hdc,0,oy-s_starH,W,s_starH,s_starDC[L],0,0,SRCPAINT);
+        BitBlt(hdc,0,oy,        W,s_starH,s_starDC[L],0,0,SRCPAINT);
     }
 }
 #define T THEMES[themeIdx]
@@ -14737,9 +14753,17 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // the card grows slightly (coming toward you), rises, and its shadow slides
     // well away from the pointer so the near corner looks furthest off the surface.
     // All of it in floats so the card glides rather than stepping pixel by pixel.
-    REAL grow=hv*2.5f, lift=hv*5.0f;
+    REAL grow=hv*3.5f, lift=hv*7.0f;
     REAL cx=(REAL)x-grow, cy=(REAL)y-grow-lift, cw=(REAL)w+grow*2, ch=(REAL)h+grow*2;
-    REAL shX=-dx*8.0f*hv, shY=-dy*6.0f*hv;
+    REAL shX=-dx*11.0f*hv, shY=-dy*8.0f*hv;
+
+    // Actually roll the surface toward the cursor. GDI+ only rotates in-plane, and
+    // the caller draws this card's text afterwards in screen space, so the angle is
+    // held under a degree: enough that the edges visibly pivot, small enough that
+    // the content still sits where it should.
+    Matrix tilt;
+    tilt.RotateAt(-dx*0.85f*hv, PointF(cx+cw*0.5f, cy+ch*0.5f));
+    g.SetTransform(&tilt);
 
     // 1. Ambient drop shadow. Two passes rather than three - the third was costing a
     //    full extra path fill per card per frame for a barely visible difference.
@@ -14792,7 +14816,7 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         // The highlight drifts along the edge rather than sitting where the cursor
         // is - a slow sweep either side of the pointer, so the card looks like it is
         // catching a moving light instead of holding a static hotspot.
-        REAL sweep=(REAL)sin((double)GetTickCount()/900.0)*(cw*0.30f);
+        REAL sweep=(REAL)sin((double)GetTickCount()/900.0)*(cw*0.13f);
         REAL gx=fx.mx+sweep, gy=fx.my;
         REAL rad=(REAL)std::max(cw,ch)*0.62f;
         GraphicsPath spot;
@@ -14805,6 +14829,7 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         g.FillPath(&pg,&spot);
         g.ResetClip();
     }
+    g.ResetTransform();
 }
 // The card's resting appearance with none of the hover work: same gradient body,
 // same caught-light top edge, same hairline border. Used by the in-game overlay so
