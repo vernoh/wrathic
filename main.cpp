@@ -395,12 +395,17 @@ void drawVoidStars(HDC hdc,int W,int H){
     // The canvas is larger than any window that draws it, so blit only the width we
     // need and let the DC clip the height. Wrapping uses the canvas height, which is
     // why the seam never lands inside the visible area.
+    // Copy only the rows that actually land on screen. Blitting the whole 768-row
+    // canvas twice per layer meant moving 1536 rows to show 600 - the off-screen
+    // remainder was clipped, but only after the work was done. Now each layer costs
+    // exactly H rows. SRCPAINT ORs the white dots onto whatever is already there,
+    // so layers composite without needing alpha.
     for(int L=0;L<STAR_LAYERS;L++){
-        int oy=(int)s_starOff[L];
-        // Two blits per layer wrap it seamlessly. SRCPAINT ORs the white dots onto
-        // whatever is already there, so the layers composite without needing alpha.
-        BitBlt(hdc,0,oy-s_starH,W,s_starH,s_starDC[L],0,0,SRCPAINT);
-        BitBlt(hdc,0,oy,        W,s_starH,s_starDC[L],0,0,SRCPAINT);
+        int oy=((int)s_starOff[L])%s_starH; if(oy<0) oy+=s_starH;
+        int srcTop=(s_starH-oy)%s_starH;              // source row shown at dest y=0
+        int h1=std::min(H,s_starH-srcTop);
+        BitBlt(hdc,0,0,W,h1,s_starDC[L],0,srcTop,SRCPAINT);
+        if(H>h1) BitBlt(hdc,0,h1,W,H-h1,s_starDC[L],0,0,SRCPAINT);
     }
 }
 #define T THEMES[themeIdx]
@@ -13892,7 +13897,7 @@ void captureThread(bool isHotkey){
 }
 
 void hotkeyThread(){
-    bool was=false;
+    bool was=false, wasRunning=false;
     while(appRunning){
         if(!capturingHotkey&&!capturingKey){
             bool focused=robloxFocused.load();
@@ -13914,10 +13919,19 @@ void hotkeyThread(){
                     }
                 }
             }
+            // These invalidations used to fire every 16ms unconditionally, which
+            // forced a full-window repaint at 60fps on the macro tab in parallel
+            // with the animation timer - bypassing every throttle that timer has,
+            // including the minimised check. It was the single largest cost in the
+            // app and is why the background stuttered specifically on this tab.
+            // Only repaint when the state this thread owns has actually changed.
+            bool nowRunning=macroRunning.load();
+            if(pressed!=was || nowRunning!=wasRunning){
+                if(activeTab==0) InvalidateRect(hwndMain,NULL,FALSE);
+                if(hwndOverlay) InvalidateRect(hwndOverlay,NULL,FALSE);
+            }
             was=pressed;
-            // Only redraw on macro tab - settings handles its own refresh
-            if(activeTab==0) InvalidateRect(hwndMain,NULL,FALSE);
-            if(hwndOverlay)InvalidateRect(hwndOverlay,NULL,FALSE);
+            wasRunning=nowRunning;
         }
         Sleep(16);
     }
@@ -14759,9 +14773,9 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // every label. Tilt is therefore faked, but with the cues turned up far enough
     // to actually register: the card scales up, rises, and the corner nearest the
     // cursor drops a much longer shadow than the far one.
-    REAL grow=hv*6.0f, lift=hv*10.0f;
+    REAL grow=hv*4.0f, lift=hv*7.0f;
     REAL cx=(REAL)x-grow, cy=(REAL)y-grow-lift, cw=(REAL)w+grow*2, ch=(REAL)h+grow*2;
-    REAL shX=-dx*18.0f*hv, shY=-dy*13.0f*hv;
+    REAL shX=-dx*13.0f*hv, shY=-dy*9.0f*hv;
 
     // 1. Ambient drop shadow. Two passes rather than three - the third was costing a
     //    full extra path fill per card per frame for a barely visible difference.
@@ -16454,8 +16468,18 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     // playing. Update and draw are now coupled, and the interval is
                     // constant, so motion is even; the delta-time scaling in
                     // updateVoidStars keeps the speed identical at either rate.
+                    // Repainting the whole window 60x/sec purely to drift the
+                    // starfield was ~59% of a core on its own - measured with every
+                    // effect disabled, so it is the floor, not the decoration. The
+                    // stars drift under 1px per frame; halving the rate is not
+                    // visible, and the rate is *constant* within each state, which
+                    // is what keeps the motion even. Unfocused it drops further -
+                    // nobody is looking at a background window's starfield.
                     static int voidSkip=0;
-                    const int every = (robloxFocused.load()&&macroRunning.load()) ? 2 : 1;
+                    bool foreground = (GetForegroundWindow()==hwnd);
+                    int every = 2;                                       // 30fps
+                    if(!foreground) every = 6;                           // 10fps
+                    else if(robloxFocused.load()&&macroRunning.load()) every = 4; // 15fps in game
                     if((++voidSkip % every)==0){
                         updateVoidStars();
                         InvalidateRect(hwnd,NULL,FALSE);
