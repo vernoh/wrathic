@@ -12829,6 +12829,9 @@ SIZE_T procMemKB=0;         // this process working set KB
 std::atomic<int> actualKPS(0);
 std::atomic<int> keypressCount(0);
 bool uiSoundsEnabled   = true;
+// Drops the glass and depth work in drawCard() back to a flat fill. Geometry is
+// identical either way, so nothing reflows when it is toggled.
+bool performanceMode   = false;
 bool discordRpcEnabled  = false;   // Discord rich presence
 bool overlaySysStats    = true;
 // Version update toast
@@ -12915,6 +12918,7 @@ void saveSettings() {
     regSetDWORD(L"OverlayShowGpu",(DWORD)overlayShowGpu);
     regSetDWORD(L"OverlayShowDisk",(DWORD)overlayShowDisk);
     regSetDWORD(L"UiSoundsEnabled",(DWORD)uiSoundsEnabled);
+    regSetDWORD(L"PerformanceMode",(DWORD)performanceMode);
     regSetDWORD(L"OverlaySysStats",(DWORD)overlaySysStats);
     regSetDWORD(L"DiscordRpcEnabled",(DWORD)discordRpcEnabled);
     LOG_OK(L"Settings saved");
@@ -12970,6 +12974,7 @@ void loadSettings() {
     overlayShowGpu=regGetDWORD(L"OverlayShowGpu",0)!=0;
     overlayShowDisk=regGetDWORD(L"OverlayShowDisk",0)!=0;
     uiSoundsEnabled=regGetDWORD(L"UiSoundsEnabled",1)!=0;
+    performanceMode=regGetDWORD(L"PerformanceMode",0)!=0;
     overlaySysStats=regGetDWORD(L"OverlaySysStats",1)!=0;
     discordRpcEnabled=regGetDWORD(L"DiscordRpcEnabled",0)!=0;
 
@@ -14615,17 +14620,65 @@ void drawText(HDC hdc,const wchar_t* text,int x,int y,int w,int h,
     SelectObject(hdc,font);SetTextColor(hdc,c);SetBkMode(hdc,TRANSPARENT);
     RECT r={x,y,x+w,y+h};DrawText(hdc,text,-1,&r,fmt);
 }
+// Rounded-rect path helper - the same figure drawRR builds, reused by drawCard.
+static void addRoundRectPath(Gdiplus::GraphicsPath& p,int x,int y,int w,int h,int r){
+    int d=r*2;
+    p.AddArc(x,y,d,d,180,90);
+    p.AddArc(x+w-d,y,d,d,270,90);
+    p.AddArc(x+w-d,y+h-d,d,d,0,90);
+    p.AddArc(x,y+h-d,d,d,90,90);
+    p.CloseFigure();
+}
+
+// A card reads as a physical pane rather than a lighter rectangle because of four
+// separate cues, drawn bottom-up: an ambient drop shadow, a vertical gradient body
+// (lit from above), a 1px caught-light line inside the top edge, and a hairline
+// border. Performance mode skips all of it for one flat fill - the geometry is
+// identical, so no layout shifts when it is switched.
 void drawCard(HDC hdc,int x,int y,int w,int h){
-    // Subtle shadow effect - slightly lighter inner, no visible border
-    drawRR(hdc,x,y,w,h,14,T.card,RGB(0,0,0),0);
-    // Thin top highlight line for depth
-    HPEN hp=CreatePen(PS_SOLID,1,RGB(
-        std::min(255,GetRValue(T.card)+12),
-        std::min(255,GetGValue(T.card)+12),
-        std::min(255,GetBValue(T.card)+12)));
-    HPEN op=(HPEN)SelectObject(hdc,hp);
-    MoveToEx(hdc,x+14,y+1,NULL);LineTo(hdc,x+w-14,y+1);
-    SelectObject(hdc,op);DeleteObject(hp);
+    const int R=14;
+    if(performanceMode){
+        drawRR(hdc,x,y,w,h,R,T.card,T.border,1);
+        return;
+    }
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+
+    // 1. Ambient drop shadow - three offset passes, widest and faintest first, so
+    //    the falloff is smooth without needing a real blur.
+    for(int i=3;i>=1;i--){
+        int sp=i*2;
+        GraphicsPath sh;
+        addRoundRectPath(sh,x-sp/2,y+sp,w+sp,h,R+sp/2);
+        SolidBrush sb(Color((BYTE)(9-i*2),0,0,0));
+        g.FillPath(&sb,&sh);
+    }
+
+    GraphicsPath body;
+    addRoundRectPath(body,x,y,w,h,R);
+
+    // 2. Body - lighter at the top, settling to the base card colour. Kept subtle;
+    //    on the Void theme the whole range is only a few levels above black.
+    int r0=std::min(255,GetRValue(T.card)+14), g0=std::min(255,GetGValue(T.card)+14), b0=std::min(255,GetBValue(T.card)+16);
+    LinearGradientBrush lg(Rect(x,y,w,h+1),
+        Color(255,(BYTE)r0,(BYTE)g0,(BYTE)b0),
+        Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
+        LinearGradientModeVertical);
+    g.FillPath(&lg,&body);
+
+    // 3. Caught light along the top edge - clipped to the card so it follows the
+    //    corner radius instead of running straight across.
+    g.SetClip(&body);
+    Pen hi(Color(30,255,255,255),1.0f);
+    g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
+    g.DrawLine(&hi,(REAL)(x+R),(REAL)y+0.5f,(REAL)(x+w-R),(REAL)y+0.5f);
+    g.DrawArc(&hi,(REAL)(x+w-R*2),(REAL)y,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
+    g.ResetClip();
+
+    // 4. Hairline border.
+    Pen bp(Color(38,255,255,255),1.0f);
+    g.DrawPath(&bp,&body);
 }
 void drawDot(HDC hdc,int cx,int cy,int r,COLORREF c){
     using namespace Gdiplus;
@@ -15287,8 +15340,9 @@ static int calcApplicationCardH(){
     int h=10;
     h+=14+6;                           // header
     h+=24+4;                           // UI Sounds
+    h+=24+4;                           // Discord Rich Presence
     h+=24+4;                           // Minimise to Tray
-    h+=24+6;                           // Changelog on Startup
+    h+=24+6;                           // Performance Mode
     h+=8;
     return h;
 }
@@ -15491,7 +15545,9 @@ void paintSettingsInto(HDC hdc,int W,int H){
     drawText(hdc,L"Discord Rich Presence",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-48,cx,discordRpcEnabled); cx+=24+4;
     drawText(hdc,L"Minimise to Tray",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    drawToggle(hdc,p+cw-48,cx,minimiseToTray); cx+=24+6;
+    drawToggle(hdc,p+cw-48,cx,minimiseToTray); cx+=24+4;
+    drawText(hdc,L"Performance Mode",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawToggle(hdc,p+cw-48,cx,performanceMode); cx+=24+6;
     (void)cx;}
 
     // ── UPDATE CARD ─────────────────────────────────────────────────────────
@@ -15830,6 +15886,8 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();discordRpcEnabled=!discordRpcEnabled;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
       cx+=24+4;
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();minimiseToTray=!minimiseToTray;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
+      cx+=24+4;
+      if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();performanceMode=!performanceMode;saveSettings();InvalidateRect(hwnd,NULL,TRUE);}
     }
 
     // ── UPDATE CARD (l.yUpdate) ───────────────────────────────────────────────
