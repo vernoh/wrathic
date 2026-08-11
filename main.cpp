@@ -300,11 +300,14 @@ int themeIdx = 5;
 struct Star { float x, y, speed, alpha; };
 static Star voidStars[120];
 static bool voidStarsInit=false;
+// Seeded against APP_W/APP_H, the field left the 480x280 splash bare down one side
+// and never refilled it. These track whichever surface is actually drawing.
+static int gStarW=APP_W, gStarH=APP_H;
 void initVoidStars(){
     srand(12345);
     for(int i=0;i<120;i++){
-        voidStars[i].x=(float)(rand()%APP_W);
-        voidStars[i].y=(float)(rand()%APP_H);
+        voidStars[i].x=(float)(rand()%gStarW);
+        voidStars[i].y=(float)(rand()%gStarH);
         voidStars[i].speed=0.3f+((float)(rand()%100)/100.0f)*1.2f;
         voidStars[i].alpha=0.2f+((float)(rand()%80)/100.0f)*0.8f;
     }
@@ -329,14 +332,18 @@ void updateVoidStars(){
     float scale=dtMs/16.6667f; // 1.0 at a perfect 60fps tick
     for(int i=0;i<120;i++){
         voidStars[i].y+=voidStars[i].speed*scale;
-        if(voidStars[i].y>APP_H+4){
+        if(voidStars[i].y>(float)gStarH+4){
             voidStars[i].y=-2.0f;
-            voidStars[i].x=(float)(rand()%APP_W);
+            voidStars[i].x=(float)(rand()%gStarW);
             voidStars[i].alpha=0.2f+((float)(rand()%80)/100.0f)*0.8f;
         }
     }
 }
 void drawVoidStars(HDC hdc,int W,int H){
+    // Adopt the surface we are actually painting before seeding, and reseed if it
+    // changes (the splash is 480x280, the main window 420x600) so the field always
+    // covers the full area instead of leaving a bare strip.
+    if(W>0&&H>0&&(W!=gStarW||H!=gStarH)){ gStarW=W; gStarH=H; voidStarsInit=false; }
     if(!voidStarsInit) initVoidStars();
     using namespace Gdiplus;
     Graphics g(hdc);
@@ -14533,9 +14540,32 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
             SetBkMode(mdc,TRANSPARENT);
             SelectObject(mdc,s_splashFontTitle);
-            SetTextColor(mdc,RGB(230,230,240));
-            RECT tr={0,0,W,H};
+            // The wordmark settles in rather than just being there: it rises a few
+            // pixels and brightens out of the black over the first ~700ms, then a
+            // hairline rule opens outward beneath it.
+            static DWORD s_splashT0=0;
+            if(!s_splashT0) s_splashT0=GetTickCount();
+            float sp=(float)(GetTickCount()-s_splashT0)/700.0f;
+            if(sp>1.0f) sp=1.0f;
+            float ease=1.0f-(1.0f-sp)*(1.0f-sp)*(1.0f-sp); // cubic ease-out
+            int rise=(int)((1.0f-ease)*14.0f);
+            BYTE lum=(BYTE)(ease*230.0f);
+            SetTextColor(mdc,RGB(lum,lum,(BYTE)std::min(255.0f,lum*1.05f)));
+            RECT tr={0,rise,W,H};
             DrawText(mdc,L"WRATHIC",-1,&tr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+
+            // Rule under the wordmark, opening from the centre once it has landed.
+            if(ease>0.25f){
+                float rp=(ease-0.25f)/0.75f;
+                int half=(int)(rp*96.0f);
+                if(half>0){
+                    BYTE rl=(BYTE)(rp*90.0f);
+                    HPEN rp2=CreatePen(PS_SOLID,1,RGB(rl,rl,(BYTE)std::min(255,(int)(rl*1.2f))));
+                    HPEN opn=(HPEN)SelectObject(mdc,rp2);
+                    MoveToEx(mdc,W/2-half,H/2+22,NULL); LineTo(mdc,W/2+half,H/2+22);
+                    SelectObject(mdc,opn); DeleteObject(rp2);
+                }
+            }
 
             // Version - bottom right, very dim
             SelectObject(mdc,s_splashFontSmall);
@@ -14643,6 +14673,18 @@ static void addRoundRectPath(Gdiplus::GraphicsPath& p,int x,int y,int w,int h,in
     p.AddArc(x,y+h-d,d,d,90,90);
     p.CloseFigure();
 }
+// Float variant. Integer geometry made the card jump in whole-pixel steps as it
+// lifted, so the eye tracked individual pixels shifting rather than one solid
+// object moving. Sub-pixel coordinates let GDI+ antialias the motion.
+static void addRoundRectPathF(Gdiplus::GraphicsPath& p,Gdiplus::REAL x,Gdiplus::REAL y,
+                              Gdiplus::REAL w,Gdiplus::REAL h,Gdiplus::REAL r){
+    Gdiplus::REAL d=r*2;
+    p.AddArc(x,y,d,d,180,90);
+    p.AddArc(x+w-d,y,d,d,270,90);
+    p.AddArc(x+w-d,y+h-d,d,d,0,90);
+    p.AddArc(x,y+h-d,d,d,90,90);
+    p.CloseFigure();
+}
 
 // A card reads as a physical pane rather than a lighter rectangle because of four
 // separate cues, drawn bottom-up: an ambient drop shadow, a vertical gradient body
@@ -14694,28 +14736,28 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // Three cues together sell the tilt, where a 2px nudge alone read as nothing:
     // the card grows slightly (coming toward you), rises, and its shadow slides
     // well away from the pointer so the near corner looks furthest off the surface.
-    int grow=(int)(hv*2.5f);
-    int lift=(int)(hv*5.0f);
-    x-=grow; y-=grow+lift; w+=grow*2; h+=grow*2;
-    int shX=(int)(-dx*8.0f*hv), shY=(int)(-dy*6.0f*hv);
+    // All of it in floats so the card glides rather than stepping pixel by pixel.
+    REAL grow=hv*2.5f, lift=hv*5.0f;
+    REAL cx=(REAL)x-grow, cy=(REAL)y-grow-lift, cw=(REAL)w+grow*2, ch=(REAL)h+grow*2;
+    REAL shX=-dx*8.0f*hv, shY=-dy*6.0f*hv;
 
     // 1. Ambient drop shadow. Two passes rather than three - the third was costing a
     //    full extra path fill per card per frame for a barely visible difference.
     for(int i=2;i>=1;i--){
-        int sp=i*3;
+        REAL sp=(REAL)(i*3);
         GraphicsPath sh;
-        addRoundRectPath(sh,x-sp/2+shX,y+sp+lift*2+shY,w+sp,h,R+sp/2);
+        addRoundRectPathF(sh,cx-sp*0.5f+shX,cy+sp+lift*2+shY,cw+sp,ch,(REAL)R+sp*0.5f);
         SolidBrush sb(Color((BYTE)((10-i*3)+(int)(hv*10.0f)),0,0,0));
         g.FillPath(&sb,&sh);
     }
 
     GraphicsPath body;
-    addRoundRectPath(body,x,y,w,h,R);
+    addRoundRectPathF(body,cx,cy,cw,ch,(REAL)R);
 
     // 2. Body - lighter at the top, settling to the base card colour. Kept subtle;
     //    on the Void theme the whole range is only a few levels above black.
     int r0=std::min(255,GetRValue(T.card)+14), g0=std::min(255,GetGValue(T.card)+14), b0=std::min(255,GetBValue(T.card)+16);
-    LinearGradientBrush lg(Rect(x,y,w,h+1),
+    LinearGradientBrush lg(RectF(cx,cy,cw,ch+1),
         Color(255,(BYTE)r0,(BYTE)g0,(BYTE)b0),
         Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
         LinearGradientModeVertical);
@@ -14725,14 +14767,17 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     //    corner radius instead of running straight across.
     g.SetClip(&body);
     Pen hi(Color(30,255,255,255),1.0f);
-    g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
-    g.DrawLine(&hi,(REAL)(x+R),(REAL)y+0.5f,(REAL)(x+w-R),(REAL)y+0.5f);
-    g.DrawArc(&hi,(REAL)(x+w-R*2),(REAL)y,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
+    g.DrawArc(&hi,cx,cy,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
+    g.DrawLine(&hi,cx+R,cy+0.5f,cx+cw-R,cy+0.5f);
+    g.DrawArc(&hi,cx+cw-R*2,cy,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
     g.ResetClip();
 
-    // 4. Hairline border.
-    Pen bp(Color(38,255,255,255),1.0f);
-    g.DrawPath(&bp,&body);
+    // 4. Border only while hovered - at rest the cards should read as shapes in the
+    //    dark, not as outlined boxes.
+    if(hv>0.004f){
+        Pen bp(Color((BYTE)(70*hv),255,255,255),1.0f);
+        g.DrawPath(&bp,&body);
+    }
 
     // 5. Specular sweep - a soft light centred on the cursor, clipped to a 2px ring
     //    just inside the border so it reads as light catching the card's edge
@@ -14741,20 +14786,50 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     //    the card the highlight stays put and dims away instead of vanishing.
     if(hv>0.01f){
         GraphicsPath innerEdge;
-        addRoundRectPath(innerEdge,x+2,y+2,w-4,h-4,R-2);
+        addRoundRectPathF(innerEdge,cx+2,cy+2,cw-4,ch-4,(REAL)R-2);
         g.SetClip(&body);
         g.SetClip(&innerEdge,CombineModeExclude);
-        REAL rad=(REAL)std::max(w,h)*0.62f;
+        // The highlight drifts along the edge rather than sitting where the cursor
+        // is - a slow sweep either side of the pointer, so the card looks like it is
+        // catching a moving light instead of holding a static hotspot.
+        REAL sweep=(REAL)sin((double)GetTickCount()/900.0)*(cw*0.30f);
+        REAL gx=fx.mx+sweep, gy=fx.my;
+        REAL rad=(REAL)std::max(cw,ch)*0.62f;
         GraphicsPath spot;
-        spot.AddEllipse(fx.mx-rad,fx.my-rad,rad*2,rad*2);
+        spot.AddEllipse(gx-rad,gy-rad,rad*2,rad*2);
         PathGradientBrush pg(&spot);
-        pg.SetCenterPoint(PointF(fx.mx,fx.my));
+        pg.SetCenterPoint(PointF(gx,gy));
         pg.SetCenterColor(Color((BYTE)(190*hv),255,255,255));
         Color edge(0,255,255,255); int cnt=1;
         pg.SetSurroundColors(&edge,&cnt);
         g.FillPath(&pg,&spot);
         g.ResetClip();
     }
+}
+// The card's resting appearance with none of the hover work: same gradient body,
+// same caught-light top edge, same hairline border. Used by the in-game overlay so
+// it reads as the same material as the app, without animating over someone's game.
+void drawCardStatic(HDC hdc,int x,int y,int w,int h,int R){
+    if(performanceMode){ drawRR(hdc,x,y,w,h,R,T.card,T.border,1); return; }
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    GraphicsPath body;
+    addRoundRectPath(body,x,y,w,h,R);
+    int r0=std::min(255,GetRValue(T.card)+14), g0=std::min(255,GetGValue(T.card)+14), b0=std::min(255,GetBValue(T.card)+16);
+    LinearGradientBrush lg(Rect(x,y,w,h+1),
+        Color(255,(BYTE)r0,(BYTE)g0,(BYTE)b0),
+        Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
+        LinearGradientModeVertical);
+    g.FillPath(&lg,&body);
+    g.SetClip(&body);
+    Pen hi(Color(30,255,255,255),1.0f);
+    g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
+    g.DrawLine(&hi,(REAL)(x+R),(REAL)y+0.5f,(REAL)(x+w-R),(REAL)y+0.5f);
+    g.DrawArc(&hi,(REAL)(x+w-R*2),(REAL)y,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
+    g.ResetClip();
+    Pen bp(Color(46,255,255,255),1.0f);
+    g.DrawPath(&bp,&body);
 }
 void drawDot(HDC hdc,int cx,int cy,int r,COLORREF c){
     using namespace Gdiplus;
@@ -16022,7 +16097,7 @@ static void paintOverlay(HWND hwnd){
     const Theme& OT=THEMES[themeIdx];
 
     fillRect(hdc,0,0,W,H,OT.bg);
-    drawRR(hdc,0,0,W,H,14,OT.card,OT.border,1);
+    drawCardStatic(hdc,0,0,W,H,14); // same surface material as the app's cards
 
     bool running = macroRunning.load();
     int sw = GetSystemMetrics(SM_CXSCREEN);
@@ -16327,28 +16402,19 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // largest source of the app's idle CPU use.
             if(themeIdx==5){
                 if(!IsIconic(hwnd)){
-                    updateVoidStars(); // stepped every tick, so speed never changes
-                    // Repainting the whole window 60x/sec purely to drift 1px stars
-                    // was the bulk of the app's idle cost, and the stars look
-                    // identical at half that. So: full rate only while something
-                    // interactive is actually moving, half when idle, a third when
-                    // the game wants the headroom.
-                    bool interactive = g_cardAnimActive || g_kpsEditing ||
-                                       g_optimiseRunning || g_optimiseDecisionPending ||
-                                       fabsf(tabAnim-(float)activeTab)>0.002f ||
-                                       fadeAlpha<0.999f || settFadeAlpha<0.999f ||
-                                       fabsf(animModeHold-(float)holdMode.load())>0.002f;
-                    if(!interactive) for(int i=0;i<16;i++)
-                        if(hoverBtn[i]>0.002f&&hoverBtn[i]<0.998f){interactive=true;break;}
-                    if(!interactive && g_toastCSInit){
-                        EnterCriticalSection(&g_toastCS);
-                        if(!g_toasts.empty()) interactive=true;
-                        LeaveCriticalSection(&g_toastCS);
-                    }
-                    bool voidThrottle=robloxFocused.load()&&macroRunning.load();
-                    int every = interactive ? 1 : (voidThrottle ? 3 : 2);
+                    // Stepping the stars on every tick while only *drawing* on some
+                    // of them meant each drawn frame advanced them by one step or
+                    // two depending on what else happened to be animating. That
+                    // irregular pacing is what read as the background pausing and
+                    // playing. Update and draw are now coupled, and the interval is
+                    // constant, so motion is even; the delta-time scaling in
+                    // updateVoidStars keeps the speed identical at either rate.
                     static int voidSkip=0;
-                    if((++voidSkip % every)==0) InvalidateRect(hwnd,NULL,FALSE);
+                    const int every = (robloxFocused.load()&&macroRunning.load()) ? 2 : 1;
+                    if((++voidSkip % every)==0){
+                        updateVoidStars();
+                        InvalidateRect(hwnd,NULL,FALSE);
+                    }
                 }
             } else {
                 // Only repaint if something is actually animating
