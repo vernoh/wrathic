@@ -48,8 +48,8 @@ namespace Gdiplus { using std::min; using std::max; }
 #pragma comment(lib, "comdlg32.lib")  // GetOpenFileNameW / GetSaveFileNameW
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.0.1"
-#define CHANGELOG_VERSION L"v3.0.1"
+#define APP_VERSION      L"v3.1.0-beta"
+#define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
 #define TRIAL_REG_KEY     L"Software\\MacroApp\\Trial"
