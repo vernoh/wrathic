@@ -14649,15 +14649,14 @@ static void addRoundRectPath(Gdiplus::GraphicsPath& p,int x,int y,int w,int h,in
 // (lit from above), a 1px caught-light line inside the top edge, and a hairline
 // border. Performance mode skips all of it for one flat fill - the geometry is
 // identical, so no layout shifts when it is switched.
-// Per-card hover amount, keyed by the card's own position so each animates
-// independently without every call site having to own a float.
-static float* cardHoverSlot(int key){
-    static int  keys[24]={0};
-    static float vals[24]={0};
-    for(int i=0;i<24;i++){ if(keys[i]==key) return &vals[i]; }
-    for(int i=0;i<24;i++){ if(keys[i]==0){ keys[i]=key; vals[i]=0.0f; return &vals[i]; } }
-    return &vals[0];
-}
+// Per-card hover state. Keyed by draw order rather than position: settings cards
+// live at y = 8 - settScrollPos, so a position key changed on every scroll step and
+// churned through the table until every card shared one slot. Draw order is stable.
+// mx/my remember where the cursor was so the highlight can fade out from where it
+// was left, instead of snapping off the moment the pointer leaves the window.
+struct CardFx { float hv, mx, my; };
+static CardFx g_cardFx[32]={};
+int g_cardDrawIndex=0; // reset once per frame by paintMain
 
 void drawCard(HDC hdc,int x,int y,int w,int h){
     const int R=14;
@@ -14665,39 +14664,48 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         drawRR(hdc,x,y,w,h,R,T.card,T.border,1);
         return;
     }
+    // Cards scrolled out of view were still being fully rendered - shadows, gradient
+    // and all. Settings draws nine of them, so most of that work was invisible.
+    if(y+h<-24 || y>APP_H+24){ g_cardDrawIndex++; return; }
+
     using namespace Gdiplus;
     Graphics g(hdc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
 
-    // Where the cursor sits relative to the card centre, -1..1 on each axis. The
-    // corner nearest the cursor is the one that should read as lifted.
+    int idx=g_cardDrawIndex++; if(idx>=32) idx=31;
+    CardFx& fx=g_cardFx[idx];
+
     POINT m=g_lastMousePos;
     bool inside = m.x>=x && m.x<=x+w && m.y>=y && m.y<=y+h;
-    float* hovA=cardHoverSlot(y*4096+x);
-    animateTo(*hovA, inside?1.0f:0.0f, inside?0.06f:0.10f);
-    float hv=*hovA;
+    if(inside){ fx.mx=(float)m.x; fx.my=(float)m.y; }
+    animateTo(fx.hv, inside?1.0f:0.0f, inside?0.05f:0.11f);
+    float hv=fx.hv;
     if(hv>0.002f&&hv<0.998f) g_cardAnimActive=true;
+
+    // Where the cursor sits relative to the card centre, -1..1 per axis. Uses the
+    // remembered position so the tilt eases back rather than snapping flat.
     float dx=0.0f, dy=0.0f;
-    if(hv>0.001f && m.x>=0){
-        dx=((float)m.x-(x+w*0.5f))/(w*0.5f);
-        dy=((float)m.y-(y+h*0.5f))/(h*0.5f);
+    if(hv>0.001f){
+        dx=(fx.mx-(x+w*0.5f))/(w*0.5f);
+        dy=(fx.my-(y+h*0.5f))/(h*0.5f);
         dx=std::max(-1.0f,std::min(1.0f,dx));
         dy=std::max(-1.0f,std::min(1.0f,dy));
     }
-    // The whole card rises a touch, and the shadow slides *away* from the cursor -
-    // the cue the eye reads as that corner tilting up toward you.
-    int lift=(int)(hv*2.0f);
-    y-=lift;
-    int shX=(int)(-dx*3.0f*hv), shY=(int)(-dy*2.0f*hv);
+    // Three cues together sell the tilt, where a 2px nudge alone read as nothing:
+    // the card grows slightly (coming toward you), rises, and its shadow slides
+    // well away from the pointer so the near corner looks furthest off the surface.
+    int grow=(int)(hv*2.5f);
+    int lift=(int)(hv*5.0f);
+    x-=grow; y-=grow+lift; w+=grow*2; h+=grow*2;
+    int shX=(int)(-dx*8.0f*hv), shY=(int)(-dy*6.0f*hv);
 
-    // 1. Ambient drop shadow - three offset passes, widest and faintest first, so
-    //    the falloff is smooth without needing a real blur. Deepens on hover
-    //    because the card is now further off its background.
-    for(int i=3;i>=1;i--){
-        int sp=i*2;
+    // 1. Ambient drop shadow. Two passes rather than three - the third was costing a
+    //    full extra path fill per card per frame for a barely visible difference.
+    for(int i=2;i>=1;i--){
+        int sp=i*3;
         GraphicsPath sh;
         addRoundRectPath(sh,x-sp/2+shX,y+sp+lift*2+shY,w+sp,h,R+sp/2);
-        SolidBrush sb(Color((BYTE)((9-i*2)+(int)(hv*5.0f)),0,0,0));
+        SolidBrush sb(Color((BYTE)((10-i*3)+(int)(hv*10.0f)),0,0,0));
         g.FillPath(&sb,&sh);
     }
 
@@ -14729,30 +14737,22 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // 5. Specular sweep - a soft light centred on the cursor, clipped to a 2px ring
     //    just inside the border so it reads as light catching the card's edge
     //    rather than a blob floating on its face.
-    if(hv>0.01f && m.x>=0){
+    //    Driven by the remembered cursor position and hv, so when the pointer leaves
+    //    the card the highlight stays put and dims away instead of vanishing.
+    if(hv>0.01f){
         GraphicsPath innerEdge;
         addRoundRectPath(innerEdge,x+2,y+2,w-4,h-4,R-2);
         g.SetClip(&body);
         g.SetClip(&innerEdge,CombineModeExclude);
         REAL rad=(REAL)std::max(w,h)*0.62f;
         GraphicsPath spot;
-        spot.AddEllipse((REAL)m.x-rad,(REAL)m.y-rad,rad*2,rad*2);
+        spot.AddEllipse(fx.mx-rad,fx.my-rad,rad*2,rad*2);
         PathGradientBrush pg(&spot);
-        pg.SetCenterPoint(PointF((REAL)m.x,(REAL)m.y));
-        pg.SetCenterColor(Color((BYTE)(165*hv),255,255,255));
+        pg.SetCenterPoint(PointF(fx.mx,fx.my));
+        pg.SetCenterColor(Color((BYTE)(190*hv),255,255,255));
         Color edge(0,255,255,255); int cnt=1;
         pg.SetSurroundColors(&edge,&cnt);
         g.FillPath(&pg,&spot);
-        g.ResetClip();
-
-        // A far fainter version across the face, so the lit edge has something to
-        // fall off into instead of stopping dead at the border.
-        g.SetClip(&body);
-        PathGradientBrush pf(&spot);
-        pf.SetCenterPoint(PointF((REAL)m.x,(REAL)m.y));
-        pf.SetCenterColor(Color((BYTE)(26*hv),255,255,255));
-        pf.SetSurroundColors(&edge,&cnt);
-        g.FillPath(&pf,&spot);
         g.ResetClip();
     }
 }
@@ -15174,6 +15174,10 @@ static void drawOptimiseConfirm(HDC hdc,int W,int H){
 }
 
 void paintMain(HWND hwnd){
+    // Per-frame card state: draw order keys the hover slots, and the flag is
+    // re-derived each frame by drawCard rather than latching on forever.
+    g_cardDrawIndex=0;
+    g_cardAnimActive=false;
     PAINTSTRUCT ps;HDC hdc_real=BeginPaint(hwnd,&ps);
     RECT cr;GetClientRect(hwnd,&cr);int W=cr.right,H=cr.bottom;
     if(!s_mainBufDC||W!=s_mainBufW||H!=s_mainBufH){
@@ -16323,11 +16327,28 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // largest source of the app's idle CPU use.
             if(themeIdx==5){
                 if(!IsIconic(hwnd)){
-                    updateVoidStars(); // keep stars at a constant speed...
-                    static int voidSkip=0;
+                    updateVoidStars(); // stepped every tick, so speed never changes
+                    // Repainting the whole window 60x/sec purely to drift 1px stars
+                    // was the bulk of the app's idle cost, and the stars look
+                    // identical at half that. So: full rate only while something
+                    // interactive is actually moving, half when idle, a third when
+                    // the game wants the headroom.
+                    bool interactive = g_cardAnimActive || g_kpsEditing ||
+                                       g_optimiseRunning || g_optimiseDecisionPending ||
+                                       fabsf(tabAnim-(float)activeTab)>0.002f ||
+                                       fadeAlpha<0.999f || settFadeAlpha<0.999f ||
+                                       fabsf(animModeHold-(float)holdMode.load())>0.002f;
+                    if(!interactive) for(int i=0;i<16;i++)
+                        if(hoverBtn[i]>0.002f&&hoverBtn[i]<0.998f){interactive=true;break;}
+                    if(!interactive && g_toastCSInit){
+                        EnterCriticalSection(&g_toastCS);
+                        if(!g_toasts.empty()) interactive=true;
+                        LeaveCriticalSection(&g_toastCS);
+                    }
                     bool voidThrottle=robloxFocused.load()&&macroRunning.load();
-                    // ...but halve the repaints when the game needs the headroom.
-                    if(!voidThrottle||(++voidSkip%2==0)) InvalidateRect(hwnd,NULL,FALSE);
+                    int every = interactive ? 1 : (voidThrottle ? 3 : 2);
+                    static int voidSkip=0;
+                    if((++voidSkip % every)==0) InvalidateRect(hwnd,NULL,FALSE);
                 }
             } else {
                 // Only repaint if something is actually animating
