@@ -13210,7 +13210,7 @@ bool checkVersionBlocking(){
     g_lockKind=LOCK_UPDATE;
     g_lockTitle=L"Update Required";
     wchar_t sub[160];
-    swprintf(sub,160,L"You're running %ls — the latest version is %ls",APP_VERSION,wver);
+    swprintf(sub,160,L"You're running %ls  the latest version is %ls",APP_VERSION,wver);
     g_lockSubtitle=sub;
     g_lockButtonText=L"Get the Latest Version";
     g_lockRedirectUrl=UPDATE_DOWNLOAD_URL;
@@ -15135,7 +15135,7 @@ void paintMain(HWND hwnd){
     drawRR(hdc,p+16,y+84,32,22,12,lerpCol(T.btn,T.btnHov,addHov),RGB(0,0,0),0);
     drawText(hdc,capturingKey?L"...":L"+",p+16,y+84,32,22,lerpCol(T.subtext,T.accent,addHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     drawRR(hdc,p+54,y+84,32,22,12,lerpCol(T.btn,T.btnHov,remHov),RGB(0,0,0),0);
-    drawText(hdc,L"−",p+54,y+84,32,22,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"",p+54,y+84,32,22,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     y=l.yKps;
 
     // KPS CARD - presets inside
@@ -16182,10 +16182,19 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             animateTo(fadeAlpha,1.0f,0.08f);
             animateTo(settFadeAlpha,1.0f,0.08f);
 
-            // Void stars: always animate when Void theme active
+            // Void stars: animate continuously, but this branch used to bypass both
+            // the minimise check and the Roblox throttle below - so on the default
+            // theme the whole window repainted 60x/sec forever, including while
+            // minimised to tray and while the macro was running. That is the single
+            // largest source of the app's idle CPU use.
             if(themeIdx==5){
-                updateVoidStars();
-                InvalidateRect(hwnd,NULL,FALSE); // always repaint for star movement
+                if(!IsIconic(hwnd)){
+                    updateVoidStars(); // keep stars at a constant speed...
+                    static int voidSkip=0;
+                    bool voidThrottle=robloxFocused.load()&&macroRunning.load();
+                    // ...but halve the repaints when the game needs the headroom.
+                    if(!voidThrottle||(++voidSkip%2==0)) InvalidateRect(hwnd,NULL,FALSE);
+                }
             } else {
                 // Only repaint if something is actually animating
                 bool needRepaint=false;
@@ -16215,7 +16224,10 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
           if(activeTab==0&&needRepaint&&!IsIconic(hwnd)&&(!uiThrottle||(++uiSkip%2==0)))
               InvalidateRect(hwnd,NULL,FALSE);
             }
-            if(hwndOverlay)InvalidateRect(hwndOverlay,NULL,FALSE);
+            // The overlay shows CPU/GPU/disk counters that refresh about once a
+            // second, so repainting it every frame was waste layered directly on top
+            // of the game. 10fps is far past what those numbers can change at.
+            { static int ovlSkip=0; if(hwndOverlay&&(++ovlSkip%6==0)) InvalidateRect(hwndOverlay,NULL,FALSE); }
 
                         }
         break;
