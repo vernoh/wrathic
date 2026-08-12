@@ -316,141 +316,194 @@ Theme THEMES[] = {
 int themeIdx = 5;
 
 // ===================== VOID STARS =====================
-// Drawn as three pre-rendered parallax layers that scroll, rather than 120 stars
-// positioned individually every frame.
+// A perspective starfield: stars sit at a depth and rush toward the viewer, so the
+// window reads as moving through space rather than as dots sliding down a wall.
+// Each star is projected as x/z, y/z from the centre, which means it accelerates and
+// spreads outward as it approaches - the motion is the effect, and it also hides the
+// sub-pixel shimmer that made the old per-star field twinkle when it should not have.
 //
-// The per-star version had problems that were inherent to it, not tuning issues: a
-// 1px dot drawn at a fractional position gets antialiased across two pixels, so its
-// brightness flickered as it drifted; each star crossed pixel boundaries at its own
-// moment, so the field shimmered; and it cost 120 antialiased fills per frame.
-//
-// Here each layer is rendered once into a bitmap and then blitted at a scrolling
-// offset. Every star in a layer moves in lockstep, so motion reads as one coherent
-// drift with no shimmer, and a frame costs six BitBlts - straight memory copies -
-// instead of 120 GDI+ fills. Three layers at different speeds also give the field
-// some depth, which the flat version never had.
-static const int   STAR_LAYERS      = 3;
-static const float STAR_LAYER_SPEED[STAR_LAYERS] = { 0.16f, 0.38f, 0.78f }; // px per 60fps frame
-static const int   STAR_LAYER_COUNT[STAR_LAYERS] = { 64, 40, 22 };
-static const int   STAR_LAYER_LUM  [STAR_LAYERS] = { 78, 148, 236 };
+// Behind them sits a static field of large, very dim glows. It never moves, so it
+// costs one opaque blit per frame, and it exists so the frosted cards have something
+// worth refracting - a pane over flat black reads as plastic no matter how it is lit.
+struct ZStar { float x, y, z, pz; };
+static const int   ZSTAR_COUNT = 300;
+static ZStar       zStars[ZSTAR_COUNT];
+static bool        zStarsInit = false;
+static const float ZSTAR_NEAR = 0.055f;   // respawn once closer than this
+static const float ZSTAR_SPEED = 0.215f;  // depth units per second
 
-static HDC     s_starDC [STAR_LAYERS] = {};
-static HBITMAP s_starBmp[STAR_LAYERS] = {};
-static HBITMAP s_starOld[STAR_LAYERS] = {};
-static int     s_starW = 0, s_starH = 0;
-static float   s_starOff[STAR_LAYERS] = {};
+// The field is composed by writing pixels straight into a DIB rather than asking
+// GDI+ to rasterise a shape per star. Measured: 460 antialiased FillRectangles cost
+// ~70% of a core, and batching them into six calls changed nothing, because the cost
+// is the antialiased rasterisation itself, not the call count. Plotting a dot by
+// hand is a couple of dozen writes with our own coverage falloff - a few thousand
+// operations for the whole field, which does not register.
+static HDC     s_skyDC=NULL;
+static HBITMAP s_skyBmp=NULL, s_skyOld=NULL;
+static DWORD*  s_skyBits=NULL;      // compose target, written every frame
+static DWORD*  s_skyBase=NULL;      // pristine glow backdrop, copied in each frame
+static int     s_skyW=0, s_skyH=0;
 
-static void freeStarLayers(){
-    for(int i=0;i<STAR_LAYERS;i++){
-        if(s_starDC[i]){
-            if(s_starOld[i]) SelectObject(s_starDC[i],s_starOld[i]);
-            if(s_starBmp[i]) DeleteObject(s_starBmp[i]);
-            DeleteDC(s_starDC[i]);
-        }
-        s_starDC[i]=NULL; s_starBmp[i]=NULL; s_starOld[i]=NULL;
-    }
-    s_starW=s_starH=0;
+static void freeSky(){
+    if(s_skyDC){ if(s_skyOld) SelectObject(s_skyDC,s_skyOld); DeleteDC(s_skyDC); }
+    if(s_skyBmp) DeleteObject(s_skyBmp);
+    if(s_skyBase) free(s_skyBase);
+    s_skyDC=NULL; s_skyBmp=NULL; s_skyOld=NULL; s_skyBits=NULL; s_skyBase=NULL; s_skyW=s_skyH=0;
 }
 
-// One canvas large enough for every surface that draws stars (the 480x280 splash and
-// the 420x600 window), built once. Sizing it to whoever drew first would mean
-// rebuilding all three layers on every switch - and rebuilding every frame if the
-// splash and the main window are ever alive together.
-static const int STAR_CANVAS_W = 512, STAR_CANVAS_H = 768;
+static void buildSky(HDC ref,int W,int H){
+    freeSky();
+    BITMAPINFO bi={};
+    bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth=W;
+    bi.bmiHeader.biHeight=-H;          // top-down, so row 0 is the top
+    bi.bmiHeader.biPlanes=1;
+    bi.bmiHeader.biBitCount=32;
+    bi.bmiHeader.biCompression=BI_RGB;
+    void* bits=NULL;
+    s_skyBmp=CreateDIBSection(ref,&bi,DIB_RGB_COLORS,&bits,NULL,0);
+    if(!s_skyBmp) return;
+    s_skyBits=(DWORD*)bits;
+    s_skyDC=CreateCompatibleDC(ref);
+    s_skyOld=(HBITMAP)SelectObject(s_skyDC,s_skyBmp);
+    s_skyW=W; s_skyH=H;
 
-static void buildStarLayers(HDC ref,int W,int H){
-    (void)W; (void)H;
-    freeStarLayers();
-    W=STAR_CANVAS_W; H=STAR_CANVAS_H;
-    s_starW=W; s_starH=H;
-    srand(12345); // fixed seed so the field is identical every launch
-    for(int L=0;L<STAR_LAYERS;L++){
-        s_starDC[L]=CreateCompatibleDC(ref);
-        s_starBmp[L]=CreateCompatibleBitmap(ref,W,H);
-        s_starOld[L]=(HBITMAP)SelectObject(s_starDC[L],s_starBmp[L]);
-        RECT full={0,0,W,H};
-        HBRUSH black=CreateSolidBrush(RGB(0,0,0));
-        FillRect(s_starDC[L],&full,black);
-        DeleteObject(black);
+    // Paint the static glows once, with GDI+, then keep a copy of the raw pixels.
+    // These exist so the frosted cards have something worth refracting: a pane over
+    // flat black reads as plastic however carefully its edges are lit.
+    RECT full={0,0,W,H};
+    HBRUSH black=CreateSolidBrush(RGB(0,0,0));
+    FillRect(s_skyDC,&full,black);
+    DeleteObject(black);
+    {
+        using namespace Gdiplus;
+        Graphics g(s_skyDC);
+        g.SetSmoothingMode(SmoothingModeHighQuality);
+        const struct { float fx,fy,fr; BYTE a; } blobs[]={
+            {0.20f,0.14f,0.50f,26},{0.82f,0.40f,0.44f,21},
+            {0.32f,0.72f,0.54f,23},{0.74f,0.95f,0.40f,18}
+        };
+        for(const auto& b : blobs){
+            REAL bx=W*b.fx, by=H*b.fy, br=W*b.fr;
+            GraphicsPath e; e.AddEllipse(bx-br,by-br,br*2,br*2);
+            PathGradientBrush pg(&e);
+            pg.SetCenterPoint(PointF(bx,by));
+            // A little more blue than red, so the neutral doesn't read muddy.
+            pg.SetCenterColor(Color(255,b.a,b.a,(BYTE)std::min(255,(int)(b.a*1.6f))));
+            Color edge(255,0,0,0); int n=1;
+            pg.SetSurroundColors(&edge,&n);
+            g.FillPath(&pg,&e);
+        }
+    }
+    GdiFlush(); // make sure GDI+ has finished writing before we copy the pixels
+    s_skyBase=(DWORD*)malloc((size_t)W*H*4);
+    if(s_skyBase) memcpy(s_skyBase,s_skyBits,(size_t)W*H*4);
+}
 
-        // Large, very dim glows on the slowest layer. Frosted glass needs something
-        // behind it worth refracting - a field of 1px stars blurs to flat black, and
-        // a pane over flat black reads as plastic no matter how its edges are lit.
-        // Drawn before the stars so it never covers them.
-        if(L==0){
-            using namespace Gdiplus;
-            Graphics lg(s_starDC[L]);
-            lg.SetSmoothingMode(SmoothingModeHighQuality);
-            const struct { REAL fx,fy,fr; BYTE a; } blobs[]={
-                {0.24f,0.16f,0.46f,30},{0.80f,0.44f,0.40f,24},
-                {0.34f,0.74f,0.50f,26},{0.72f,0.93f,0.36f,20}
-            };
-            for(const auto& b : blobs){
-                REAL bx=W*b.fx, by=H*b.fy, br=W*b.fr;
-                GraphicsPath e; e.AddEllipse(bx-br,by-br,br*2,br*2);
-                PathGradientBrush pg(&e);
-                pg.SetCenterPoint(PointF(bx,by));
-                // A touch more blue than red - keeps the neutral from reading muddy.
-                pg.SetCenterColor(Color(255,b.a,b.a,(BYTE)std::min(255,(int)(b.a*1.6f))));
-                Color edge(255,0,0,0); int n=1;
-                pg.SetSurroundColors(&edge,&n);
-                lg.FillPath(&pg,&e);
-            }
+// Additive dot with a soft radial falloff - our own antialiasing, which is all the
+// quality GDI+ was providing here and none of the cost.
+static DWORD* s_plotTarget=NULL;
+static inline void plotStar(int W,int H,float fx,float fy,float rad,int lum){
+    int x0=(int)(fx-rad), x1=(int)(fx+rad)+1;
+    int y0=(int)(fy-rad), y1=(int)(fy+rad)+1;
+    if(x0<0) x0=0; if(y0<0) y0=0; if(x1>W) x1=W; if(y1>H) y1=H;
+    float inv=1.0f/(rad*rad);
+    for(int y=y0;y<y1;y++){
+        DWORD* row=s_plotTarget+(size_t)y*W;
+        float dy=(float)y+0.5f-fy; float dy2=dy*dy;
+        for(int x=x0;x<x1;x++){
+            float dx=(float)x+0.5f-fx;
+            float d2=(dx*dx+dy2)*inv;
+            if(d2>=1.0f) continue;
+            float cov=1.0f-d2;                 // smooth edge, no hard pixel
+            int add=(int)(lum*cov);
+            if(add<=0) continue;
+            DWORD p=row[x];
+            int b=(p&0xFF)+add, gg=((p>>8)&0xFF)+add, r=((p>>16)&0xFF)+add;
+            if(b>255)b=255; if(gg>255)gg=255; if(r>255)r=255;
+            row[x]=((DWORD)r<<16)|((DWORD)gg<<8)|(DWORD)b;
         }
-        int lum=STAR_LAYER_LUM[L];
-        for(int i=0;i<STAR_LAYER_COUNT[L];i++){
-            int sx=rand()%W, sy=rand()%H;
-            int v=lum-(rand()%40); if(v<12) v=12;
-            SetPixelV(s_starDC[L],sx,sy,RGB(v,v,v));
-            // Brightest layer gets a faint cross of bleed so it reads as a star
-            // rather than a lone pixel.
-            if(L==STAR_LAYERS-1){
-                int d=v/3;
-                if(sx+1<W) SetPixelV(s_starDC[L],sx+1,sy,RGB(d,d,d));
-                if(sy+1<H) SetPixelV(s_starDC[L],sx,sy+1,RGB(d,d,d));
-            }
-        }
-        s_starOff[L]=0.0f;
     }
 }
 
-void initVoidStars(){ /* layers are built lazily by drawVoidStars */ }
+static void seedZStar(ZStar& s, bool anywhere){
+    // x and y are in units of half the viewport, so at the far plane (z = 1) a value
+    // of 1 sits exactly on the edge. Anything wider is off-screen at every depth,
+    // since the projection only ever pushes stars further out as they approach.
+    s.x = ((float)(rand()%2000)/1000.0f - 1.0f);
+    s.y = ((float)(rand()%2000)/1000.0f - 1.0f);
+    s.z = anywhere ? (ZSTAR_NEAR + (float)(rand()%1000)/1000.0f) : 1.0f;
+    s.pz = s.z;
+}
+void initVoidStars(){
+    srand(12345); // fixed seed so the field looks the same every launch
+    for(int i=0;i<ZSTAR_COUNT;i++) seedZStar(zStars[i], true);
+    zStarsInit = true;
+}
+
+extern DWORD* g_mainBufBits; // back buffer pixels, set by paintMain
 
 void updateVoidStars(){
-    // Delta-time scaled so the drift speed is identical whatever the repaint rate.
-    // QPC rather than GetTickCount64, whose ~15.6ms resolution quantised the delta
-    // at a 16ms timer and made the scale factor lurch between 0 and ~1.9.
+    if(!zStarsInit) initVoidStars();
+    // QPC, not GetTickCount64: the latter only advances every ~15.6ms, which at a
+    // 16ms timer quantised the delta and made the speed lurch frame to frame.
     static LARGE_INTEGER freq={}, last={};
     if(freq.QuadPart==0){ QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
     LARGE_INTEGER nowQ; QueryPerformanceCounter(&nowQ);
-    float dtMs=(float)((double)(nowQ.QuadPart-last.QuadPart)*1000.0/(double)freq.QuadPart);
+    float dt=(float)((double)(nowQ.QuadPart-last.QuadPart)/(double)freq.QuadPart);
     last=nowQ;
-    if(dtMs<=0.0f||dtMs>100.0f) dtMs=16.6667f; // app was idle or minimised
-    float scale=dtMs/16.6667f;
-    for(int L=0;L<STAR_LAYERS;L++){
-        s_starOff[L]+=STAR_LAYER_SPEED[L]*scale;
-        if(s_starH>0) while(s_starOff[L]>=(float)s_starH) s_starOff[L]-=(float)s_starH;
+    if(dt<=0.0f||dt>0.1f) dt=1.0f/60.0f; // app was idle or minimised
+    for(int i=0;i<ZSTAR_COUNT;i++){
+        zStars[i].pz = zStars[i].z;
+        zStars[i].z -= ZSTAR_SPEED*dt;
+        if(zStars[i].z < ZSTAR_NEAR) seedZStar(zStars[i], false);
     }
 }
 
 void drawVoidStars(HDC hdc,int W,int H){
     if(W<=0||H<=0) return;
-    if(!s_starDC[0]) buildStarLayers(hdc,W,H);
-    // The canvas is larger than any window that draws it, so blit only the width we
-    // need and let the DC clip the height. Wrapping uses the canvas height, which is
-    // why the seam never lands inside the visible area.
-    // Copy only the rows that actually land on screen. Blitting the whole 768-row
-    // canvas twice per layer meant moving 1536 rows to show 600 - the off-screen
-    // remainder was clipped, but only after the work was done. Now each layer costs
-    // exactly H rows. SRCPAINT ORs the white dots onto whatever is already there,
-    // so layers composite without needing alpha.
-    for(int L=0;L<STAR_LAYERS;L++){
-        int oy=((int)s_starOff[L])%s_starH; if(oy<0) oy+=s_starH;
-        int srcTop=(s_starH-oy)%s_starH;              // source row shown at dest y=0
-        int h1=std::min(H,s_starH-srcTop);
-        BitBlt(hdc,0,0,W,h1,s_starDC[L],0,srcTop,SRCPAINT);
-        if(H>h1) BitBlt(hdc,0,h1,W,H-h1,s_starDC[L],0,0,SRCPAINT);
+    if(!zStarsInit) initVoidStars();
+    if(!s_skyDC||W!=s_skyW||H!=s_skyH) buildSky(hdc,W,H);
+    if(!s_skyBase){ return; }
+
+    // Plot into the back buffer itself when we can reach its pixels - it is the same
+    // 32-bit top-down DIB, so this is just a different destination pointer, and it
+    // saves composing into a second full buffer and blitting it across.
+    DWORD* dst = s_skyBits; // composing separately beats writing into the back
+                            // buffer: GDI synchronises against later drawing on it
+    if(!dst) return;
+    memcpy(dst,s_skyBase,(size_t)W*H*4); // start from the glow backdrop
+    s_plotTarget = dst;
+
+    const float ccx=(float)W*0.5f, ccy=(float)H*0.5f;
+    // Project each axis separately so the far plane maps onto the window exactly,
+    // rather than onto a square that hangs off both sides of it.
+    const float spanX=(float)W*0.5f, spanY=(float)H*0.5f;
+    for(int i=0;i<ZSTAR_COUNT;i++){
+        const ZStar& s=zStars[i];
+        float sx=ccx + (s.x/s.z)*spanX;
+        float sy=ccy + (s.y/s.z)*spanY;
+        if(sx<-4||sx>W+4||sy<-4||sy>H+4) continue;
+        float depth=1.0f - s.z; if(depth<0.0f) depth=0.0f;
+        float d2=depth*depth;
+        int   lum=(int)(30.0f + d2*225.0f);
+        float rad=0.85f + d2*2.0f;
+        // The nearest stars smear toward the edge - the streak is what sells speed.
+        if(depth>0.80f){
+            float px=ccx + (s.x/s.pz)*spanX, py=ccy + (s.y/s.pz)*spanY;
+            float dx=sx-px, dy=sy-py;
+            float len=sqrtf(dx*dx+dy*dy);
+            if(len>1.0f){
+                int steps=(int)std::min(5.0f,len);
+                for(int k=1;k<=steps;k++){
+                    float f=(float)k/(float)(steps+1);
+                    plotStar(W,H,px+dx*f,py+dy*f,rad*0.72f,(int)(lum*0.30f*f));
+                }
+            }
+        }
+        plotStar(W,H,sx,sy,rad,lum);
     }
+    if(dst==s_skyBits) BitBlt(hdc,0,0,W,H,s_skyDC,0,0,SRCCOPY);
 }
 #define T THEMES[themeIdx]
 
@@ -12664,21 +12717,42 @@ static const DWORD CLICK_SND_LEN = 195092;
 // Parse WAV data offset once at startup
 static DWORD s_sndDataOff=0, s_sndDataSize=0;
 static std::atomic<int> s_sndActive{0}; // limit concurrent sounds
-static void initClickSound(){
-    const BYTE* wav=CLICK_SND;
-    for(DWORD i=12;i+8<CLICK_SND_LEN;i++){
-        if(memcmp(wav+i,"data",4)==0){
-            s_sndDataSize=*(DWORD*)(wav+i+4);
-            s_sndDataOff=i+8;
-            break;
-        }
+// Synthesised rather than sampled. The old click was a recorded wav that read as
+// thin and toppy; what makes a keypress satisfying is almost all low end and a soft
+// edge, so this builds a "thock": a low fundamental that drops in pitch as it
+// settles - the way a keycap does when it bottoms out - plus a heavily low-passed
+// noise transient for texture, under an attack slow enough that there is no click
+// at the front. Nothing above a few hundred Hz survives, which is what keeps it
+// creamy instead of sharp.
+static std::vector<short> s_clickPcm;
+static void buildClickSound(){
+    const int SR=44100;
+    const int n=(int)(SR*0.085f);
+    s_clickPcm.resize((size_t)n*2);
+    float noiseLp=0.0f;
+    unsigned rng=22222u;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)SR;
+        float attack=1.0f-expf(-t*820.0f);   // ~3ms, no hard transient
+        float env=expf(-t*36.0f)*attack;
+        float f=182.0f-52.0f*(1.0f-expf(-t*28.0f)); // settles ~130Hz
+        float body =sinf(6.2831853f*f*t);
+        float body2=sinf(6.2831853f*f*2.0f*t)*0.16f; // a little body, no glare
+        rng=rng*1664525u+1013904223u;
+        float wh=((float)((rng>>16)&0xFFFF)/32768.0f)-1.0f;
+        noiseLp+=(wh-noiseLp)*0.05f;         // steep low pass - removes all sizzle
+        float noise=noiseLp*expf(-t*145.0f)*0.75f;
+        float smp=((body+body2)*0.5f+noise)*env;
+        short v=(short)std::max(-30000.0f,std::min(30000.0f,smp*10500.0f));
+        s_clickPcm[(size_t)i*2]=v; s_clickPcm[(size_t)i*2+1]=v;
     }
 }
+static void initClickSound(){ buildClickSound(); }
 // uiSoundsEnabled defined later in globals - extern ref so playClick can use it
 extern bool uiSoundsEnabled;
 static void playClick(){
     if(!uiSoundsEnabled) return;
-    if(!s_sndDataOff) return;
+    if(s_clickPcm.empty()) return;
     if(s_sndActive.load()>=6) return;
     s_sndActive++;
     std::thread([]{
@@ -12688,8 +12762,8 @@ static void playClick(){
             s_sndActive--; return;
         }
         WAVEHDR hdr={};
-        hdr.lpData=(LPSTR)(CLICK_SND+s_sndDataOff);
-        hdr.dwBufferLength=s_sndDataSize;
+        hdr.lpData=(LPSTR)s_clickPcm.data();
+        hdr.dwBufferLength=(DWORD)(s_clickPcm.size()*sizeof(short));
         waveOutPrepareHeader(hWave,&hdr,sizeof(WAVEHDR));
         waveOutWrite(hWave,&hdr,sizeof(WAVEHDR));
         // Wait with timeout (3 seconds max)
@@ -13502,12 +13576,20 @@ HCURSOR createGlowCursor(){
 HCURSOR gGlowCursor=NULL;
 
 HICON getSmallIcon(){
-    HICON small = (HICON)CreateIconFromResourceEx(
-        (PBYTE)LOGO_16_PNG, LOGO_16_PNG_LEN,
-        TRUE, 0x00030000, 16, 16, LR_DEFAULTCOLOR
-    );
-    if(!small) small = gAppIcon;
-    return small;
+    // LOGO_16_PNG is the old Macro "M" mark, which is what was showing in the title
+    // bar and alt-tab. Prefer the real wrathic icon - the .ico beside the exe if it
+    // is there, otherwise the copy embedded in the resource - and only fall back to
+    // the legacy PNG if neither can be loaded.
+    wchar_t ep[MAX_PATH]={};
+    GetModuleFileNameW(NULL,ep,MAX_PATH);
+    wchar_t* sl=wcsrchr(ep,L'\\');
+    if(sl){ sl[1]=0; wcscat(ep,L"wrathic.ico"); }
+    HICON ico=(HICON)LoadImage(NULL,ep,IMAGE_ICON,16,16,LR_LOADFROMFILE);
+    if(!ico) ico=(HICON)LoadImage(GetModuleHandle(NULL),L"IDI_APPICON",IMAGE_ICON,16,16,0);
+    if(!ico) ico=(HICON)CreateIconFromResourceEx(
+        (PBYTE)LOGO_16_PNG, LOGO_16_PNG_LEN, TRUE, 0x00030000, 16, 16, LR_DEFAULTCOLOR);
+    if(!ico) ico=gAppIcon;
+    return ico;
 }
 
 // ===================== HWID =====================
@@ -13566,7 +13648,7 @@ std::string httpCall(const wchar_t* path,const std::string& body,const std::stri
     return resp;
 }
 
-// GitHub API GET — separate from Supabase httpCall
+// GitHub API GET â€” separate from Supabase httpCall
 std::string githubGet(const char* path){
     HINTERNET hN=InternetOpen(L"wrathic/1.0",INTERNET_OPEN_TYPE_DIRECT,NULL,NULL,0);if(!hN)return"";
     HINTERNET hC=InternetConnect(hN,L"api.github.com",INTERNET_DEFAULT_HTTPS_PORT,NULL,NULL,INTERNET_SERVICE_HTTP,0,0);
@@ -13876,7 +13958,7 @@ DWORD WINAPI macroWorkerThread(LPVOID) {
         if (now.QuadPart < spinThresh) {
             // Set timer to wake us just before target
             LONGLONG dueTime = -(((spinThresh - now.QuadPart) * 10000LL) / freq.QuadPart) * 100LL;
-            if (dueTime < -100LL) { // only if more than 10µs away
+            if (dueTime < -100LL) { // only if more than 10Âµs away
                 SetWaitableTimer(hTimer, (LARGE_INTEGER*)&dueTime, 0, NULL, NULL, FALSE);
                 WaitForSingleObject(hTimer, 10);
             }
@@ -13996,7 +14078,7 @@ void hotkeyThread(){
 }
 
 // System CPU and RAM - shows actual system usage not just this process
-// ── Discord RPC via named pipe IPC ──────────────────────────────────────────
+// â”€â”€ Discord RPC via named pipe IPC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 static HANDLE g_rpcPipe = INVALID_HANDLE_VALUE;
 static bool   g_rpcHandshake = false;
 static DWORD  g_rpcStartTime = 0;
@@ -14023,7 +14105,7 @@ static bool rpcConnect(){
     }
     return false;
 }
-// Persistent RPC thread — reconnects automatically, updates every 15s
+// Persistent RPC thread â€” reconnects automatically, updates every 15s
 static void discordRpcThread(){
     g_rpcStartTime=GetTickCount();
     DWORD lastAct=0;
@@ -14159,11 +14241,11 @@ void resourceThread(){
                 }
             }
         }}
-        // GPU via PDH — tries 3D engine first, falls back to all engines
+        // GPU via PDH â€” tries 3D engine first, falls back to all engines
         {static PDH_HQUERY gpuQ=NULL; static PDH_HCOUNTER gpuC=NULL;
         static bool gpuOk=false, gpuFail=false;
         if(!gpuFail && !gpuOk){
-            // Try paths in order: 3D → Graphics → all engines
+            // Try paths in order: 3D â†’ Graphics â†’ all engines
             const wchar_t* gpuPaths[]={
                 L"\\GPU Engine(*engtype_3D)\\Utilization Percentage",
                 L"\\GPU Engine(*engtype_Graphics)\\Utilization Percentage",
@@ -14174,7 +14256,7 @@ void resourceThread(){
                 if(gpuQ){ PdhCloseQuery(gpuQ); gpuQ=NULL; }
                 if(PdhOpenQuery(NULL,0,&gpuQ)!=ERROR_SUCCESS){ gpuFail=true; break; }
                 if(PdhAddEnglishCounterW(gpuQ,gpuPaths[pi],0,&gpuC)==ERROR_SUCCESS){
-                    PdhCollectQueryData(gpuQ); // prime — first sample not valid
+                    PdhCollectQueryData(gpuQ); // prime â€” first sample not valid
                     gpuOk=true;
                 }
             }
@@ -14616,14 +14698,14 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         HBITMAP bmp=CreateCompatibleBitmap(hdc,W,H);
         HBITMAP ob=(HBITMAP)SelectObject(mdc,bmp);
 
-        // Background — pure black, matching the Void theme
+        // Background â€” pure black, matching the Void theme
         HBRUSH bg=CreateSolidBrush(RGB(0,0,0)); FillRect(mdc,&cr,bg); DeleteObject(bg);
 
         if(!splashShowChangelog){
-            // ── Void background (same drifting-stars background used by the
+            // â”€â”€ Void background (same drifting-stars background used by the
             //    in-app Void theme) instead of icon + progress bar + status
             //    text - this is now just a brief identity splash, not a
-            //    fake loading sequence. ─────────────────────────────────────
+            //    fake loading sequence. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             drawVoidStars(mdc,W,H);
 
             SetBkMode(mdc,TRANSPARENT);
@@ -14662,7 +14744,7 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             DrawText(mdc,APP_VERSION,-1,&vr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
 
         } else {
-            // ── Changelog screen ──────────────────────────────────────────
+            // â”€â”€ Changelog screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             HBRUSH hb=CreateSolidBrush(RGB(10,10,16));
             RECT hr2={0,0,W,44}; FillRect(mdc,&hr2,hb); DeleteObject(hb);
 
@@ -14761,38 +14843,80 @@ static void addRoundRectPath(Gdiplus::GraphicsPath& p,int x,int y,int w,int h,in
     p.AddArc(x,y+h-d,d,d,90,90);
     p.CloseFigure();
 }
-// ── Backdrop blur ───────────────────────────────────────────────────────────
+// â”€â”€ Backdrop blur â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Frosted glass has to sample what is behind the pane - that refraction is the
 // whole effect, and a flat translucent fill will never read as glass no matter how
 // the edges are lit. GDI has no blur, but scaling the background down and back up
 // with HALFTONE averages neighbouring pixels, which is a decent box blur for a
 // fraction of the cost of a real kernel. Built once per frame from the finished
 // background, then sampled by each card.
-static HDC     s_blurDC=NULL,  s_blurSmDC=NULL;
-static HBITMAP s_blurBmp=NULL, s_blurSmBmp=NULL, s_blurOld=NULL, s_blurSmOld=NULL;
-static int     s_blurW=0, s_blurH=0;
-static const int BLUR_DIV=12; // higher = softer and cheaper
+// A single big downscale then upscale is *pixelation*, not blur: scaling 12:1 in one
+// step throws away everything between the sampled pixels, and scaling back up just
+// makes those survivors into blocks. Halving repeatedly instead averages each 2x2 on
+// every step, and reversing the same way interpolates between them - the result
+// approximates a Gaussian and has no blockiness. Six small blits beat one large one.
+#define BLUR_STEPS 3
+static HDC     s_blurDC=NULL,  s_blurStep[BLUR_STEPS]={};
+static HBITMAP s_blurBmp=NULL, s_blurStepBmp[BLUR_STEPS]={}, s_blurOld=NULL, s_blurStepOld[BLUR_STEPS]={};
+static int     s_blurW=0, s_blurH=0, s_stepW[BLUR_STEPS]={}, s_stepH[BLUR_STEPS]={};
 
 static void freeBackdropBlur(){
     if(s_blurDC){ if(s_blurOld) SelectObject(s_blurDC,s_blurOld); if(s_blurBmp) DeleteObject(s_blurBmp); DeleteDC(s_blurDC); }
-    if(s_blurSmDC){ if(s_blurSmOld) SelectObject(s_blurSmDC,s_blurSmOld); if(s_blurSmBmp) DeleteObject(s_blurSmBmp); DeleteDC(s_blurSmDC); }
-    s_blurDC=s_blurSmDC=NULL; s_blurBmp=s_blurSmBmp=s_blurOld=s_blurSmOld=NULL; s_blurW=s_blurH=0;
+    s_blurDC=NULL; s_blurBmp=NULL; s_blurOld=NULL;
+    for(int i=0;i<BLUR_STEPS;i++){
+        if(s_blurStep[i]){ if(s_blurStepOld[i]) SelectObject(s_blurStep[i],s_blurStepOld[i]);
+                           if(s_blurStepBmp[i]) DeleteObject(s_blurStepBmp[i]); DeleteDC(s_blurStep[i]); }
+        s_blurStep[i]=NULL; s_blurStepBmp[i]=NULL; s_blurStepOld[i]=NULL;
+    }
+    s_blurW=s_blurH=0;
 }
 void buildBackdropBlur(HDC src,int W,int H){
     if(W<=0||H<=0) return;
-    int sw=std::max(1,W/BLUR_DIV), sh=std::max(1,H/BLUR_DIV);
+    // The backdrop is a slow drift behind heavy blur, so a frame-old copy is not
+    // distinguishable from a fresh one - but rebuilding the whole pyramid every
+    // frame is the single most expensive thing in the paint. Every third frame.
+    static int tick=0;
+    static int lastW=0,lastH=0;
+    bool sized = (W!=lastW||H!=lastH||!s_blurDC);
+    if(!sized && (++tick % 3)!=0) return;
+    lastW=W; lastH=H;
     if(!s_blurDC||W!=s_blurW||H!=s_blurH){
         freeBackdropBlur();
-        s_blurDC=CreateCompatibleDC(src);   s_blurBmp=CreateCompatibleBitmap(src,W,H);
+        // Every buffer is a 32-bit top-down DIB, matching the back buffer and the sky
+        // buffer. Mixing DIB and device bitmaps makes GDI convert format per pixel on
+        // each blit, and with eight blits a frame that dominated the cost.
+        auto makeDib=[&](int w,int h,HBITMAP& bmp)->HDC{
+            BITMAPINFO bi={};
+            bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth=w; bi.bmiHeader.biHeight=-h;
+            bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
+            void* bits=NULL;
+            bmp=CreateDIBSection(src,&bi,DIB_RGB_COLORS,&bits,NULL,0);
+            if(!bmp) bmp=CreateCompatibleBitmap(src,w,h);
+            HDC dc=CreateCompatibleDC(src);
+            return dc;
+        };
+        s_blurDC=makeDib(W,H,s_blurBmp);
         s_blurOld=(HBITMAP)SelectObject(s_blurDC,s_blurBmp);
-        s_blurSmDC=CreateCompatibleDC(src); s_blurSmBmp=CreateCompatibleBitmap(src,sw,sh);
-        s_blurSmOld=(HBITMAP)SelectObject(s_blurSmDC,s_blurSmBmp);
+        int w=W,h=H;
+        for(int i=0;i<BLUR_STEPS;i++){
+            w=std::max(1,w/2); h=std::max(1,h/2);
+            s_stepW[i]=w; s_stepH[i]=h;
+            s_blurStep[i]=makeDib(w,h,s_blurStepBmp[i]);
+            s_blurStepOld[i]=(HBITMAP)SelectObject(s_blurStep[i],s_blurStepBmp[i]);
+            SetStretchBltMode(s_blurStep[i],HALFTONE); SetBrushOrgEx(s_blurStep[i],0,0,NULL);
+        }
+        SetStretchBltMode(s_blurDC,HALFTONE); SetBrushOrgEx(s_blurDC,0,0,NULL);
         s_blurW=W; s_blurH=H;
     }
-    SetStretchBltMode(s_blurSmDC,HALFTONE); SetBrushOrgEx(s_blurSmDC,0,0,NULL);
-    StretchBlt(s_blurSmDC,0,0,sw,sh,src,0,0,W,H,SRCCOPY);   // down: averages
-    SetStretchBltMode(s_blurDC,HALFTONE);   SetBrushOrgEx(s_blurDC,0,0,NULL);
-    StretchBlt(s_blurDC,0,0,W,H,s_blurSmDC,0,0,sw,sh,SRCCOPY); // up: smooths
+    // Down the pyramid, halving each time - every step averages a 2x2 neighbourhood.
+    StretchBlt(s_blurStep[0],0,0,s_stepW[0],s_stepH[0],src,0,0,W,H,SRCCOPY);
+    for(int i=1;i<BLUR_STEPS;i++)
+        StretchBlt(s_blurStep[i],0,0,s_stepW[i],s_stepH[i],s_blurStep[i-1],0,0,s_stepW[i-1],s_stepH[i-1],SRCCOPY);
+    // Back up the same way, interpolating between the averages rather than blocking.
+    for(int i=BLUR_STEPS-1;i>0;i--)
+        StretchBlt(s_blurStep[i-1],0,0,s_stepW[i-1],s_stepH[i-1],s_blurStep[i],0,0,s_stepW[i],s_stepH[i],SRCCOPY);
+    StretchBlt(s_blurDC,0,0,W,H,s_blurStep[0],0,0,s_stepW[0],s_stepH[0],SRCCOPY);
 }
 
 // Float variant. Integer geometry made the card jump in whole-pixel steps as it
@@ -14989,6 +15113,31 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         }
     }
 }
+// A flat horizontal band of glass - the header and the dock. Same material as the
+// cards (frosted backdrop, tint, lit edge) but square, and with the caught-light
+// line on whichever edge faces the content: the bottom of the header, the top of
+// the dock. Without this the chrome stayed opaque while the cards went glassy, and
+// the two read as different applications.
+void drawGlassBand(HDC hdc,int x,int y,int w,int h,bool lightBottomEdge){
+    if(performanceMode||!s_blurDC){
+        fillRect(hdc,x,y,w,h,T.surface);
+        return;
+    }
+    BitBlt(hdc,x,y,w,h,s_blurDC,x,y,SRCCOPY);
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    int r0=std::min(255,GetRValue(T.surface)+16), g0=std::min(255,GetGValue(T.surface)+16), b0=std::min(255,GetBValue(T.surface)+20);
+    LinearGradientBrush lg(RectF((REAL)x,(REAL)y,(REAL)w,(REAL)h+1),
+        Color(206,(BYTE)r0,(BYTE)g0,(BYTE)b0),
+        Color(226,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
+        LinearGradientModeVertical);
+    g.FillRectangle(&lg,RectF((REAL)x,(REAL)y,(REAL)w,(REAL)h));
+    Pen hi(Color(34,255,255,255),1.0f);
+    REAL ey = lightBottomEdge ? (REAL)(y+h)-0.5f : (REAL)y+0.5f;
+    g.DrawLine(&hi,(REAL)x,ey,(REAL)(x+w),ey);
+}
+
 // The card's resting appearance with none of the hover work: same gradient body,
 // same caught-light top edge, same hairline border. Used by the in-game overlay so
 // it reads as the same material as the app, without animating over someone's game.
@@ -15132,6 +15281,10 @@ void paintSettingsInto(HDC hdc,int W,int H);
 // with the Void theme repainting at 60fps).
 static HDC     s_mainBufDC   = NULL;
 static HBITMAP s_mainBufBmp  = NULL;
+// Raw pixels of the back buffer. The starfield plots straight into these rather
+// than composing in its own buffer and blitting across, which halves the
+// full-buffer traffic per frame.
+DWORD*         g_mainBufBits = NULL;
 static HBITMAP s_mainBufOld  = NULL;
 static int     s_mainBufW    = -1;
 static int     s_mainBufH    = -1;
@@ -15441,7 +15594,21 @@ void paintMain(HWND hwnd){
     if(!s_mainBufDC||W!=s_mainBufW||H!=s_mainBufH){
         freeMainBackbuffer();
         s_mainBufDC=CreateCompatibleDC(hdc_real);
-        s_mainBufBmp=CreateCompatibleBitmap(hdc_real,W,H);
+        // A DIB section, not a compatible (device) bitmap. The starfield is composed
+        // in a 32-bit DIB, and blitting a DIB into a DDB makes GDI convert format
+        // per pixel on every frame - which measured as most of the background's
+        // cost. Matching the formats turns that blit into a straight memory copy.
+        BITMAPINFO mbi={};
+        mbi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+        mbi.bmiHeader.biWidth=W;
+        mbi.bmiHeader.biHeight=-H;      // top-down, same as the sky buffer
+        mbi.bmiHeader.biPlanes=1;
+        mbi.bmiHeader.biBitCount=32;
+        mbi.bmiHeader.biCompression=BI_RGB;
+        void* mbits=NULL;
+        s_mainBufBmp=CreateDIBSection(hdc_real,&mbi,DIB_RGB_COLORS,&mbits,NULL,0);
+        if(!s_mainBufBmp){ s_mainBufBmp=CreateCompatibleBitmap(hdc_real,W,H); mbits=NULL; } // fallback
+        g_mainBufBits=(DWORD*)mbits;
         s_mainBufOld=(HBITMAP)SelectObject(s_mainBufDC,s_mainBufBmp);
         s_mainBufW=W; s_mainBufH=H;
     }
@@ -15467,8 +15634,8 @@ void paintMain(HWND hwnd){
     if(!performanceMode) buildBackdropBlur(hdc,W,H);
 
     if(activeTab==0){
-    // ── TITLE BAR (macro tab) ─────────────────────────────
-    fillRect(hdc,0,0,W,56,T.surface);
+    // â”€â”€ TITLE BAR (macro tab) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    drawGlassBand(hdc,0,0,W,56,true);   // header: lit along its lower edge
     fillRect(hdc,0,55,W,1,RGB(GetRValue(T.accent)/3,GetGValue(T.accent)/3,GetBValue(T.accent)/3));
     if(gAppIcon) DrawIconEx(hdc,14,12,gAppIcon,28,28,0,NULL,DI_NORMAL);
     drawText(hdc,L"WRATHIC",gAppIcon?52:16,0,120,56,T.text,hFontBig,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -15574,18 +15741,17 @@ void paintMain(HWND hwnd){
 
     } // end activeTab==0
 
-    // ── SETTINGS TAB CONTENT ─────────────────────────────────
+    // â”€â”€ SETTINGS TAB CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(activeTab==1){
         paintSettingsInto(hdc,W,H-DOCK_H);
     }
 
-    // ── TOASTS (drawn before the dock so they slide up from behind it) ──
+    // â”€â”€ TOASTS (drawn before the dock so they slide up from behind it) â”€â”€
     drawToasts(hdc,W,H);
 
-    // ── BOTTOM DOCK ───────────────────────────────────────────
+    // â”€â”€ BOTTOM DOCK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {int dy=H-DOCK_H;
-    fillRect(hdc,0,dy,W,DOCK_H,T.surface);
-    fillRect(hdc,0,dy,W,1,T.border);
+    drawGlassBand(hdc,0,dy,W,DOCK_H,false); // dock: lit along its upper edge
     int tw=W/2;
     float mA=easeInOut(1.0f-tabAnim);
     float sA=easeInOut(tabAnim);
@@ -15617,7 +15783,7 @@ void paintMain(HWND hwnd){
 
 // ===================== SETTINGS LAYOUT =====================
 struct SLayout{int W,pad,cw,yVouch,yRes,yLic,yFont,yFontDrop,yTheme,yAutoLaunch,yMinimise,yChangelog,yUpdate,yTrial;};
-// ── Layout constants ─────────────────────────────────────────────────────────
+// â”€â”€ Layout constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Each card has ONE height function. getSLayout, paintSettingsInto, and
 // settingsHandleClick all call the same function - they can never disagree.
 
@@ -15755,13 +15921,13 @@ void paintSettingsInto(HDC hdc,int W,int H){
     int sfadeY=0; // no position offset - keeps click areas aligned with painted positions
     int y=l.yRes;
 
-    // ── VOUCH CARD ────────────────────────────────────────────────
+    // â”€â”€ VOUCH CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {int vy=l.yVouch;
     drawCard(hdc,p,vy,cw,44);
     drawText(hdc,L"Enjoying wrathic?",p+14,vy,cw/2,44,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawText(hdc,L"Leave a vouch",p+cw/2,vy,cw/2-10,44,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);}
 
-    // ── OVERLAY CARD ────────────────────────────────────────────────────────────
+    // â”€â”€ OVERLAY CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
     int rH=calcOverlayCardH();
     drawCard(hdc,p,y,cw,rH);
@@ -15802,7 +15968,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     (void)cx;
     }
 
-    // ── OVERLAY POSITION CARD ─────────────────────────────────────────────────
+    // â”€â”€ OVERLAY POSITION CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(kpsOverlayEnabled||resOverlayEnabled){
         int gy0 = l.yRes + calcOverlayCardH() + GAP;
         int posH = calcOvPosCardH();
@@ -15823,7 +15989,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
         drawText(hdc,posb,p+14,gy0+gcH+8,cw-28,20,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
-    // ── UTILITIES CARD ──────────────────────────────────────────────────────
+    // â”€â”€ UTILITIES CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     y=l.yAutoLaunch+sfadeY;
     {int uH=calcUtilsCardH(); drawCard(hdc,p,y,cw,uH);
     int cx=y+10;
@@ -15847,7 +16013,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
         RECT sr={p+14,cx,p+14+cw-28,cx+lines*16+8}; DrawText(hdc,cleanRamStatus.c_str(),-1,&sr,DT_LEFT|DT_TOP|DT_WORDBREAK);
     }(void)cx;}
 
-    // ── APPEARANCE CARD ─────────────────────────────────────────────────────
+    // â”€â”€ APPEARANCE CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     y=l.yFont+sfadeY;
     drawCard(hdc,p,y,cw,calcAppearanceCardH());
     {int cx=y+10;
@@ -15876,7 +16042,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     cx+=(30+gap2)+6;
     }(void)cx;}
 
-    // ── APPLICATION CARD ────────────────────────────────────────────────────
+    // â”€â”€ APPLICATION CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     y=l.yMinimise+sfadeY;
     drawCard(hdc,p,y,cw,calcApplicationCardH());
     {int cx=y+10;
@@ -15891,7 +16057,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     drawToggle(hdc,p+cw-48,cx,performanceMode); cx+=24+6;
     (void)cx;}
 
-    // ── UPDATE CARD ─────────────────────────────────────────────────────────
+    // â”€â”€ UPDATE CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     y=l.yUpdate+sfadeY;
     {drawCard(hdc,p,y,cw,54);
     drawText(hdc,L"UPDATE",p+14,y+8,200,14,T.subtext,hFontSmall);
@@ -15901,7 +16067,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     drawRR(hdc,p+14,y+26,cw-28,22,8,T.btn,T.border,1);
     drawText(hdc,ustr.c_str(),p+18,y+26,cw-36,22,uc,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);}
 
-    // ── LICENSE CARD ────────────────────────────────────────────────────────
+    // â”€â”€ LICENSE CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     y=l.yLic+sfadeY;
     animateTo(licCopiedAlpha, licCopied?1.0f:0.0f, 0.12f);
     float lca=licCopiedAlpha;
@@ -15921,7 +16087,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
         drawText(hdc,L"Copied to clipboard",p+14,y+44,cw-28,14,fadeText,hFontSmall);
     }}
 
-    // ── TRIAL CARD ──────────────────────────────────────────────────────────
+    // â”€â”€ TRIAL CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(trialMode){y=l.yTrial+sfadeY;
     drawCard(hdc,p,y,cw,44);
     drawText(hdc,L"TRIAL",p+14,y+8,100,12,T.subtext,hFontSmall);
@@ -16090,14 +16256,14 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
     int p = l.pad, cw = l.cw;
     (void)W; (void)H;
 
-    // ── VOUCH ─────────────────────────────────────────────────────────────────
+    // â”€â”€ VOUCH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int vy=l.yVouch;
       if(mx>=p+cw-124&&mx<=p+cw-6&&my>=vy+11&&my<=vy+37){
           // Discord invite link removed - no vanity URL yet
       }
     }
 
-    // ── OVERLAY CARD (l.yRes = card top) ──────────────────────────────────────
+    // â”€â”€ OVERLAY CARD (l.yRes = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
         int cx = l.yRes + 10;
 
@@ -16147,7 +16313,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
 
     
 
-    // ── OVERLAY POSITION CARD clicks ───────────────────────────────────────────
+    // â”€â”€ OVERLAY POSITION CARD clicks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(kpsOverlayEnabled||resOverlayEnabled){
         int gy0 = l.yRes + calcOverlayCardH() + GAP;
         const int GBH=28, GBG=4;
@@ -16182,17 +16348,17 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
             }
         }
 
-        // Fine-adjust removed — drag overlay directly to reposition
+        // Fine-adjust removed â€” drag overlay directly to reposition
     }
 
-    // ── UTILITIES CARD (l.yAutoLaunch = card top) ─────────────────────────────
+    // â”€â”€ UTILITIES CARD (l.yAutoLaunch = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int cx=l.yAutoLaunch+10+14+6; // top + header
       int hw=(cw-28-8)/2;
       if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();g_optimiseConfirmOpen=true;InvalidateRect(hwnd,NULL,FALSE);}
       if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",dataPath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
     }
 
-    // ── APPEARANCE CARD (l.yFont = card top) ─────────────────────────────────
+    // â”€â”€ APPEARANCE CARD (l.yFont = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int cx=l.yFont+10+14+6; // top + header
       // Font dropdown row
       if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+22){
@@ -16220,7 +16386,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       }
     }
 
-    // ── APPLICATION CARD (l.yMinimise = card top) ────────────────────────────
+    // â”€â”€ APPLICATION CARD (l.yMinimise = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int cx=l.yMinimise+10+14+6; // top + header
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();uiSoundsEnabled=!uiSoundsEnabled;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
       cx+=24+4;
@@ -16231,11 +16397,11 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();performanceMode=!performanceMode;saveSettings();InvalidateRect(hwnd,NULL,TRUE);}
     }
 
-    // ── UPDATE CARD (l.yUpdate) ───────────────────────────────────────────────
+    // â”€â”€ UPDATE CARD (l.yUpdate) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(mx>=p+14&&mx<=p+cw-14&&my>=l.yUpdate+26&&my<=l.yUpdate+48){
         playClick();checkForUpdate();}
 
-    // ── LICENSE CARD (l.yLic) ────────────────────────────────────────────────
+    // â”€â”€ LICENSE CARD (l.yLic) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int ly=l.yLic;
       if(mx>=p+cw-92&&mx<=p+cw-52&&my>=ly+15&&my<=ly+35){playClick();keyVisible=!keyVisible;InvalidateRect(hwnd,NULL,FALSE);}
       if(mx>=p+cw-46&&mx<=p+cw-6&&my>=ly+15&&my<=ly+35&&!savedLicenseKey.empty()){
@@ -16309,7 +16475,7 @@ static void paintOverlay(HWND hwnd){
 
     int pad=10, cy=pad;
 
-    // ── KPS SECTION (always vertical, centred) ─────────────────────────────
+    // â”€â”€ KPS SECTION (always vertical, centred) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(kpsOverlayEnabled){
         // Status pill left, PULSE right
         COLORREF pc=running?OT.green:OT.btn;
@@ -16328,7 +16494,7 @@ static void paintOverlay(HWND hwnd){
         cy+=14;;
     }
 
-    // ── RESOURCE SECTION ─────────────────────────────────────────────────────
+    // â”€â”€ RESOURCE SECTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(resOverlayEnabled){
         if(kpsOverlayEnabled){ fillRect(hdc,pad,cy,W-pad*2,1,OT.border); cy+=6; }
 
@@ -16343,7 +16509,7 @@ static void paintOverlay(HWND hwnd){
         for(auto& r:rows) if(r.show) activeRows++;
 
         if(horiz && activeRows>0){
-            // ── HORIZONTAL: all stats on one compact line ─────────────────────
+            // â”€â”€ HORIZONTAL: all stats on one compact line â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             wchar_t line[80]=L"";
             for(auto& r:rows){
                 if(!r.show) continue;
@@ -16357,7 +16523,7 @@ static void paintOverlay(HWND hwnd){
             drawText(hdc,line,pad,cy,W-pad*2,13,OT.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             cy+=15;
         } else {
-            // ── VERTICAL: stacked rows ────────────────────────────────────────
+            // â”€â”€ VERTICAL: stacked rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             int bh=3, bw=W-pad*2;
             for(auto& r:rows){
                 if(!r.show) continue;
@@ -16497,7 +16663,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return TRUE; // suppress nc repaint during drag
     case WM_NCACTIVATE:
         // Return TRUE to suppress white flash when window loses/gains focus.
-        // Do NOT call DefWindowProc here — it redraws non-client area white.
+        // Do NOT call DefWindowProc here â€” it redraws non-client area white.
         return TRUE;
     case WM_SHOWWINDOW:
         if(wp){
@@ -16558,7 +16724,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             animateTo(animModeHold,(float)holdMode.load(),0.07f); // ~70ms half-life
             animateTo(animRunning,(float)macroRunning.load(),0.07f);
             // Tab dock indicator animation (smooth bar, instant content)
-            // Dock tab animation — fixed speed, always finishes in ~600ms
+            // Dock tab animation â€” fixed speed, always finishes in ~600ms
             {
                 float tabTarget=(float)activeTab;
                 animateTo(tabAnim,tabTarget,0.10f); // 100ms half-life for tab slide
@@ -16608,11 +16774,13 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     // core, so the headroom exists and halving the rate only made
                     // the drift look choppy. Still backs off hard when the window
                     // isn't in front, or when the game wants the cycles.
+                    // Full rate whenever the window is visible at all. Backing off
+                    // merely because it wasn't focused made the field visibly stall
+                    // while it was still on screen and being looked at. The only
+                    // case worth throttling is the game wanting the cycles; when
+                    // minimised the branch above skips the work entirely.
                     static int voidSkip=0;
-                    bool foreground = (GetForegroundWindow()==hwnd);
-                    int every = 1;                                       // 60fps
-                    if(!foreground) every = 6;                           // 10fps
-                    else if(robloxFocused.load()&&macroRunning.load()) every = 3; // 20fps in game
+                    int every = (robloxFocused.load()&&macroRunning.load()) ? 3 : 1;
                     if((++voidSkip % every)==0){
                         updateVoidStars();
                         InvalidateRect(hwnd,NULL,FALSE);
