@@ -372,6 +372,31 @@ static void buildStarLayers(HDC ref,int W,int H){
         HBRUSH black=CreateSolidBrush(RGB(0,0,0));
         FillRect(s_starDC[L],&full,black);
         DeleteObject(black);
+
+        // Large, very dim glows on the slowest layer. Frosted glass needs something
+        // behind it worth refracting - a field of 1px stars blurs to flat black, and
+        // a pane over flat black reads as plastic no matter how its edges are lit.
+        // Drawn before the stars so it never covers them.
+        if(L==0){
+            using namespace Gdiplus;
+            Graphics lg(s_starDC[L]);
+            lg.SetSmoothingMode(SmoothingModeHighQuality);
+            const struct { REAL fx,fy,fr; BYTE a; } blobs[]={
+                {0.24f,0.16f,0.46f,30},{0.80f,0.44f,0.40f,24},
+                {0.34f,0.74f,0.50f,26},{0.72f,0.93f,0.36f,20}
+            };
+            for(const auto& b : blobs){
+                REAL bx=W*b.fx, by=H*b.fy, br=W*b.fr;
+                GraphicsPath e; e.AddEllipse(bx-br,by-br,br*2,br*2);
+                PathGradientBrush pg(&e);
+                pg.SetCenterPoint(PointF(bx,by));
+                // A touch more blue than red - keeps the neutral from reading muddy.
+                pg.SetCenterColor(Color(255,b.a,b.a,(BYTE)std::min(255,(int)(b.a*1.6f))));
+                Color edge(255,0,0,0); int n=1;
+                pg.SetSurroundColors(&edge,&n);
+                lg.FillPath(&pg,&e);
+            }
+        }
         int lum=STAR_LAYER_LUM[L];
         for(int i=0;i<STAR_LAYER_COUNT[L];i++){
             int sx=rand()%W, sy=rand()%H;
@@ -14736,6 +14761,40 @@ static void addRoundRectPath(Gdiplus::GraphicsPath& p,int x,int y,int w,int h,in
     p.AddArc(x,y+h-d,d,d,90,90);
     p.CloseFigure();
 }
+// ── Backdrop blur ───────────────────────────────────────────────────────────
+// Frosted glass has to sample what is behind the pane - that refraction is the
+// whole effect, and a flat translucent fill will never read as glass no matter how
+// the edges are lit. GDI has no blur, but scaling the background down and back up
+// with HALFTONE averages neighbouring pixels, which is a decent box blur for a
+// fraction of the cost of a real kernel. Built once per frame from the finished
+// background, then sampled by each card.
+static HDC     s_blurDC=NULL,  s_blurSmDC=NULL;
+static HBITMAP s_blurBmp=NULL, s_blurSmBmp=NULL, s_blurOld=NULL, s_blurSmOld=NULL;
+static int     s_blurW=0, s_blurH=0;
+static const int BLUR_DIV=12; // higher = softer and cheaper
+
+static void freeBackdropBlur(){
+    if(s_blurDC){ if(s_blurOld) SelectObject(s_blurDC,s_blurOld); if(s_blurBmp) DeleteObject(s_blurBmp); DeleteDC(s_blurDC); }
+    if(s_blurSmDC){ if(s_blurSmOld) SelectObject(s_blurSmDC,s_blurSmOld); if(s_blurSmBmp) DeleteObject(s_blurSmBmp); DeleteDC(s_blurSmDC); }
+    s_blurDC=s_blurSmDC=NULL; s_blurBmp=s_blurSmBmp=s_blurOld=s_blurSmOld=NULL; s_blurW=s_blurH=0;
+}
+void buildBackdropBlur(HDC src,int W,int H){
+    if(W<=0||H<=0) return;
+    int sw=std::max(1,W/BLUR_DIV), sh=std::max(1,H/BLUR_DIV);
+    if(!s_blurDC||W!=s_blurW||H!=s_blurH){
+        freeBackdropBlur();
+        s_blurDC=CreateCompatibleDC(src);   s_blurBmp=CreateCompatibleBitmap(src,W,H);
+        s_blurOld=(HBITMAP)SelectObject(s_blurDC,s_blurBmp);
+        s_blurSmDC=CreateCompatibleDC(src); s_blurSmBmp=CreateCompatibleBitmap(src,sw,sh);
+        s_blurSmOld=(HBITMAP)SelectObject(s_blurSmDC,s_blurSmBmp);
+        s_blurW=W; s_blurH=H;
+    }
+    SetStretchBltMode(s_blurSmDC,HALFTONE); SetBrushOrgEx(s_blurSmDC,0,0,NULL);
+    StretchBlt(s_blurSmDC,0,0,sw,sh,src,0,0,W,H,SRCCOPY);   // down: averages
+    SetStretchBltMode(s_blurDC,HALFTONE);   SetBrushOrgEx(s_blurDC,0,0,NULL);
+    StretchBlt(s_blurDC,0,0,W,H,s_blurSmDC,0,0,sw,sh,SRCCOPY); // up: smooths
+}
+
 // Float variant. Integer geometry made the card jump in whole-pixel steps as it
 // lifted, so the eye tracked individual pixels shifting rather than one solid
 // object moving. Sub-pixel coordinates let GDI+ antialias the motion.
@@ -14783,7 +14842,7 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     POINT m=g_lastMousePos;
     bool inside = m.x>=x && m.x<=x+w && m.y>=y && m.y<=y+h;
     if(inside){ fx.mx=(float)m.x; fx.my=(float)m.y; }
-    animateTo(fx.hv, inside?1.0f:0.0f, inside?0.05f:0.11f);
+    animateTo(fx.hv, inside?1.0f:0.0f, inside?0.055f:0.085f);
     float hv=fx.hv;
     if(hv>0.002f&&hv<0.998f) g_cardAnimActive=true;
 
@@ -14823,14 +14882,46 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     GraphicsPath body;
     addRoundRectPathF(body,cx,cy,cw,ch,(REAL)R);
 
-    // 2. Body - lighter at the top, settling to the base card colour. Kept subtle;
-    //    on the Void theme the whole range is only a few levels above black.
-    int r0=std::min(255,GetRValue(T.card)+14), g0=std::min(255,GetGValue(T.card)+14), b0=std::min(255,GetBValue(T.card)+16);
+    // 2a. Frosted interior: the blurred background showing through the pane. GDI+
+    //     clipping does not apply to BitBlt, so the rounded mask is a GDI region.
+    //     This is what makes it read as glass rather than a translucent rectangle.
+    if(s_blurDC){
+        int bx=(int)cx, by=(int)cy, bw=(int)(cw+0.5f), bh=(int)(ch+0.5f);
+        HRGN rgn=CreateRoundRectRgn(bx,by,bx+bw+1,by+bh+1,R*2,R*2);
+        SelectClipRgn(hdc,rgn);
+        BitBlt(hdc,bx,by,bw,bh,s_blurDC,bx,by,SRCCOPY);
+        SelectClipRgn(hdc,NULL);
+        DeleteObject(rgn);
+    }
+
+    // 2b. Tint over the frost - the glass's own colour and density. Semi-transparent
+    //     so the refracted background stays visible through it, and lighter at the
+    //     top so the pane still reads as lit from above.
+    int r0=std::min(255,GetRValue(T.card)+20), g0=std::min(255,GetGValue(T.card)+20), b0=std::min(255,GetBValue(T.card)+26);
+    // Thinner over the frost while hovered - the pane clarifies as it lifts toward
+    // you, which is most of what makes the material feel alive rather than printed.
+    BYTE aTop=(BYTE)(s_blurDC?(190-(int)(26*hv)):255);
+    BYTE aBot=(BYTE)(s_blurDC?(214-(int)(22*hv)):255);
     LinearGradientBrush lg(RectF(cx,cy,cw,ch+1),
-        Color(255,(BYTE)r0,(BYTE)g0,(BYTE)b0),
-        Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
+        Color(aTop,(BYTE)r0,(BYTE)g0,(BYTE)b0),
+        Color(aBot,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
         LinearGradientModeVertical);
     g.FillPath(&lg,&body);
+
+    // 2c. Inner shading just inside the rim, top darker than bottom. Real glass is
+    //     thicker at the edge than the middle, and that gradient across the first
+    //     few pixels is what separates a pane from a flat translucent shape.
+    if(s_blurDC){
+        GraphicsPath inner;
+        addRoundRectPathF(inner,cx+1.0f,cy+1.0f,cw-2.0f,ch-2.0f,(REAL)R-1.0f);
+        g.SetClip(&body);
+        g.SetClip(&inner,CombineModeExclude);
+        LinearGradientBrush rim(PointF(cx,cy),PointF(cx,cy+ch),
+            Color(52,255,255,255),Color(16,255,255,255));
+        rim.SetWrapMode(WrapModeTileFlipXY);
+        g.FillPath(&rim,&body);
+        g.ResetClip();
+    }
 
     // 3. Caught light along the top edge - clipped to the card so it follows the
     //    corner radius instead of running straight across.
@@ -15371,6 +15462,9 @@ void paintMain(HWND hwnd){
 
     fillRect(hdc,0,0,W,H,T.bg);
     if(themeIdx==5) drawVoidStars(hdc,W,H);
+    // Snapshot the finished background, blurred, before any card covers it - each
+    // card samples this for its frosted interior.
+    if(!performanceMode) buildBackdropBlur(hdc,W,H);
 
     if(activeTab==0){
     // ── TITLE BAR (macro tab) ─────────────────────────────
@@ -16508,11 +16602,17 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     // visible, and the rate is *constant* within each state, which
                     // is what keeps the motion even. Unfocused it drops further -
                     // nobody is looking at a background window's starfield.
+                    // Full rate when the window is actually in front. The 30fps
+                    // throttle here was a workaround for hotkeyThread forcing a
+                    // repaint every 16ms; with that fixed the app sits at ~12% of a
+                    // core, so the headroom exists and halving the rate only made
+                    // the drift look choppy. Still backs off hard when the window
+                    // isn't in front, or when the game wants the cycles.
                     static int voidSkip=0;
                     bool foreground = (GetForegroundWindow()==hwnd);
-                    int every = 2;                                       // 30fps
+                    int every = 1;                                       // 60fps
                     if(!foreground) every = 6;                           // 10fps
-                    else if(robloxFocused.load()&&macroRunning.load()) every = 4; // 15fps in game
+                    else if(robloxFocused.load()&&macroRunning.load()) every = 3; // 20fps in game
                     if((++voidSkip % every)==0){
                         updateVoidStars();
                         InvalidateRect(hwnd,NULL,FALSE);
