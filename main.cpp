@@ -13,6 +13,7 @@
 #include <mmsystem.h>
 #include <tlhelp32.h>
 #include <srrestoreptapi.h>
+#include <shlobj.h>   // SHGetFolderPathW - locates %LOCALAPPDATA% for the data folder
 #include <string>
 #include <vector>
 #include <thread>
@@ -91,6 +92,16 @@ static std::string xorDecrypt(const unsigned char* data, int len){
 // ===================== PATH HELPERS =====================
 // Must be defined before anything that uses file I/O
 static std::wstring gExeDir;
+// Everything wrathic writes lives in one folder: %LOCALAPPDATA%\wrathic.
+// Previously the log was dropped next to the exe, which for most people means it
+// littered their Downloads folder - and in Program Files it would not be writable
+// at all. Settings and the licence key are in the registry, so this is currently
+// the log, but anything file-shaped should go here too.
+static std::wstring gDataDir;
+static std::wstring dataPath(const wchar_t* filename){
+    if(gDataDir.empty()) return std::wstring(filename);
+    return gDataDir + L"\\" + std::wstring(filename);
+}
 static std::wstring exePath(const wchar_t* filename){
     if(gExeDir.empty()) return std::wstring(filename);
     return gExeDir + L"\\" + std::wstring(filename);
@@ -101,6 +112,14 @@ void initExeDir(){
     std::wstring path(buf);
     size_t pos=path.rfind(L'\\');
     gExeDir=(pos!=std::wstring::npos)?path.substr(0,pos):L".";
+
+    wchar_t appdata[MAX_PATH]={};
+    if(SUCCEEDED(SHGetFolderPathW(NULL,CSIDL_LOCAL_APPDATA,NULL,0,appdata))){
+        gDataDir=std::wstring(appdata)+L"\\wrathic";
+        CreateDirectoryW(gDataDir.c_str(),NULL); // no-op if it already exists
+    } else {
+        gDataDir=gExeDir; // fall back to the old behaviour rather than losing logs
+    }
 }
 
 // ===================== LOGGING =====================
@@ -142,7 +161,7 @@ void addLog(const wchar_t* type, const wchar_t* msg) {
     nbuf[ni] = 0;
 
     // Append to log file
-    FILE* f = _wfopen(exePath(LOG_FILE).c_str(), L"a");
+    FILE* f = _wfopen(dataPath(LOG_FILE).c_str(), L"a");
     if (f) {
         fputs(nbuf, f);
         fclose(f);
@@ -177,7 +196,7 @@ void pruneOldLogs(){
     }
 
     // Prune physical file - read, filter, rewrite
-    std::wstring path = exePath(LOG_FILE);
+    std::wstring path = dataPath(LOG_FILE);
     FILE* fin = _wfopen(path.c_str(), L"r");
     if (!fin) return;
     std::vector<std::string> keptLines;
@@ -12962,7 +12981,21 @@ void saveSettings() {
     LOG_OK(L"Settings saved");
 }
 
+// An older build stored everything under lowercase names; the current one uses the
+// CamelCase set. Nothing reads the old names any more, so they just sit in the
+// registry confusing anyone who looks - and they survive a reinstall. Clear them.
+static void cleanupLegacySettings(){
+    static const wchar_t* legacy[]={
+        L"antiAfkClicker",L"antiAfkEnabled",L"antiAfkInterval",L"autoLaunch",
+        L"changelogVer",L"discordRpc",L"font",L"gamepaths",L"gamesel",L"hotkey",
+        L"keys",L"kpsOverlay",L"license",L"resOverlay",L"showChangelog",
+        L"theme",L"uiSounds",L"version"
+    };
+    for(const wchar_t* n : legacy) regDeleteValue(n);
+}
+
 void loadSettings() {
+    cleanupLegacySettings();
     bool found=false;
     int ti=(int)regGetDWORD(L"ThemeIdx",0,&found);
     if (!found) {
@@ -16062,7 +16095,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
     { int cx=l.yAutoLaunch+10+14+6; // top + header
       int hw=(cw-28-8)/2;
       if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();g_optimiseConfirmOpen=true;InvalidateRect(hwnd,NULL,FALSE);}
-      if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",exePath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
+      if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",dataPath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
     }
 
     // ── APPEARANCE CARD (l.yFont = card top) ─────────────────────────────────
