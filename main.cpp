@@ -12747,7 +12747,56 @@ static void buildClickSound(){
         s_clickPcm[(size_t)i*2]=v; s_clickPcm[(size_t)i*2+1]=v;
     }
 }
-static void initClickSound(){ buildClickSound(); }
+// A distinct sound for toggles. The button thock says "that happened"; a switch also
+// needs to say *which way*, so this is a short two-note move - up when switching on,
+// down when switching off - built on the same soft, low-passed body so the two read
+// as the same instrument rather than two different apps.
+static std::vector<short> s_toggleOnPcm, s_toggleOffPcm;
+static void buildTogglePcm(std::vector<short>& out,float f1,float f2){
+    const int SR=44100;
+    const int n=(int)(SR*0.095f);
+    out.resize((size_t)n*2);
+    float lp=0.0f;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)SR;
+        float attack=1.0f-expf(-t*700.0f);
+        float env=expf(-t*30.0f)*attack;
+        // Glide between the two notes over the first third, then hold.
+        float k=std::min(1.0f,t/0.030f);
+        float f=f1+(f2-f1)*k;
+        float body=sinf(6.2831853f*f*t)+sinf(6.2831853f*f*2.0f*t)*0.12f;
+        lp+=(body-lp)*0.35f;                 // takes the edge off the harmonic
+        float smp=lp*env*0.42f;
+        short v=(short)std::max(-28000.0f,std::min(28000.0f,smp*10500.0f));
+        out[(size_t)i*2]=v; out[(size_t)i*2+1]=v;
+    }
+}
+extern bool uiSoundsEnabled;
+static void playPcm(const std::vector<short>& pcm){
+    if(!uiSoundsEnabled||pcm.empty()) return;
+    if(s_sndActive.load()>=6) return;
+    s_sndActive++;
+    const std::vector<short>* p=&pcm;
+    std::thread([p]{
+        WAVEFORMATEX wfx={WAVE_FORMAT_PCM,2,44100,44100*4,4,16,0};
+        HWAVEOUT hWave=NULL;
+        if(waveOutOpen(&hWave,WAVE_MAPPER,&wfx,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){ s_sndActive--; return; }
+        WAVEHDR hdr={};
+        hdr.lpData=(LPSTR)p->data();
+        hdr.dwBufferLength=(DWORD)(p->size()*sizeof(short));
+        waveOutPrepareHeader(hWave,&hdr,sizeof(WAVEHDR));
+        waveOutWrite(hWave,&hdr,sizeof(WAVEHDR));
+        for(int t=0;t<600&&!(hdr.dwFlags&WHDR_DONE);t++) Sleep(5);
+        waveOutUnprepareHeader(hWave,&hdr,sizeof(WAVEHDR));
+        waveOutClose(hWave);
+        s_sndActive--;
+    }).detach();
+}
+static void initClickSound(){
+    buildClickSound();
+    buildTogglePcm(s_toggleOnPcm ,300.0f,430.0f); // rising  = on
+    buildTogglePcm(s_toggleOffPcm,430.0f,290.0f); // falling = off
+}
 // uiSoundsEnabled defined later in globals - extern ref so playClick can use it
 extern bool uiSoundsEnabled;
 static void playClick(){
@@ -13007,6 +13056,12 @@ HINSTANCE gInst;
 ULONG_PTR gdiplusToken=0;
 
 // ===================== SETTINGS =====================
+// Triggerbot state lives with its engine further down, but the settings code below
+// reads and writes it, so it has to be visible here.
+extern std::atomic<bool> triggerbotEnabled;
+extern std::atomic<int>  trigKey, trigR, trigG, trigB, trigTolerance, trigBox, trigDelayMs;
+extern std::atomic<bool> trigHoldMode;
+
 // ===================== REGISTRY STORAGE =====================
 // Replaces the old settings.dat/settings.dat.ver/license.dat files - nothing
 // visible in the app folder, and named values mean adding a new setting
@@ -13049,6 +13104,15 @@ static void regDeleteValue(const wchar_t* name){
 void saveSettings() {
     regSetDWORD(L"ThemeIdx",(DWORD)themeIdx);
     regSetDWORD(L"Kps",(DWORD)kps.load());
+    regSetDWORD(L"TrigEnabled",(DWORD)triggerbotEnabled.load());
+    regSetDWORD(L"TrigKey",(DWORD)trigKey.load());
+    regSetDWORD(L"TrigR",(DWORD)trigR.load());
+    regSetDWORD(L"TrigG",(DWORD)trigG.load());
+    regSetDWORD(L"TrigB",(DWORD)trigB.load());
+    regSetDWORD(L"TrigTol",(DWORD)trigTolerance.load());
+    regSetDWORD(L"TrigBox",(DWORD)trigBox.load());
+    regSetDWORD(L"TrigDelay",(DWORD)trigDelayMs.load());
+    regSetDWORD(L"TrigHold",(DWORD)trigHoldMode.load());
     regSetDWORD(L"HotkeyVK",(DWORD)hotkeyVK.load());
     regSetDWORD(L"HoldMode",(DWORD)holdMode.load());
     regSetDWORD(L"KpsOverlayEnabled",(DWORD)kpsOverlayEnabled);
@@ -13106,6 +13170,15 @@ void loadSettings() {
     }
     if (ti>=0&&ti<6) themeIdx=ti;
     kps = std::max(MIN_KPS, std::min(MAX_KPS, (int)regGetDWORD(L"Kps",kps.load())));
+    triggerbotEnabled = regGetDWORD(L"TrigEnabled",0)!=0;
+    trigKey       = (int)regGetDWORD(L"TrigKey",VK_LBUTTON);
+    trigR         = (int)regGetDWORD(L"TrigR",255);
+    trigG         = (int)regGetDWORD(L"TrigG",0);
+    trigB         = (int)regGetDWORD(L"TrigB",0);
+    trigTolerance = std::max(0,std::min(255,(int)regGetDWORD(L"TrigTol",40)));
+    trigBox       = std::max(2,std::min(128,(int)regGetDWORD(L"TrigBox",16)));
+    trigDelayMs   = std::max(0,std::min(500,(int)regGetDWORD(L"TrigDelay",0)));
+    trigHoldMode  = regGetDWORD(L"TrigHold",0)!=0;
     int hk=(int)regGetDWORD(L"HotkeyVK",VK_F8);
     hotkeyVK = hk ? hk : VK_F8;
     holdMode = regGetDWORD(L"HoldMode",0)!=0;
@@ -14008,6 +14081,35 @@ void macroThread(){
     while(appRunning) Sleep(100); // kept for thread compat, worker does all work
 }
 
+extern bool g_tbCapturing;
+extern std::atomic<int> trigKey;
+
+// Waits for the next key or mouse button and binds it as the triggerbot's key.
+// Separate from captureThread because that one owns the macro's own capture flags.
+void captureTriggerKey(){
+    Sleep(250); // let the click that started the capture finish
+    while(appRunning && g_tbCapturing){
+        for(int vk=1;vk<255;vk++){
+            if(vk==VK_ESCAPE){
+                if(GetAsyncKeyState(vk)&0x8000){ g_tbCapturing=false; break; }
+                continue;
+            }
+            if(GetAsyncKeyState(vk)&0x8000){
+                trigKey=vk;
+                g_tbCapturing=false;
+                saveSettings();
+                std::wstring msg=L"Trigger key set to: "+vkToString(vk);
+                LOG_OK(msg.c_str());
+                showSuccessToast(msg.c_str());
+                break;
+            }
+        }
+        if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+        Sleep(16);
+    }
+    if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+}
+
 void captureThread(bool isHotkey){
     Sleep(300);
     while(appRunning){
@@ -14042,6 +14144,8 @@ void hotkeyThread(){
         if(!capturingHotkey&&!capturingKey){
             bool focused=robloxFocused.load();
             bool pressed=(GetAsyncKeyState(hotkeyVK.load())&0x8000)!=0;
+            // Both engines drive SendInput; only one may hold the input at a time.
+            if(pressed && triggerbotEnabled.load()){ triggerbotEnabled=false; saveSettings(); }
             if(holdMode){
                 bool prev=macroRunning.load();
                 macroRunning=pressed&&focused;
@@ -14363,6 +14467,159 @@ int benchmarkSystem(){
     swprintf(buf,256,L"KPS auto-set to recommended value: %d",recommended);
     LOG_OK(buf);
     return recommended;
+}
+
+// Hit-test rectangles for the triggerbot page, filled in while painting so the click
+// handler never has to duplicate the layout arithmetic.
+struct TbLayout { int yEnable,yKey,yColour,yTune; int hueX,hueY,hueW,hueH; int tolX,tolY,tolW; int boxX,boxY,boxW; };
+static TbLayout g_tbLay={};
+bool                g_tbCapturing=false;   // waiting for the user to press a key
+static bool         g_tbHexEditing=false;
+static std::wstring g_tbHexBuf;
+
+// Fully saturated hue -> RGB, for the colour strip.
+static void hsvToRgb(float h,float s,float v,int& R,int& G,int& B){
+    float c=v*s, x=c*(1.0f-fabsf(fmodf(h/60.0f,2.0f)-1.0f)), m=v-c;
+    float r=0,g=0,b=0;
+    if(h<60){r=c;g=x;} else if(h<120){r=x;g=c;} else if(h<180){g=c;b=x;}
+    else if(h<240){g=x;b=c;} else if(h<300){r=x;b=c;} else {r=c;b=x;}
+    R=(int)((r+m)*255.0f); G=(int)((g+m)*255.0f); B=(int)((b+m)*255.0f);
+}
+
+// ===================== TRIGGERBOT =====================
+// Watches a small box at the centre of the screen and fires a key when the target
+// colour appears in it. Mutually exclusive with the click engine - they both drive
+// SendInput, and letting them run together would interleave presses unpredictably.
+//
+// Speed matters more than anything else here, so the hot loop does no allocation and
+// no GDI work beyond one BitBlt of a small region into a DIB that is created once.
+// A 16x16 box is 256 pixels; scanning it is a few microseconds, and the capture is
+// what dominates. The thread sleeps 1ms between passes, which is well inside human
+// reaction time while leaving the CPU alone.
+std::atomic<bool> triggerbotEnabled{false};   // user has switched it on
+std::atomic<bool> triggerbotFiring{false};    // currently holding the hotkey down
+std::atomic<int>  trigKey{VK_LBUTTON};        // key it presses
+std::atomic<int>  trigR{255}, trigG{0}, trigB{0};
+std::atomic<int>  trigTolerance{40};          // 0..255 per-channel distance
+std::atomic<int>  trigBox{16};                // capture square, px
+std::atomic<int>  trigDelayMs{0};             // optional reaction delay
+std::atomic<bool> trigHoldMode{false};        // hold while seen, vs a single tap
+static std::atomic<bool> gTrigThreadRun{false};
+static HANDLE gTrigThread=NULL;
+
+// Squared distance in RGB. Comparing squares avoids a sqrt in the inner loop.
+static inline bool colourMatches(int r,int g,int b,int tr,int tg,int tb,int tol){
+    int dr=r-tr, dg=g-tg, db=b-tb;
+    return (dr*dr+dg*dg+db*db) <= (tol*tol*3);
+}
+
+static DWORD WINAPI triggerbotThread(LPVOID){
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+    HDC screen=GetDC(NULL);
+    HDC mem=CreateCompatibleDC(screen);
+    HBITMAP bmp=NULL, oldBmp=NULL;
+    DWORD* bits=NULL;
+    int curBox=0;
+    bool wasDown=false;
+
+    while(gTrigThreadRun.load(std::memory_order_relaxed)){
+        if(!triggerbotEnabled.load()){
+            if(wasDown){ // release if we were holding when it was switched off
+                INPUT up{}; int k=trigKey.load();
+                if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
+                    up.type=INPUT_MOUSE;
+                    up.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTUP:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEUP:MOUSEEVENTF_LEFTUP;
+                } else { up.type=INPUT_KEYBOARD; up.ki.wVk=(WORD)k; up.ki.dwFlags=KEYEVENTF_KEYUP; }
+                SendInput(1,&up,sizeof(INPUT));
+                wasDown=false; triggerbotFiring=false;
+            }
+            Sleep(15);
+            continue;
+        }
+
+        int box=std::max(2,std::min(128,trigBox.load()));
+        if(box!=curBox||!bmp){
+            if(bmp){ SelectObject(mem,oldBmp); DeleteObject(bmp); }
+            BITMAPINFO bi={};
+            bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth=box; bi.bmiHeader.biHeight=-box;
+            bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
+            void* p=NULL;
+            bmp=CreateDIBSection(screen,&bi,DIB_RGB_COLORS,&p,NULL,0);
+            if(!bmp){ Sleep(50); continue; }
+            bits=(DWORD*)p;
+            oldBmp=(HBITMAP)SelectObject(mem,bmp);
+            curBox=box;
+        }
+
+        int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
+        int sx=sw/2-box/2, sy=sh/2-box/2;
+        BitBlt(mem,0,0,box,box,screen,sx,sy,SRCCOPY);
+        GdiFlush();
+
+        const int tr=trigR.load(), tg=trigG.load(), tb=trigB.load(), tol=trigTolerance.load();
+        bool hit=false;
+        if(bits){
+            const int n=box*box;
+            for(int i=0;i<n;i++){
+                DWORD px=bits[i];
+                int b=(int)(px&0xFF), g=(int)((px>>8)&0xFF), r=(int)((px>>16)&0xFF);
+                if(colourMatches(r,g,b,tr,tg,tb,tol)){ hit=true; break; }
+            }
+        }
+
+        int k=trigKey.load();
+        bool wantDown = hit;
+        if(wantDown && !wasDown){
+            int d=trigDelayMs.load();
+            if(d>0) Sleep(d);
+            INPUT dn{};
+            if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
+                dn.type=INPUT_MOUSE;
+                dn.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTDOWN:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEDOWN:MOUSEEVENTF_LEFTDOWN;
+            } else { dn.type=INPUT_KEYBOARD; dn.ki.wVk=(WORD)k; }
+            SendInput(1,&dn,sizeof(INPUT));
+            triggerbotFiring=true;
+            if(!trigHoldMode.load()){
+                // Tap mode: release straight away and wait for the colour to clear
+                // before it can fire again, so one target is one press.
+                INPUT up=dn;
+                if(dn.type==INPUT_MOUSE)
+                    up.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTUP:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEUP:MOUSEEVENTF_LEFTUP;
+                else up.ki.dwFlags=KEYEVENTF_KEYUP;
+                SendInput(1,&up,sizeof(INPUT));
+                triggerbotFiring=false;
+            }
+            wasDown=true;
+        } else if(!wantDown && wasDown){
+            if(trigHoldMode.load()){
+                INPUT up{};
+                if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
+                    up.type=INPUT_MOUSE;
+                    up.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTUP:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEUP:MOUSEEVENTF_LEFTUP;
+                } else { up.type=INPUT_KEYBOARD; up.ki.wVk=(WORD)k; up.ki.dwFlags=KEYEVENTF_KEYUP; }
+                SendInput(1,&up,sizeof(INPUT));
+            }
+            triggerbotFiring=false;
+            wasDown=false;
+        }
+        Sleep(1);
+    }
+
+    if(bmp){ SelectObject(mem,oldBmp); DeleteObject(bmp); }
+    DeleteDC(mem);
+    ReleaseDC(NULL,screen);
+    return 0;
+}
+
+void startTriggerbotEngine(){
+    if(gTrigThreadRun.load()) return;
+    gTrigThreadRun=true;
+    gTrigThread=CreateThread(NULL,0,triggerbotThread,NULL,0,NULL);
+}
+void stopTriggerbotEngine(){
+    gTrigThreadRun=false;
+    if(gTrigThread){ WaitForSingleObject(gTrigThread,2000); CloseHandle(gTrigThread); gTrigThread=NULL; }
 }
 
 // ===================== MEMORY CLEANER =====================
@@ -15113,6 +15370,67 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         }
     }
 }
+// A free-floating rounded pill of glass: frosted backdrop, tint, lit top edge and a
+// soft shadow beneath, so it reads as sitting above the content rather than being a
+// strip welded to the window edge.
+void drawGlassPill(HDC hdc,int x,int y,int w,int h,int r){
+    if(performanceMode||!s_blurDC){
+        drawRR(hdc,x,y,w,h,r,T.surface,T.border,1);
+        return;
+    }
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    for(int i=2;i>=1;i--){                 // ambient shadow, widest first
+        int sp=i*3;
+        GraphicsPath sh;
+        addRoundRectPath(sh,x-sp/2,y+sp,w+sp,h,r+sp/2);
+        SolidBrush sb(Color((BYTE)(11-i*3),0,0,0));
+        g.FillPath(&sb,&sh);
+    }
+    HRGN rgn=CreateRoundRectRgn(x,y,x+w+1,y+h+1,r*2,r*2);
+    SelectClipRgn(hdc,rgn);
+    BitBlt(hdc,x,y,w,h,s_blurDC,x,y,SRCCOPY);   // frosted backdrop
+    SelectClipRgn(hdc,NULL);
+    DeleteObject(rgn);
+    GraphicsPath body;
+    addRoundRectPath(body,x,y,w,h,r);
+    int r0=std::min(255,GetRValue(T.surface)+18), g0=std::min(255,GetGValue(T.surface)+18), b0=std::min(255,GetBValue(T.surface)+22);
+    LinearGradientBrush lg(Rect(x,y,w,h+1),
+        Color(198,(BYTE)r0,(BYTE)g0,(BYTE)b0),
+        Color(220,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
+        LinearGradientModeVertical);
+    g.FillPath(&lg,&body);
+    g.SetClip(&body);
+    Pen hi(Color(40,255,255,255),1.0f);
+    g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(r*2),(REAL)(r*2),180.0f,90.0f);
+    g.DrawLine(&hi,(REAL)(x+r),(REAL)y+0.5f,(REAL)(x+w-r),(REAL)y+0.5f);
+    g.DrawArc(&hi,(REAL)(x+w-r*2),(REAL)y,(REAL)(r*2),(REAL)(r*2),270.0f,90.0f);
+    g.ResetClip();
+    Pen bp(Color(34,255,255,255),1.0f);
+    g.DrawPath(&bp,&body);
+}
+
+// The selected-tab bubble that rides inside the dock pill.
+void drawSelBubble(HDC hdc,int x,int y,int w,int h,int r){
+    if(w<=0||h<=0) return;
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    GraphicsPath body;
+    addRoundRectPath(body,x,y,w,h,r);
+    if(performanceMode){
+        SolidBrush b(Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)));
+        g.FillPath(&b,&body);
+        return;
+    }
+    LinearGradientBrush lg(Rect(x,y,w,h+1),
+        Color(64,255,255,255),Color(26,255,255,255),LinearGradientModeVertical);
+    g.FillPath(&lg,&body);
+    Pen bp(Color(52,255,255,255),1.0f);
+    g.DrawPath(&bp,&body);
+}
+
 // A flat horizontal band of glass - the header and the dock. Same material as the
 // cards (frosted backdrop, tint, lit edge) but square, and with the caught-light
 // line on whichever edge faces the content: the bottom of the header, the top of
@@ -15743,6 +16061,68 @@ void paintMain(HWND hwnd){
 
     // â”€â”€ SETTINGS TAB CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(activeTab==1){
+        int ty=70;
+        drawCard(hdc,p,ty,cw,68);
+        drawText(hdc,L"TRIGGERBOT",p+16,ty+10,180,12,T.subtext,hFontSmall);
+        drawText(hdc,triggerbotEnabled.load()?L"Watching for colour":L"Disabled",
+                 p+16,ty+30,cw-90,20,triggerbotEnabled.load()?T.green:T.subtext,
+                 hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        drawToggle(hdc,p+cw-56,ty+32,triggerbotEnabled.load());
+        g_tbLay.yEnable=ty; ty+=78;
+
+        drawCard(hdc,p,ty,cw,66);
+        drawText(hdc,L"TRIGGER KEY",p+16,ty+10,180,12,T.subtext,hFontSmall);
+        drawRR(hdc,p+16,ty+30,86,24,8,T.btn,T.border,1);
+        drawText(hdc,g_tbCapturing?L"press a key":vkToString(trigKey.load()).c_str(),
+                 p+16,ty+30,86,24,T.accent,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        drawText(hdc,trigHoldMode.load()?L"Hold":L"Tap",p+cw-112,ty+30,48,24,T.text,
+                 hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+        drawToggle(hdc,p+cw-56,ty+30,trigHoldMode.load());
+        g_tbLay.yKey=ty; ty+=76;
+
+        drawCard(hdc,p,ty,cw,120);
+        drawText(hdc,L"TARGET COLOUR",p+16,ty+10,200,12,T.subtext,hFontSmall);
+        drawRR(hdc,p+16,ty+30,44,44,10,RGB(trigR.load(),trigG.load(),trigB.load()),T.border,1);
+        {   wchar_t hex[16];
+            swprintf(hex,16,L"#%02X%02X%02X",trigR.load(),trigG.load(),trigB.load());
+            drawRR(hdc,p+70,ty+30,110,26,8,T.btn,g_tbHexEditing?T.accent:T.border,1);
+            std::wstring shown = g_tbHexEditing ? (L"#"+g_tbHexBuf+L"_") : std::wstring(hex);
+            drawText(hdc,shown.c_str(),p+70,ty+30,110,26,T.text,hFontSmall,
+                     DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+        {   int hx=p+16, hy=ty+84, hw2=cw-32, hh=18;
+            for(int i=0;i<hw2;i++){
+                int r2,g2,b2; hsvToRgb((float)i/(float)hw2*360.0f,1.0f,1.0f,r2,g2,b2);
+                fillRect(hdc,hx+i,hy,1,hh,RGB(r2,g2,b2));
+            }
+            g_tbLay.hueX=hx; g_tbLay.hueY=hy; g_tbLay.hueW=hw2; g_tbLay.hueH=hh;
+        }
+        g_tbLay.yColour=ty; ty+=130;
+
+        drawCard(hdc,p,ty,cw,92);
+        {   wchar_t tb[64];
+            swprintf(tb,64,L"TOLERANCE   %d",trigTolerance.load());
+            drawText(hdc,tb,p+16,ty+10,220,12,T.subtext,hFontSmall);
+            int sx=p+16, sy=ty+30, sw2=cw-32;
+            fillRect(hdc,sx,sy+3,sw2,3,T.btn);
+            int fw=(int)((float)trigTolerance.load()/255.0f*(float)sw2);
+            fillRect(hdc,sx,sy+3,fw,3,T.accent);
+            drawDot(hdc,sx+fw,sy+4,6,T.text);
+            g_tbLay.tolX=sx; g_tbLay.tolY=sy; g_tbLay.tolW=sw2;
+
+            swprintf(tb,64,L"SCAN BOX   %d px",trigBox.load());
+            drawText(hdc,tb,p+16,ty+52,220,12,T.subtext,hFontSmall);
+            int bx=p+16, by=ty+72, bw2=cw-32;
+            fillRect(hdc,bx,by+3,bw2,3,T.btn);
+            int bfw=(int)((float)(trigBox.load()-2)/126.0f*(float)bw2);
+            fillRect(hdc,bx,by+3,bfw,3,T.accent);
+            drawDot(hdc,bx+bfw,by+4,6,T.text);
+            g_tbLay.boxX=bx; g_tbLay.boxY=by; g_tbLay.boxW=bw2;
+        }
+        g_tbLay.yTune=ty;
+    }
+
+    if(activeTab==2){
         paintSettingsInto(hdc,W,H-DOCK_H);
     }
 
@@ -15751,17 +16131,27 @@ void paintMain(HWND hwnd){
 
     // â”€â”€ BOTTOM DOCK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {int dy=H-DOCK_H;
-    drawGlassBand(hdc,0,dy,W,DOCK_H,false); // dock: lit along its upper edge
-    int tw=W/2;
-    float mA=easeInOut(1.0f-tabAnim);
-    float sA=easeInOut(tabAnim);
-    fillRect(hdc,0,dy+1,tw,DOCK_H-1,lerpCol(T.surface,T.card,mA*0.7f));
-    {int bw=(int)(mA*(tw-24));if(bw>0)fillRect(hdc,(tw-bw)/2,dy+DOCK_H-3,bw,3,T.accent);}
-    drawText(hdc,L"wrathic",0,dy,tw,DOCK_H,lerpCol(T.subtext,T.text,mA),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    fillRect(hdc,tw,dy+1,tw,DOCK_H-1,lerpCol(T.surface,T.card,sA*0.7f));
-    {int bw=(int)(sA*(tw-24));if(bw>0)fillRect(hdc,tw+(tw-bw)/2,dy+DOCK_H-3,bw,3,T.accent);}
-    drawText(hdc,L"Settings",tw,dy,tw,DOCK_H,lerpCol(T.subtext,T.text,sA),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    fillRect(hdc,tw,dy+10,1,DOCK_H-20,T.border);}
+    // A floating pill rather than a band welded to the window edge: the dock is
+    // inset on all sides and fully rounded, with the selected tab riding inside it
+    // as its own rounded bubble that slides between positions.
+    {
+        const int inset=10, pillH=DOCK_H-14;
+        int px=inset, py=dy+6, pw=W-inset*2;
+        drawGlassPill(hdc,px,py,pw,pillH,pillH/2);
+        const int N=3;
+        const wchar_t* labels[N]={L"wrathic",L"triggerbot",L"Settings"};
+        int segW=pw/N;
+        // The selection bubble follows tabAnim continuously, so switching tabs
+        // slides it rather than snapping between cells.
+        float selX=(float)px + tabAnim*(float)segW;
+        drawSelBubble(hdc,(int)(selX+3),py+3,segW-6,pillH-6,(pillH-6)/2);
+        for(int i=0;i<N;i++){
+            float on=1.0f-std::min(1.0f,fabsf(tabAnim-(float)i));
+            drawText(hdc,labels[i],px+segW*i,py,segW,pillH,
+                     lerpCol(T.subtext,T.text,on),hFontSmall,
+                     DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+    }}
 
     // Vouch card moved to settings tab
 
@@ -16147,6 +16537,8 @@ void showToast(const wchar_t* msg, COLORREF col, ToastIcon icon) {
     LeaveCriticalSection(&g_toastCS);
     if (hwndMain) InvalidateRect(hwndMain, NULL, FALSE);
 }
+void playToggle(bool turningOn){ playPcm(turningOn?s_toggleOnPcm:s_toggleOffPcm); }
+void playToggle(){ playPcm(s_toggleOnPcm); }
 void showSuccessToast(const wchar_t* msg){ showToast(msg, T.green, TOAST_CHECK); playChime(); }
 
 void drawToasts(HDC hdc, int W, int H) {
@@ -16480,7 +16872,10 @@ static void paintOverlay(HWND hwnd){
         // Status pill left, PULSE right
         COLORREF pc=running?OT.green:OT.btn;
         drawRR(hdc,pad,cy,30,13,6,pc,pc,0);
-        drawText(hdc,running?L"LIVE":L"OFF",pad,cy,30,13,running?OT.bg:OT.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        {   bool tb=triggerbotEnabled.load();
+            const wchar_t* lbl = running ? L"LIVE" : (tb ? L"TRIG" : L"OFF");
+            COLORREF lc = running ? OT.bg : (tb ? OT.green : OT.subtext);
+            drawText(hdc,lbl,pad,cy,30,13,lc,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
         drawText(hdc,L"WRATHIC",W-pad-52,cy,52,11,OT.accent,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         cy+=16;
 
@@ -16692,7 +17087,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             break;
         }
         if(wp==TIMER_SETT){
-            if(activeTab==1){
+            if(activeTab==2){
                 InvalidateRect(hwnd,NULL,FALSE); // settings always needs refresh for cpu/ram
             }
             // Track cumulative usage time (fires every 500ms = 0.5min per 60 ticks)
@@ -16827,7 +17222,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
         g_lastMousePos.x=mx; g_lastMousePos.y=my;
         {TRACKMOUSEEVENT tme={sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};TrackMouseEvent(&tme);}
-        if(activeTab==1){
+        if(activeTab==2){
             // Tooltip hover tracking for ? icons
             SLayout tl=getSLayout(hwnd);
             int tp=tl.pad;
@@ -16958,12 +17353,71 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // non-interactive - just shows progress
             return 0;
         }
+        // ── TRIGGERBOT TAB CLICKS ────────────────────────────────────────────
+        if(activeTab==1){
+            RECT crT; GetClientRect(hwnd,&crT);
+            int pT=14, cwT=crT.right-pT*2;
+            int mxT=GET_X_LPARAM(lp), myT=GET_Y_LPARAM(lp);
+            if(myT < crT.bottom-DOCK_H){
+                bool handled=false;
+                // enable / disable
+                if(mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&myT>=g_tbLay.yEnable+32&&myT<=g_tbLay.yEnable+56){
+                    playToggle();
+                    bool now=!triggerbotEnabled.load();
+                    triggerbotEnabled=now;
+                    // The two engines both drive SendInput; running them together
+                    // would interleave presses, so enabling one stops the other.
+                    if(now){ macroRunning=false; showToast(L"Triggerbot enabled - macro disabled",T.green); }
+                    saveSettings(); handled=true;
+                }
+                // rebind key
+                else if(mxT>=pT+16&&mxT<=pT+102&&myT>=g_tbLay.yKey+30&&myT<=g_tbLay.yKey+54){
+                    playClick(); g_tbCapturing=true;
+                    std::thread(captureTriggerKey).detach(); handled=true;
+                }
+                // hold / tap
+                else if(mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&myT>=g_tbLay.yKey+30&&myT<=g_tbLay.yKey+54){
+                    playToggle(); trigHoldMode=!trigHoldMode.load(); saveSettings(); handled=true;
+                }
+                // hex field
+                else if(mxT>=pT+70&&mxT<=pT+180&&myT>=g_tbLay.yColour+30&&myT<=g_tbLay.yColour+56){
+                    playClick(); g_tbHexEditing=true; g_tbHexBuf.clear(); handled=true;
+                }
+                // hue strip
+                else if(mxT>=g_tbLay.hueX&&mxT<=g_tbLay.hueX+g_tbLay.hueW&&
+                        myT>=g_tbLay.hueY&&myT<=g_tbLay.hueY+g_tbLay.hueH){
+                    float h=(float)(mxT-g_tbLay.hueX)/(float)g_tbLay.hueW*360.0f;
+                    int r2,g2,b2; hsvToRgb(h,1.0f,1.0f,r2,g2,b2);
+                    trigR=r2; trigG=g2; trigB=b2; playClick(); saveSettings(); handled=true;
+                }
+                // tolerance / scan box sliders
+                else if(mxT>=g_tbLay.tolX&&mxT<=g_tbLay.tolX+g_tbLay.tolW&&
+                        myT>=g_tbLay.tolY-8&&myT<=g_tbLay.tolY+14){
+                    trigTolerance=std::max(0,std::min(255,(int)((float)(mxT-g_tbLay.tolX)/(float)g_tbLay.tolW*255.0f)));
+                    saveSettings(); handled=true;
+                }
+                else if(mxT>=g_tbLay.boxX&&mxT<=g_tbLay.boxX+g_tbLay.boxW&&
+                        myT>=g_tbLay.boxY-8&&myT<=g_tbLay.boxY+14){
+                    trigBox=std::max(2,std::min(128,2+(int)((float)(mxT-g_tbLay.boxX)/(float)g_tbLay.boxW*126.0f)));
+                    saveSettings(); handled=true;
+                }
+                else { g_tbHexEditing=false; }
+                if(handled){ InvalidateRect(hwnd,NULL,FALSE); return 0; }
+            }
+        }
+
         {RECT cr10;GetClientRect(hwnd,&cr10);
         int dockY=cr10.bottom-DOCK_H;
         // Dock tab bar always handled first
         if(my>=dockY){
-            if(mx<cr10.right/2){ activeTab=0; }
-            else { activeTab=1; settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; SetTimer(hwnd,TIMER_SETT,500,NULL); }
+            // Three equal segments inside the dock pill: wrathic | triggerbot | Settings
+            int inset=10, pw=cr10.right-inset*2, seg=std::max(1,pw/3);
+            int idx=(mx-inset)/seg;
+            idx=std::max(0,std::min(2,idx));
+            playClick();
+            activeTab=idx;
+            if(idx==2){ settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; SetTimer(hwnd,TIMER_SETT,500,NULL); }
+            else KillTimer(hwnd,TIMER_SETT);
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
         }
@@ -16982,7 +17436,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             }
         }
         // Settings tab: absolute hard block - nothing below runs
-        if(activeTab==1){
+        if(activeTab==2){
             settingsHandleClick(hwnd,mx,my,cr10.right,dockY);
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
@@ -17066,7 +17520,7 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
     case WM_MOUSEWHEEL:{
         POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&pt);
 
-        if(activeTab==1){
+        if(activeTab==2){
             int delta2=GET_WHEEL_DELTA_WPARAM(wp)>0?-80:80;
             RECT cr9;GetClientRect(hwnd,&cr9);
             int maxS9=std::max(0,(int)settTotalHeight-(int)(cr9.bottom-DOCK_H)+48);
@@ -17450,6 +17904,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
 
     std::thread(focusThread).detach();
     startMacroEngine(); // start high-res timer worker
+    startTriggerbotEngine(); // colour watcher; idles cheaply until enabled
     std::thread(macroThread).detach();
     std::thread(hotkeyThread).detach();
     std::thread(resourceThread).detach();
