@@ -388,9 +388,14 @@ static void buildSky(HDC ref,int W,int H){
             GraphicsPath e; e.AddEllipse(bx-br,by-br,br*2,br*2);
             PathGradientBrush pg(&e);
             pg.SetCenterPoint(PointF(bx,by));
-            // A little more blue than red, so the neutral doesn't read muddy.
-            pg.SetCenterColor(Color(255,b.a,b.a,(BYTE)std::min(255,(int)(b.a*1.6f))));
-            Color edge(255,0,0,0); int n=1;
+            // Fade out in *alpha*, not toward opaque black. Ramping to Color(255,0,0,0)
+            // meant each blob stamped a fully opaque disc that erased whatever glow was
+            // already there, so wherever two blobs overlapped the newer one cut a hard
+            // dark circle out of the older - visible in the app as a distinct arc
+            // across the lower half of the window.
+            BYTE gr=b.a, gg=b.a, gb=(BYTE)std::min(255,(int)(b.a*1.6f));
+            pg.SetCenterColor(Color(255,gr,gg,gb));
+            Color edge(0,gr,gg,gb); int n=1;
             pg.SetSurroundColors(&edge,&n);
             g.FillPath(&pg,&e);
         }
@@ -12901,8 +12906,11 @@ static void playChime(){
 #define ID_TB_UPGRADE    140  // triggerbot upgrade button (locked state)
 #define ID_PROFILE_0     150  // three profile slots occupy 150..152
 #define ID_PROFILE_COPY  153
-#define ID_PROFILE_PASTE 154
+#define ID_PROFILE_PASTE 154        // the share-code text box
 #define ID_BENCHMARK     155
+#define ID_PROFILE_ASSIGN_0 156     // "-> Slot N" buttons occupy 156..158
+// Slots + hint + copy + paste box + assign row.
+#define PROFILE_CARD_H   188
 #define ID_ADD_KEY       103
 #define ID_REMOVE_KEY    104
 #define ID_MODE_TOGGLE   108
@@ -13074,6 +13082,22 @@ float getHoverAlpha(int id){
     if(id!=0&&id==g_pressedId&&g_pressAnim>0.01f) return -g_pressAnim;
     for(int i=0;i<16;i++) if(hoverBtnId[i]==id) return hoverBtn[i];
     return 0.0f;
+}
+
+// The table above is a fixed 16-slot list of macro-tab widgets, so nothing on the
+// settings page ever got a hover value - the lerps there were reading a constant
+// zero. Settings only ever has one thing under the cursor, so one id and one alpha
+// covers the whole page.
+int   g_settHoverId=0;
+float g_settHoverAlpha=0.0f;
+float getSettHover(int id){
+    if(id!=0&&id==g_pressedId&&g_pressAnim>0.01f) return -g_pressAnim;
+    return (id!=0&&id==g_settHoverId) ? g_settHoverAlpha : 0.0f;
+}
+void setSettHover(int id){
+    // Snap to zero on a change so the new widget fades up from nothing rather than
+    // inheriting the outgoing one's brightness.
+    if(id!=g_settHoverId){ g_settHoverId=id; g_settHoverAlpha=0.0f; }
 }
 
 // Lerp two colours
@@ -14527,29 +14551,42 @@ void resourceThread(){
     }
 
 // ===================== BENCHMARK =====================
+// Picks a starting KPS for a brand new install. Only ever called when there is no
+// saved setting - see the call site - because re-running it on every launch bought
+// nothing and cost real harm:
+//
+//   it fired 600 SendInput pairs back to back, as fast as the machine would take
+//   them, during startup. "Auto-launch with Roblox" means startup routinely happens
+//   with the game already up, so that burst went straight into the game's input
+//   queue. It is the same flood that made the live benchmark freeze a match.
+//
+// Samples are now spaced 6ms apart - about 160/sec, a rate the machine handles
+// without noticing - and the median is used so one scheduling hiccup cannot skew it.
 int benchmarkSystem(){
-    LOG_INFO(L"Benchmarking your system - measuring SendInput throughput...");
-    LARGE_INTEGER freq,start,end;
-    QueryPerformanceFrequency(&freq);
+    LOG_INFO(L"First run - measuring SendInput cost to pick a starting speed...");
+    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
     INPUT dummy[2]={};
     dummy[0].type=INPUT_KEYBOARD;dummy[0].ki.dwFlags=KEYEVENTF_KEYUP;
     dummy[1]=dummy[0];
-    for(int i=0;i<100;i++)SendInput(2,dummy,sizeof(INPUT));
-    const int trials=500;
-    QueryPerformanceCounter(&start);
-    for(int i=0;i<trials;i++)SendInput(2,dummy,sizeof(INPUT));
-    QueryPerformanceCounter(&end);
-    double totalUs=((double)(end.QuadPart-start.QuadPart)/freq.QuadPart)*1000000.0;
-    double perCallUs=totalUs/trials;
+    std::vector<double> costs; costs.reserve(64);
+    for(int i=0;i<48;i++){
+        LARGE_INTEGER a,b;
+        QueryPerformanceCounter(&a);
+        SendInput(2,dummy,sizeof(INPUT));
+        QueryPerformanceCounter(&b);
+        costs.push_back((double)(b.QuadPart-a.QuadPart)*1000000.0/freq.QuadPart);
+        Sleep(6);
+    }
+    std::sort(costs.begin(),costs.end());
+    double perCallUs=costs[costs.size()/2];
+    if(perCallUs<1.0) perCallUs=1.0;
     int maxTheo=(int)(1000000.0/perCallUs);
     int recommended=(int)(maxTheo*0.4);
     recommended=std::max(20,std::min(500,recommended));
     wchar_t buf[256];
-    swprintf(buf,256,L"SendInput avg: %.1f us/call | Theoretical max: %d KPS | Recommended (40%%): %d KPS",
+    swprintf(buf,256,L"SendInput median: %.1f us/call | Ceiling: %d KPS | Starting speed: %d KPS",
         perCallUs,maxTheo,recommended);
     LOG_INFO(buf);
-    swprintf(buf,256,L"KPS auto-set to recommended value: %d",recommended);
-    LOG_OK(buf);
     return recommended;
 }
 
@@ -14709,97 +14746,111 @@ void stopTriggerbotEngine(){
 // ===== LIVE BENCHMARK =====
 // The startup benchmark times SendInput on an idle desktop, which is not the
 // condition that matters: what decides whether the macro helps or hurts is the rate
-// the machine can *sustain* while Roblox is rendering. Measured on this machine the
-// idle figure swung between 249us and 642us per call across runs, so a
-// recommendation derived from it can be out by a factor of two - and setting a rate
-// the system cannot hold means the engine spins without achieving it, stealing
-// frames from the game. Which is what dying feels like.
+// the machine can hold while Roblox is rendering. Measured on this machine the idle
+// figure swung between 249us and 642us per call across runs, so a recommendation
+// derived from it can be out by a factor of two - and setting a rate the system
+// cannot hold means the engine spins without achieving it, stealing frames from the
+// game. Which is what dying feels like.
 //
-// This runs while the game is open, ramps through candidate rates, and reports the
-// highest one actually achieved rather than a theoretical maximum.
+// This runs while the game is open so the load is real, but it never raises the send
+// rate: see benchmarkThread below for why that matters.
 std::atomic<bool> g_benchRunning{false};
 std::atomic<int>  g_benchStage{0};      // 0 idle, 1..N testing, used by the UI
-std::atomic<int>  g_benchBest{0};       // highest sustained rate measured
+std::atomic<int>  g_benchBest{0};       // measured ceiling
 std::atomic<int>  g_benchRecommend{0};
 std::wstring      g_benchMessage;
 
-// Sends a harmless key-up for a key that is not down. Windows still does the full
-// journey through the input stack, so the timing is real, but nothing reaches the
-// game as a keystroke.
-static inline void benchPulse(INPUT* pair){ SendInput(2,pair,sizeof(INPUT)); }
-
+// Measures without flooding. The previous version ramped real SendInput calls up to
+// 2000/sec against a live game: every one of those still travels the full input
+// stack and lands in Roblox's message queue, so the benchmark itself stalled the
+// game it was trying to measure. It froze the game and cost a death. Never send
+// input at a rate you are trying to discover is too high.
+//
+// Instead: sample the cost of a single send at a harmless ~120/sec while the game is
+// running - which is a rate the machine plainly copes with - and separately measure
+// how precisely the wait loop can hit an interval. Together those give the ceiling
+// arithmetically, with no burst at any point.
 static DWORD WINAPI benchmarkThread(LPVOID){
-    const int rates[]={200,500,800,1200,1600,2000};
-    const int nRates=(int)(sizeof(rates)/sizeof(rates[0]));
-
     INPUT pair[2]={};
     pair[0].type=INPUT_KEYBOARD; pair[0].ki.wVk=0; pair[0].ki.dwFlags=KEYEVENTF_KEYUP;
     pair[1]=pair[0];
 
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
-    HANDLE hTimer=CreateWaitableTimerExW(NULL,NULL,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
-    if(!hTimer) hTimer=CreateWaitableTimerW(NULL,FALSE,NULL);
     timeBeginPeriod(1);
 
-    int best=0;
-    for(int r=0;r<nRates;r++){
-        if(!g_benchRunning.load()) break;
-        g_benchStage=r+1;
-        const int target=rates[r];
-        const long long intervalTicks=freq.QuadPart/target;
-        const double windowSec=0.45;
-
-        LARGE_INTEGER t0,now; QueryPerformanceCounter(&t0);
-        long long deadline=t0.QuadPart+(long long)(freq.QuadPart*windowSec);
-        long long next=t0.QuadPart;
-        int sent=0;
-
-        while(true){
-            QueryPerformanceCounter(&now);
-            if(now.QuadPart>=deadline) break;
-            benchPulse(pair); sent++;
-            next+=intervalTicks;
-            // Same wait strategy as the click engine, so the number reflects what the
-            // engine will actually manage rather than an idealised loop.
-            long long spinFrom=next-(freq.QuadPart/2000);
-            QueryPerformanceCounter(&now);
-            if(now.QuadPart<spinFrom){
-                LONGLONG due=-(((spinFrom-now.QuadPart)*10000LL)/freq.QuadPart)*100LL;
-                if(due<-100LL){ SetWaitableTimer(hTimer,(LARGE_INTEGER*)&due,0,NULL,NULL,FALSE); WaitForSingleObject(hTimer,10); }
-            }
-            do{ QueryPerformanceCounter(&now); _mm_pause(); } while(now.QuadPart<next && g_benchRunning.load());
-        }
-
-        QueryPerformanceCounter(&now);
-        double elapsed=(double)(now.QuadPart-t0.QuadPart)/freq.QuadPart;
-        int achieved=(int)(sent/elapsed);
-        wchar_t line[192];
-        swprintf(line,192,L"Benchmark: asked %d KPS, achieved %d KPS (%.0f%%)",
-                 target,achieved,100.0*achieved/target);
-        LOG_INFO(line);
-        // Counts as sustained only if it held ~95% of the requested rate.
-        if(achieved >= (int)(target*0.95)) best=target;
-        else break; // it will only get worse from here
+    // ── Stage 1: per-send cost under real game load ──────────────────────────
+    // 180 samples at ~120/sec is 1.5s of a load the machine handles trivially.
+    g_benchStage=1;
+    std::vector<double> costs;
+    costs.reserve(200);
+    for(int i=0;i<180 && g_benchRunning.load();i++){
+        LARGE_INTEGER a,b;
+        QueryPerformanceCounter(&a);
+        SendInput(2,pair,sizeof(INPUT));
+        QueryPerformanceCounter(&b);
+        costs.push_back((double)(b.QuadPart-a.QuadPart)*1000000.0/freq.QuadPart);
+        Sleep(8); // ~120/sec - deliberately gentle
     }
+    if(costs.empty()){ timeEndPeriod(1); g_benchRunning=false; g_benchStage=0; return 0; }
 
-    timeEndPeriod(1);
+    // Median, not mean: a single scheduling hiccup in 180 samples would drag a mean
+    // far enough to change the recommendation.
+    std::sort(costs.begin(),costs.end());
+    double medianUs=costs[costs.size()/2];
+    double p90Us   =costs[(size_t)(costs.size()*0.90)];
+
+    // ── Stage 2: how precisely can the wait loop hit an interval ─────────────
+    g_benchStage=2;
+    HANDLE hTimer=CreateWaitableTimerExW(NULL,NULL,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
+    if(!hTimer) hTimer=CreateWaitableTimerW(NULL,FALSE,NULL);
+    double jitterUs=0; int jn=0;
+    for(int i=0;i<60 && g_benchRunning.load();i++){
+        LARGE_INTEGER a,b;
+        QueryPerformanceCounter(&a);
+        long long target=a.QuadPart+freq.QuadPart/1000; // aim for exactly 1ms
+        long long spinFrom=target-(freq.QuadPart/2000);
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if(now.QuadPart<spinFrom){
+            LONGLONG due=-(((spinFrom-now.QuadPart)*10000LL)/freq.QuadPart)*100LL;
+            if(due<-100LL){ SetWaitableTimer(hTimer,(LARGE_INTEGER*)&due,0,NULL,NULL,FALSE); WaitForSingleObject(hTimer,5); }
+        }
+        do{ QueryPerformanceCounter(&now); _mm_pause(); } while(now.QuadPart<target);
+        QueryPerformanceCounter(&b);
+        double overshoot=((double)(b.QuadPart-a.QuadPart)*1000000.0/freq.QuadPart)-1000.0;
+        if(overshoot>0){ jitterUs+=overshoot; jn++; }
+    }
     if(hTimer){ CancelWaitableTimer(hTimer); CloseHandle(hTimer); }
+    if(jn) jitterUs/=jn;
+    timeEndPeriod(1);
 
-    if(best==0) best=rates[0];
-    // Leave headroom: running at exactly the ceiling leaves the game nothing.
-    int rec=std::max(MIN_KPS,std::min(MAX_KPS,(int)(best*0.8)));
-    g_benchBest=best;
+    // ── Result ───────────────────────────────────────────────────────────────
+    // Budget per click = the send itself, at the pessimistic end, plus the wait
+    // loop's typical overshoot. p90 rather than the median because the rate has to
+    // hold during the worst moments of a match, not the calmest.
+    double perClickUs = p90Us + jitterUs;
+    if(perClickUs < 1.0) perClickUs = 1.0;
+    int ceiling = (int)(1000000.0 / perClickUs);
+    ceiling = std::max(MIN_KPS, std::min(MAX_KPS, ceiling));
+    // 60% of the ceiling. The macro is not the only thing that needs the CPU - the
+    // game has to render, and running near the limit is what causes the stalls this
+    // is meant to prevent.
+    int rec = std::max(MIN_KPS, std::min(MAX_KPS, (int)(ceiling*0.6)));
+
+    wchar_t line[224];
+    swprintf(line,224,L"Benchmark: send median %.0fus, p90 %.0fus, wait jitter %.0fus -> ceiling ~%d KPS",
+             medianUs,p90Us,jitterUs,ceiling);
+    LOG_INFO(line);
+
+    g_benchBest=ceiling;
     g_benchRecommend=rec;
-    wchar_t msg[192];
-    swprintf(msg,192,L"Sustained %d KPS. Recommended %d - applied.",best,rec);
-    g_benchMessage=msg;
-    LOG_OK(msg);
-    kps=rec;
-    saveSettings();
+    swprintf(line,224,L"Measured ceiling ~%d KPS. Recommended %d.",ceiling,rec);
+    g_benchMessage=line;
+    LOG_OK(line);
+    // Suggest rather than impose - the user knows what they can run at.
     g_benchStage=0;
     g_benchRunning=false;
     if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
-    showSuccessToast(msg);
+    showSuccessToast(line);
     return 0;
 }
 
@@ -14810,6 +14861,11 @@ void startLiveBenchmark(){
     if(!robloxFocused.load() && !gRobloxHwnd){
         showToast(L"Open Roblox first - the result is only useful under game load",T.red);
         LOG_ERR(L"Benchmark refused - Roblox is not running");
+        return;
+    }
+    if(macroRunning.load() || triggerbotEnabled.load()){
+        // Two things sending input at once measures neither of them.
+        showToast(L"Stop the macro first",T.red);
         return;
     }
     g_benchRunning=true;
@@ -14963,15 +15019,52 @@ static void profilesLoad(){
     }
 }
 
+// Share-code box. A code arrives from Discord as text, so it has to be pasteable
+// somewhere visible - a button that silently reads the clipboard gives no sign it
+// found anything, or found the wrong thing.
+bool         g_pasteEditing=false;
+std::wstring g_pasteBuffer;
+bool         g_pasteValid=false;   // does the buffer currently decode? drives the border colour
+float        g_profCopiedAlpha=0.0f;
+bool         g_profCopied=false;   // cleared by the same 2s timer as the license copy
+
+// Re-checks whether whatever is in the share-code box actually decodes. Called on
+// every edit so the border and the slot buttons react as you type or paste, instead
+// of only telling you it was wrong after you commit to a slot.
+static void pasteRevalidate(){
+    Profile tmp;
+    g_pasteValid = !g_pasteBuffer.empty() && profileDecode(g_pasteBuffer,tmp);
+}
+// Pulls text from the clipboard into the box. Codes copied out of Discord often carry
+// surrounding whitespace or a stray backtick from a code block, so trim those.
+static void pasteFromClipboard(HWND hwnd){
+    std::wstring t;
+    if(OpenClipboard(hwnd)){
+        HANDLE h=GetClipboardData(CF_UNICODETEXT);
+        if(h){ const wchar_t* s=(const wchar_t*)GlobalLock(h); if(s) t=s; GlobalUnlock(h); }
+        CloseClipboard();
+    }
+    size_t a=t.find_first_not_of(L" \t\r\n`");
+    if(a==std::wstring::npos){ if(t.empty()) showToast(L"Clipboard is empty",T.red); return; }
+    size_t b=t.find_last_not_of(L" \t\r\n`");
+    t=t.substr(a,b-a+1);
+    if(t.size()>128) t=t.substr(0,128);
+    g_pasteBuffer=t;
+    pasteRevalidate();
+    if(!g_pasteValid) showToast(L"That is not a wrathic share code",T.red);
+}
+
 // ===================== MEMORY CLEANER =====================
 std::wstring cleanRamStatus = L"";
 bool licCopied = false;
 
 // Custom KPS/ms entry - click the speed label to type an exact value
 // instead of only dragging the slider or picking a preset.
+bool g_sliderDragging=false;  // mouse captured for a slider drag
 bool g_kpsEditing=false;
 bool g_kpsEditIsMs=false; // false = typing a KPS value directly, true = typing ms-between-clicks
 std::wstring g_kpsEditBuffer;
+
 float licCopiedAlpha = 0.0f; // animated toward licCopied?1:0 each frame for a smooth fade
 DWORD licCopiedTick = 0;
 
@@ -15847,32 +15940,76 @@ void drawToggle(HDC hdc,int x,int y,bool on){
     SolidBrush knob(Color(GetRValue(T.text),GetGValue(T.text),GetBValue(T.text)));
     g.FillEllipse(&knob,kx,y+2,H-4,H-4);
 }
+// The track used to be two flat GDI rectangles with 3px corners, which read as blocky
+// next to the glass cards. It is now drawn entirely in GDI+: a recessed groove, a
+// gradient fill, and a knob built like a glass bead - rim, body, highlight - that
+// swells while it is being dragged so the grab is legible.
 void drawSlider(HDC hdc,int x,int y,int w,int val,int minV,int maxV){
     using namespace Gdiplus;
-    int H=6,KW=20,KH=20;
-    int ty=y+(KH-H)/2;
+    const REAL H=7.0f;          // groove thickness
+    const int  KW=20,KH=20;     // knob box
+    REAL ty=(REAL)y+(KH-H)/2.0f;
     float pct=(float)(val-minV)/(maxV-minV);
     pct=std::max(0.0f,std::min(1.0f,pct));
-    int filled=(int)(pct*(w-KW));
-    // Track background
-    drawRR(hdc,x+KW/2,ty,w-KW,H,3,T.btn);
-    // Filled portion
-    if(filled>0) drawRR(hdc,x+KW/2,ty,filled,H,3,T.accent);
-    int kx=x+(int)(pct*(w-KW));
-    int cx=kx+KW/2, cy=y+KH/2;
+    REAL runW=(REAL)(w-KW);
+    REAL filled=pct*runW;
+    REAL tx=(REAL)x+KW/2.0f;
+
     Graphics g(hdc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
-    // Soft glow using alpha ellipse - no cross artifact
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);   // stops the groove edge shimmering
+
     BYTE ar=GetRValue(T.accent), ag=GetGValue(T.accent), ab=GetBValue(T.accent);
-    SolidBrush glow1(Color(30, ar, ag, ab));
-    SolidBrush glow2(Color(15, ar, ag, ab));
-    g.FillEllipse(&glow2, cx-14, cy-14, 28, 28);
-    g.FillEllipse(&glow1, cx-10, cy-10, 20, 20);
-    // Knob
-    SolidBrush knobBr(Color(GetRValue(T.text),GetGValue(T.text),GetBValue(T.text)));
-    Pen knobPen(Color(GetRValue(T.accent),GetGValue(T.accent),GetBValue(T.accent)),2.0f);
-    g.FillEllipse(&knobBr,kx,y,KW,KH);
-    g.DrawEllipse(&knobPen,kx,y,KW,KH);
+
+    // Groove: darker than the card, with a light top edge so it reads as cut in
+    // rather than laid on.
+    {
+        GraphicsPath track; addRoundRectPathF(track,tx,ty,runW,H,H/2.0f);
+        SolidBrush base(Color(255,(BYTE)(GetRValue(T.btn)*0.55f),
+                                  (BYTE)(GetGValue(T.btn)*0.55f),
+                                  (BYTE)(GetBValue(T.btn)*0.55f)));
+        g.FillPath(&base,&track);
+        Pen lip(Color(26,255,255,255),1.0f);
+        g.DrawPath(&lip,&track);
+    }
+
+    // Filled run: accent, brightening toward the knob so the eye is led to it.
+    if(filled>1.0f){
+        GraphicsPath fill; addRoundRectPathF(fill,tx,ty,filled,H,H/2.0f);
+        LinearGradientBrush lg(PointF(tx,ty),PointF(tx+filled,ty),
+            Color(255,(BYTE)(ar*0.62f),(BYTE)(ag*0.62f),(BYTE)(ab*0.62f)),
+            Color(255,ar,ag,ab));
+        g.FillPath(&lg,&fill);
+    }
+
+    REAL kx=(REAL)x+pct*runW;
+    REAL cx=kx+KW/2.0f, cy=(REAL)y+KH/2.0f;
+    // Grows a little under the hand. g_sliderDragging is the same flag that holds the
+    // mouse capture, so the visual and the gesture cannot disagree.
+    REAL grow=g_sliderDragging?2.0f:0.0f;
+    REAL kr=KW/2.0f+grow;
+
+    // Halo - two soft passes, stronger while dragging.
+    {
+        BYTE o1=(BYTE)(g_sliderDragging?46:26), o2=(BYTE)(g_sliderDragging?22:12);
+        SolidBrush h2(Color(o2,ar,ag,ab)); g.FillEllipse(&h2,cx-kr-7,cy-kr-7,(kr+7)*2,(kr+7)*2);
+        SolidBrush h1(Color(o1,ar,ag,ab)); g.FillEllipse(&h1,cx-kr-3,cy-kr-3,(kr+3)*2,(kr+3)*2);
+    }
+    // Body: near-white, shaded top-to-bottom so it looks spherical rather than flat.
+    {
+        GraphicsPath bead; bead.AddEllipse(cx-kr,cy-kr,kr*2,kr*2);
+        LinearGradientBrush body(PointF(cx,cy-kr),PointF(cx,cy+kr),
+            Color(255,255,255,255),
+            Color(255,(BYTE)(GetRValue(T.text)*0.80f),
+                      (BYTE)(GetGValue(T.text)*0.80f),
+                      (BYTE)(GetBValue(T.text)*0.80f)));
+        g.FillPath(&body,&bead);
+        Pen rim(Color(255,ar,ag,ab),2.0f);
+        g.DrawEllipse(&rim,cx-kr,cy-kr,kr*2,kr*2);
+        // Specular dot, offset up-left like every other lit surface in the app.
+        SolidBrush spec(Color(150,255,255,255));
+        g.FillEllipse(&spec,cx-kr*0.55f,cy-kr*0.68f,kr*0.66f,kr*0.46f);
+    }
 }
 
 // ===================== LAYOUT =====================
@@ -16655,7 +16792,7 @@ SLayout getSLayout(HWND hwnd){
     l.yRes       = y; y += calcOverlayCardH() + GAP;
     if(kpsOverlayEnabled||resOverlayEnabled) y += calcOvPosCardH() + GAP;
     l.yAutoLaunch= y; y += calcUtilsCardH() + GAP;     // utilities card
-    l.yProfiles  = y; y += 118 + GAP;                 // profiles card
+    l.yProfiles  = y; y += PROFILE_CARD_H + GAP;      // profiles card
     // Appearance card (yFont = card top)
     l.yFont      = y; y += calcAppearanceCardH() + GAP;
     l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22; // font row start
@@ -16688,7 +16825,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     l.yRes       = y2; y2 += calcOverlayCardH() + GAP;
     if(kpsOverlayEnabled||resOverlayEnabled) y2 += calcOvPosCardH() + GAP;
     l.yAutoLaunch= y2; y2 += calcUtilsCardH() + GAP;
-    l.yProfiles  = y2; y2 += 118 + GAP;
+    l.yProfiles  = y2; y2 += PROFILE_CARD_H + GAP;
     l.yFont      = y2; y2 += calcAppearanceCardH() + GAP;
     l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22;
     l.yTheme     = -1; // embedded in appearance card
@@ -16789,15 +16926,20 @@ void paintSettingsInto(HDC hdc,int W,int H){
     cx+=28+6;
     {
         bool busy=g_benchRunning.load();
-        float bh=getHoverAlpha(ID_BENCHMARK);
+        float bh=getSettHover(ID_BENCHMARK);
         drawRR(hdc,p+14,cx,cw-28,28,8,busy?T.btn:lerpCol(T.btn,T.btnHov,bh),busy?T.accent:T.border,1);
         std::wstring lbl;
         if(busy){
             int st=g_benchStage.load();
-            wchar_t t[64]; swprintf(t,64,L"Testing... step %d of 6",st<1?1:st);
-            lbl=t;
-        } else if(g_benchBest.load()>0){
-            wchar_t t[96]; swprintf(t,96,L"Benchmark  -  sustained %d KPS",g_benchBest.load());
+            lbl = (st>=2) ? L"Measuring timer precision..." : L"Measuring send cost...";
+        } else if(g_benchRecommend.load()>0){
+            // Second tap applies it. The result is a suggestion, never forced - the
+            // rate someone can actually play at is theirs to know.
+            wchar_t t[96];
+            if(kps.load()==g_benchRecommend.load())
+                swprintf(t,96,L"Ceiling ~%d KPS  -  recommendation applied",g_benchBest.load());
+            else
+                swprintf(t,96,L"Ceiling ~%d KPS  -  tap to set %d",g_benchBest.load(),g_benchRecommend.load());
             lbl=t;
         } else {
             lbl=L"Benchmark my KPS  (Roblox must be open)";
@@ -16823,14 +16965,16 @@ void paintSettingsInto(HDC hdc,int W,int H){
 
     // ===== PROFILES CARD =====
     y=l.yProfiles+sfadeY;
-    drawCard(hdc,p,y,cw,118);
+    animateTo(g_profCopiedAlpha, g_profCopied?1.0f:0.0f, 0.12f);
+    animateTo(g_settHoverAlpha, g_settHoverId?1.0f:0.0f, 0.07f);
+    drawCard(hdc,p,y,cw,PROFILE_CARD_H);
     drawText(hdc,L"PROFILES",p+14,y+10,200,14,T.subtext,hFontSmall);
     {
         int rowY=y+30, slotW=(cw-28-12)/3;
         for(int i=0;i<PROFILE_SLOTS;i++){
             int sx=p+14+i*(slotW+6);
             const Profile& pr=g_profiles[i];
-            float hv=getHoverAlpha(ID_PROFILE_0+i);
+            float hv=getSettHover(ID_PROFILE_0+i);
             drawRR(hdc,sx,rowY,slotW,36,9,lerpCol(T.btn,T.btnHov,hv),pr.used?T.accent:T.border,1);
             wchar_t lbl[48];
             if(pr.used) swprintf(lbl,48,L"%s",pr.name.c_str());
@@ -16842,12 +16986,44 @@ void paintSettingsInto(HDC hdc,int W,int H){
         }
         drawText(hdc,L"tap empty to save, saved to load \u00b7 right-click clears",
                  p+14,y+70,cw-28,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        int bw=(cw-28-6)/2;
-        float ce=getHoverAlpha(ID_PROFILE_COPY), pe=getHoverAlpha(ID_PROFILE_PASTE);
-        drawRR(hdc,p+14,y+88,bw,24,12,lerpCol(T.btn,T.btnHov,ce),T.border,1);
-        drawText(hdc,L"Copy code",p+14,y+88,bw,24,lerpCol(T.subtext,T.text,ce),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        drawRR(hdc,p+14+bw+6,y+88,bw,24,12,lerpCol(T.btn,T.btnHov,pe),T.border,1);
-        drawText(hdc,L"Paste code",p+14+bw+6,y+88,bw,24,lerpCol(T.subtext,T.text,pe),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+
+        // Copy: same green tick + fade the license key copy uses, so the two feel like
+        // the same action.
+        float ca=g_profCopiedAlpha;
+        float ce=getSettHover(ID_PROFILE_COPY);
+        COLORREF cBg=lerpCol(lerpCol(T.btn,T.btnHov,ce),RGB(20,60,30),ca);
+        drawRR(hdc,p+14,y+88,cw-28,26,13,cBg,lerpCol(T.border,T.green,ca),1);
+        drawText(hdc,ca>0.5f?L"\u2713  Share code copied":L"Copy my setup as a share code",
+                 p+14,y+88,cw-28,26,lerpCol(lerpCol(T.subtext,T.text,ce),T.green,ca),
+                 hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+
+        // Paste box. Typing is allowed but Ctrl+V is the point of it.
+        int by=y+120;
+        bool empty=g_pasteBuffer.empty();
+        COLORREF pbBorder = g_pasteEditing ? (empty?T.accent:(g_pasteValid?T.green:T.red))
+                                           : (empty?T.border:(g_pasteValid?T.green:T.red));
+        drawRR(hdc,p+14,by,cw-28,26,8,T.btn,pbBorder,1);
+        std::wstring disp;
+        if(empty && !g_pasteEditing) disp=L"Paste a share code here";
+        else {
+            disp=g_pasteBuffer;
+            if(g_pasteEditing && ((GetTickCount()/500)%2)==0) disp+=L"_";
+        }
+        drawText(hdc,disp.c_str(),p+22,by,cw-44,26,
+                 (empty&&!g_pasteEditing)?T.subtext:T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+
+        // Assign row. Disabled until the buffer decodes - a code either parses or it
+        // does not, and there is no reason to let someone overwrite a slot with junk.
+        int ay=by+32, aw=(cw-28-12)/3;
+        for(int i=0;i<PROFILE_SLOTS;i++){
+            int sx=p+14+i*(aw+6);
+            float hv=g_pasteValid?getSettHover(ID_PROFILE_ASSIGN_0+i):0.0f;
+            drawRR(hdc,sx,ay,aw,24,12,g_pasteValid?lerpCol(T.btn,T.btnHov,hv):T.card,
+                   g_pasteValid?T.border:T.border,1);
+            wchar_t t[32]; swprintf(t,32,L"\u2192 Slot %d",i+1);
+            drawText(hdc,t,sx,ay,aw,24,g_pasteValid?lerpCol(T.subtext,T.text,hv):T.border,
+                     hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
     }
 
 
@@ -17106,6 +17282,55 @@ void spawnOverlay();
 void updateOverlay();
 
 // ===================== SETTINGS CLICK HANDLER =====================
+// Which settings widget is under the cursor. Separate from hitTest() because that one
+// is built on the macro tab's Layout, not SLayout.
+int settingsHitTest(HWND hwnd, int mx, int my){
+    if(activeTab!=2) return 0;
+    SLayout l = getSLayout(hwnd);
+    int p=l.pad, cw=l.cw;
+    int py=l.yProfiles, slotW=(cw-28-12)/3;
+    for(int i=0;i<PROFILE_SLOTS;i++){
+        int sx=p+14+i*(slotW+6);
+        if(mx>=sx&&mx<=sx+slotW&&my>=py+30&&my<=py+66) return ID_PROFILE_0+i;
+    }
+    if(mx>=p+14&&mx<=p+cw-14&&my>=py+88 &&my<=py+114) return ID_PROFILE_COPY;
+    if(mx>=p+14&&mx<=p+cw-14&&my>=py+120&&my<=py+146) return ID_PROFILE_PASTE;
+    { int ay=py+152, aw=(cw-28-12)/3;
+      for(int i=0;i<PROFILE_SLOTS;i++){
+          int sx=p+14+i*(aw+6);
+          if(mx>=sx&&mx<=sx+aw&&my>=ay&&my<=ay+24) return ID_PROFILE_ASSIGN_0+i;
+      } }
+    { int cx=l.yAutoLaunch+10+14+6+28+6;   // utilities card: past header and the first row
+      if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+28) return ID_BENCHMARK; }
+    return 0;
+}
+
+// Right-click on the settings page. Only the profile slots use it: the card has said
+// "right-click clears" since the feature landed, but nothing was listening for the
+// message, so the hint was a lie.
+void settingsHandleRightClick(HWND hwnd, int mx, int my, int W, int H) {
+    (void)W; (void)H;
+    if(activeTab!=2) return;
+    SLayout l = getSLayout(hwnd);
+    int p=l.pad, cw=l.cw;
+    int py=l.yProfiles, slotW=(cw-28-12)/3, rowY=py+30;
+    for(int i=0;i<PROFILE_SLOTS;i++){
+        int sx=p+14+i*(slotW+6);
+        if(mx>=sx&&mx<=sx+slotW&&my>=rowY&&my<=rowY+36){
+            if(!g_profiles[i].used){ showToast(L"That slot is already empty",T.subtext); }
+            else {
+                std::wstring gone=g_profiles[i].name;
+                g_profiles[i]=Profile();
+                profilesSave();
+                playToggle(false);
+                showToast((L"Cleared " + gone).c_str(),T.red);
+            }
+            InvalidateRect(hwnd,NULL,FALSE);
+            return;
+        }
+    }
+}
+
 void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
     SLayout l = getSLayout(hwnd);
     int p = l.pad, cw = l.cw;
@@ -17226,9 +17451,8 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
               return;
           }
       }
-      int bw=(cw-28-6)/2;
       // Copy: put the code on the clipboard so it can be pasted into Discord.
-      if(mx>=p+14&&mx<=p+14+bw&&my>=py+88&&my<=py+112){
+      if(mx>=p+14&&mx<=p+cw-14&&my>=py+88&&my<=py+114){
           playClick();
           std::wstring code=profileEncode(profileFromCurrent(L"Current"));
           if(OpenClipboard(hwnd)){
@@ -17237,27 +17461,46 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
               HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,bytes);
               if(h){ memcpy(GlobalLock(h),code.c_str(),bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); }
               CloseClipboard();
-              showSuccessToast(L"Share code copied");
-          }
+              // Same tick-and-fade as the license key, on the same 2s timer.
+              g_profCopied=true; SetTimer(hwnd,20,2000,NULL);
+          } else showToast(L"Could not open the clipboard",T.red);
           InvalidateRect(hwnd,NULL,FALSE);
           return;
       }
-      // Paste: read a code off the clipboard and apply it.
-      if(mx>=p+14+bw+6&&mx<=p+14+bw+6+bw&&my>=py+88&&my<=py+112){
+      // The paste box. Clicking it takes keyboard focus; Ctrl+V fills it. It is also
+      // filled straight from the clipboard on click when it is empty, because that is
+      // what everyone tries first.
+      if(mx>=p+14&&mx<=p+cw-14&&my>=py+120&&my<=py+146){
           playClick();
-          std::wstring code;
-          if(OpenClipboard(hwnd)){
-              HANDLE h=GetClipboardData(CF_UNICODETEXT);
-              if(h){ const wchar_t* t=(const wchar_t*)GlobalLock(h); if(t) code=t; GlobalUnlock(h); }
-              CloseClipboard();
-          }
-          Profile imported;
-          if(code.empty())                       showToast(L"Clipboard is empty",T.red);
-          else if(!profileDecode(code,imported)) showToast(L"That is not a wrathic share code",T.red);
-          else { profileApply(imported); showSuccessToast(L"Settings applied from code"); }
+          g_pasteEditing=true; g_kpsEditing=false;
+          if(g_pasteBuffer.empty()) pasteFromClipboard(hwnd);
           InvalidateRect(hwnd,NULL,FALSE);
           return;
       }
+      // Assign the pasted code to a slot. Inert until it decodes.
+      { int ay=py+152, aw=(cw-28-12)/3;
+        for(int i=0;i<PROFILE_SLOTS;i++){
+            int sx=p+14+i*(aw+6);
+            if(mx>=sx&&mx<=sx+aw&&my>=ay&&my<=ay+24){
+                if(!g_pasteValid){ showToast(L"Paste a valid share code first",T.red); InvalidateRect(hwnd,NULL,FALSE); return; }
+                Profile imported;
+                if(profileDecode(g_pasteBuffer,imported)){
+                    wchar_t nm[24]; swprintf(nm,24,L"Shared %d",i+1);
+                    imported.name=nm; imported.used=true;
+                    g_profiles[i]=imported;
+                    profilesSave();
+                    playToggle(true);
+                    wchar_t m[48]; swprintf(m,48,L"Saved to slot %d",i+1);
+                    showSuccessToast(m);
+                    g_pasteBuffer.clear(); g_pasteValid=false; g_pasteEditing=false;
+                }
+                InvalidateRect(hwnd,NULL,FALSE);
+                return;
+            }
+        }
+      }
+      // Clicking anywhere else in the card drops focus out of the box.
+      if(my>=py&&my<=py+PROFILE_CARD_H) g_pasteEditing=false;
     }
 
     // â”€â”€ UTILITIES CARD (l.yAutoLaunch = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -17266,7 +17509,20 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();g_optimiseConfirmOpen=true;InvalidateRect(hwnd,NULL,FALSE);}
       if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",dataPath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
       cx+=28+6;
-      if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+28){ playClick(); startLiveBenchmark(); InvalidateRect(hwnd,NULL,FALSE); }
+      if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+28){
+          playClick();
+          int rec=g_benchRecommend.load();
+          if(rec>0 && kps.load()!=rec){
+              // A result is on screen and has not been taken up yet - this tap accepts it.
+              kps=rec; saveSettings();
+              wchar_t m[64]; swprintf(m,64,L"Set to %d KPS",rec);
+              showSuccessToast(m);
+          } else {
+              g_benchRecommend=0; g_benchBest=0;   // re-run from scratch
+              startLiveBenchmark();
+          }
+          InvalidateRect(hwnd,NULL,FALSE);
+      }
     }
 
     // â”€â”€ APPEARANCE CARD (l.yFont = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -17352,7 +17608,17 @@ static void paintOverlay(HWND hwnd){
     if(!s_ovlBufDC||W!=s_ovlBufW||H!=s_ovlBufH){
         freeOverlayBackbuffer();
         s_ovlBufDC=CreateCompatibleDC(hr);
-        s_ovlBufBmp=CreateCompatibleBitmap(hr,W,H);
+        // A DIB section, for the same reason the main window uses one: mixing a DIB
+        // source with a DDB destination makes GDI convert format per pixel on every
+        // blit. Matching them turns the present into a straight copy.
+        BITMAPINFO obi={};
+        obi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+        obi.bmiHeader.biWidth=W; obi.bmiHeader.biHeight=-H;
+        obi.bmiHeader.biPlanes=1; obi.bmiHeader.biBitCount=32;
+        obi.bmiHeader.biCompression=BI_RGB;
+        void* obits=NULL;
+        s_ovlBufBmp=CreateDIBSection(hr,&obi,DIB_RGB_COLORS,&obits,NULL,0);
+        if(!s_ovlBufBmp) s_ovlBufBmp=CreateCompatibleBitmap(hr,W,H);
         s_ovlBufOld=(HBITMAP)SelectObject(s_ovlBufDC,s_ovlBufBmp);
         s_ovlBufW=W; s_ovlBufH=H;
     }
@@ -17360,7 +17626,9 @@ static void paintOverlay(HWND hwnd){
     const Theme& OT=THEMES[themeIdx];
 
     fillRect(hdc,0,0,W,H,OT.bg);
-    drawCardStatic(hdc,0,0,W,H,14); // same surface material as the app's cards
+    // Radius matches the window region set in updateOverlay(); at 14 against an 18px
+    // region the two arcs disagreed and left a sliver of raw background in each corner.
+    drawCardStatic(hdc,0,0,W,H,18);
 
     bool running = macroRunning.load();
     int sw = GetSystemMetrics(SM_CXSCREEN);
@@ -17374,14 +17642,29 @@ static void paintOverlay(HWND hwnd){
     float sysRam=ramT>0?((ms.ullTotalPhys-ms.ullAvailPhys)/1048576.0f/ramT*100.0f):0;
     float pulseRam=ramT>0?(procMemKB/1024.0f/ramT*100.0f):0;
 
-    // Dual bar helper
+    // Dual bar helper. Rounded and antialiased in GDI+ rather than square GDI
+    // rectangles - at 3px tall a hard-edged bar is the one thing on screen that still
+    // looked like a progress control from 2009.
     auto dBar=[&](int x,int y,int w,int h,float sys,float pulse){
-        COLORREF dim=RGB((GetRValue(OT.accent)+GetRValue(OT.btn)*2)/3,
-                         (GetGValue(OT.accent)+GetGValue(OT.btn)*2)/3,
-                         (GetBValue(OT.accent)+GetBValue(OT.btn)*2)/3);
-        drawRR(hdc,x,y,w,h,h/2,OT.btn,OT.btn,0);
-        int sv=(int)(std::min(sys/100.0f,1.0f)*w); if(sv>0) drawRR(hdc,x,y,sv,h,h/2,dim,dim,0);
-        int pv=(int)(std::min(pulse/100.0f,1.0f)*w); if(pv>0) drawRR(hdc,x,y,pv,h,h/2,OT.accent,OT.accent,0);
+        using namespace Gdiplus;
+        Graphics gg(hdc);
+        gg.SetSmoothingMode(SmoothingModeAntiAlias);
+        gg.SetPixelOffsetMode(PixelOffsetModeHalf);
+        REAL r=(REAL)h/2.0f;
+        GraphicsPath groove; addRoundRectPathF(groove,(REAL)x,(REAL)y,(REAL)w,(REAL)h,r);
+        SolidBrush gb(Color(255,(BYTE)(GetRValue(OT.btn)*0.6f),(BYTE)(GetGValue(OT.btn)*0.6f),(BYTE)(GetBValue(OT.btn)*0.6f)));
+        gg.FillPath(&gb,&groove);
+        BYTE ar=GetRValue(OT.accent),ag=GetGValue(OT.accent),ab=GetBValue(OT.accent);
+        // System total sits behind as a dimmed accent; the app's own share sits on top
+        // in full accent, so one glance separates 'the machine is busy' from 'we are'.
+        REAL sv=std::min(sys/100.0f,1.0f)*w;
+        if(sv>1.0f){ GraphicsPath q; addRoundRectPathF(q,(REAL)x,(REAL)y,sv,(REAL)h,r);
+                     SolidBrush b(Color(120,ar,ag,ab)); gg.FillPath(&b,&q); }
+        REAL pv=std::min(pulse/100.0f,1.0f)*w;
+        if(pv>1.0f){ GraphicsPath q; addRoundRectPathF(q,(REAL)x,(REAL)y,pv,(REAL)h,r);
+                     LinearGradientBrush lb(PointF((REAL)x,(REAL)y),PointF((REAL)x+pv,(REAL)y),
+                        Color(255,(BYTE)(ar*0.7f),(BYTE)(ag*0.7f),(BYTE)(ab*0.7f)),Color(255,ar,ag,ab));
+                     gg.FillPath(&lb,&q); }
     };
 
     int pad=10, cy=pad;
@@ -17389,28 +17672,56 @@ static void paintOverlay(HWND hwnd){
     // â”€â”€ KPS SECTION (always vertical, centred) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(kpsOverlayEnabled){
         // Status pill left, PULSE right
-        COLORREF pc=running?OT.green:OT.btn;
-        drawRR(hdc,pad,cy,30,13,6,pc,pc,0);
-        {   bool tb=triggerbotEnabled.load();
-            const wchar_t* lbl = running ? L"LIVE" : (tb ? L"TRIG" : L"OFF");
-            COLORREF lc = running ? OT.bg : (tb ? OT.green : OT.subtext);
-            drawText(hdc,lbl,pad,cy,30,13,lc,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
-        drawText(hdc,L"WRATHIC",W-pad-52,cy,52,11,OT.accent,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-        cy+=16;
+        {   using namespace Gdiplus;
+            bool tb=triggerbotEnabled.load();
+            const wchar_t* lbl = running ? L"LIVE" : (tb ? L"TRIG" : L"IDLE");
+            COLORREF dot = running ? OT.green : (tb ? OT.accent : OT.subtext);
+            Graphics gg(hdc); gg.SetSmoothingMode(SmoothingModeAntiAlias);
+            gg.SetPixelOffsetMode(PixelOffsetModeHalf);
+            // Pill, then a status dot that breathes while the macro is live. The dot
+            // is what you read at a glance mid-match; the word is the confirmation.
+            GraphicsPath pill; addRoundRectPathF(pill,(REAL)pad,(REAL)cy,42.0f,15.0f,7.5f);
+            SolidBrush pb(Color(running?54:30,GetRValue(dot),GetGValue(dot),GetBValue(dot)));
+            gg.FillPath(&pb,&pill);
+            Pen pp(Color(running?150:60,GetRValue(dot),GetGValue(dot),GetBValue(dot)),1.0f);
+            gg.DrawPath(&pp,&pill);
+            REAL dcx=(REAL)pad+8.0f, dcy=(REAL)cy+7.5f;
+            float breathe = running ? (0.6f+0.4f*(float)sin((double)GetTickCount()/320.0)) : 1.0f;
+            if(running){ SolidBrush hb(Color((BYTE)(90*breathe),GetRValue(dot),GetGValue(dot),GetBValue(dot)));
+                         gg.FillEllipse(&hb,dcx-5.0f,dcy-5.0f,10.0f,10.0f); }
+            SolidBrush db(Color((BYTE)(running?(BYTE)(160+95*breathe):200),GetRValue(dot),GetGValue(dot),GetBValue(dot)));
+            gg.FillEllipse(&db,dcx-2.5f,dcy-2.5f,5.0f,5.0f);
+            drawText(hdc,lbl,pad+14,cy,26,15,dot,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+        drawText(hdc,L"WRATHIC",W-pad-56,cy,56,15,OT.accent,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+        cy+=19;
 
         // Big KPS number - centred in full width
-        wchar_t kb[16];
-        if(running) swprintf(kb,16,L"%d",kps.load());
-        else        wcscpy(kb,L"\u2014");
-        drawText(hdc,kb,0,cy,W,34,running?OT.text:OT.subtext,hFontBig,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        cy+=36;
-        drawText(hdc,L"KPS",0,cy,W,12,OT.subtext,hFontSmall,DT_CENTER|DT_TOP|DT_SINGLELINE);
-        cy+=14;;
+        // Show the configured speed even when idle, dimmed. An em dash told the player
+        // nothing they could act on; the number they are about to run at is worth a
+        // glance before a match starts.
+        wchar_t kb[16]; swprintf(kb,16,L"%d",kps.load());
+        drawText(hdc,kb,0,cy,W,32,running?OT.text:OT.subtext,hFontBig,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        cy+=32;
+        drawText(hdc,running?L"KPS":L"KPS  idle",0,cy,W,12,OT.subtext,hFontSmall,DT_CENTER|DT_TOP|DT_SINGLELINE);
+        cy+=13;
     }
 
     // â”€â”€ RESOURCE SECTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(resOverlayEnabled){
-        if(kpsOverlayEnabled){ fillRect(hdc,pad,cy,W-pad*2,1,OT.border); cy+=6; }
+        if(kpsOverlayEnabled){
+            // Hairline that fades at both ends rather than a hard rule butting into
+            // the card edge - the same treatment the app's own dividers use.
+            using namespace Gdiplus;
+            Graphics gg(hdc); gg.SetSmoothingMode(SmoothingModeAntiAlias);
+            LinearGradientBrush lb(PointF((REAL)pad,(REAL)cy),PointF((REAL)(W-pad),(REAL)cy),
+                Color(0,255,255,255),Color(0,255,255,255));
+            Color cols[]={Color(0,255,255,255),Color(40,255,255,255),Color(0,255,255,255)};
+            REAL pos[]={0.0f,0.5f,1.0f};
+            lb.SetInterpolationColors(cols,pos,3);
+            gg.FillRectangle(&lb,(REAL)pad,(REAL)cy,(REAL)(W-pad*2),1.0f);
+            cy+=7;
+        }
 
         struct ResRow { const wchar_t* lbl; float sys; float pulse; bool show; };
         ResRow rows[]={
@@ -17485,9 +17796,9 @@ void updateOverlay(){
     bool horiz2=(overlayX>screenW/4)&&(overlayX<screenW*3/4);
 
     int h=10;
-    if(kpsOverlayEnabled) h+=16+36+14;
+    if(kpsOverlayEnabled) h+=19+32+13;   // header row + number + caption
     if(resOverlayEnabled){
-        if(kpsOverlayEnabled) h+=6;
+        if(kpsOverlayEnabled) h+=7;   // hairline + gap
         if(horiz2){ h+=15; }
         else {
             if(overlayShowCpu)  h+=21;
@@ -17602,6 +17913,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp==20){
             KillTimer(hwnd,20);
             licCopied=false;
+            g_profCopied=false;   // shares the timer; both are "copied" confirmations
             InvalidateRect(hwnd,NULL,FALSE);
             break;
         }
@@ -17628,10 +17940,18 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             break;
         }
         if(wp==TIMER_ANIM){
-            updateAnimTick(); // must run before any animateTo this frame
-            // Throttle: if minimised to tray, skip all rendering work
             static int frameCount=0;
             frameCount++;
+            // Minimised: there is no animation to advance and nothing to draw, so the
+            // entire tick body is waste. The starfield branch below already checked
+            // IsIconic, but everything above it still ran 62x a second - measured at
+            // 19% of a core with the window in the tray. Only the anti-debug sweep
+            // still needs a heartbeat.
+            if(IsIconic(hwnd)){
+                if(frameCount%60==0) antiDebugTick();
+                break;
+            }
+            updateAnimTick(); // must run before any animateTo this frame
             // Anti-debug check every 60 frames (~1s) not every frame
             if(frameCount%60==0) antiDebugTick();
 
@@ -17711,8 +18031,15 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     // while it was still on screen and being looked at. The only
                     // case worth throttling is the game wanting the cycles; when
                     // minimised the branch above skips the work entirely.
+                    // Throttle on Roblox being *focused*, not on the macro also
+                    // running. Whenever the game is in front the window is behind it
+                    // and nobody is watching the starfield, but the app was still
+                    // rendering it at 60fps and taking cycles off the frame the
+                    // player is actually reacting to. Clicking makes that worse
+                    // again, hence the third tier.
                     static int voidSkip=0;
-                    int every = (robloxFocused.load()&&macroRunning.load()) ? 3 : 1;
+                    int every = 1;
+                    if(robloxFocused.load()) every = macroRunning.load() ? 6 : 3;
                     if((++voidSkip % every)==0){
                         updateVoidStars();
                         InvalidateRect(hwnd,NULL,FALSE);
@@ -17742,10 +18069,20 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     LeaveCriticalSection(&g_toastCS);
                     if(hasToasts) needRepaint=true;
                 }
+                // The settings page has its own animations - hover fades, the
+                // copy-confirmation tick, the share-code cursor blink. This branch only
+                // ever repainted tab 0, so on every theme except Void those sat frozen
+                // until something else happened to invalidate the window.
+                if(activeTab==2){
+                    if(g_settHoverAlpha>0.002f&&g_settHoverAlpha<0.998f) needRepaint=true;
+                    if(g_profCopiedAlpha>0.002f) needRepaint=true;
+                    if(g_pasteEditing) needRepaint=true;   // blinking cursor
+                    if(settFadeAlpha<0.999f) needRepaint=true;
+                }
                 // Reduce UI to 30fps when Roblox is focused - more headroom for game
           static int uiSkip=0;
-          bool uiThrottle=robloxFocused.load()&&macroRunning.load();
-          if(activeTab==0&&needRepaint&&!IsIconic(hwnd)&&(!uiThrottle||(++uiSkip%2==0)))
+          bool uiThrottle=robloxFocused.load();
+          if((activeTab==0||activeTab==2)&&needRepaint&&!IsIconic(hwnd)&&(!uiThrottle||(++uiSkip%2==0)))
               InvalidateRect(hwnd,NULL,FALSE);
             }
             // The overlay shows CPU/GPU/disk counters that refresh about once a
@@ -17756,7 +18093,13 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         }
         break;
     case WM_LBUTTONUP:
+        if(g_sliderDragging){ g_sliderDragging=false; ReleaseCapture(); saveSettings(); }
         if(g_pressedId){ g_pressedId=0; InvalidateRect(hwnd,NULL,FALSE); }
+        return 0;
+    case WM_CAPTURECHANGED:
+        // Something else took the mouse - end the drag rather than leaving the flag
+        // stuck on, which would swallow every later click.
+        if(g_sliderDragging){ g_sliderDragging=false; InvalidateRect(hwnd,NULL,FALSE); }
         return 0;
     case WM_MOUSEMOVE:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
@@ -17780,9 +18123,11 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
             }
             if(!anyHov&&g_tipVisible){g_tipVisible=false;g_tipHoverId=0;InvalidateRect(hwnd,NULL,FALSE);}
+            int sh=settingsHitTest(hwnd,mx,my);
+            if(sh!=g_settHoverId){ setSettHover(sh); InvalidateRect(hwnd,NULL,FALSE); }
         }
         if(activeTab==0){
-            bool draggingSlider=(wp&MK_LBUTTON)&&isInSlider(hwnd,mx,my);
+            bool draggingSlider=g_sliderDragging&&(wp&MK_LBUTTON);
             if(draggingSlider){
                 int newKps=sliderVal(hwnd,mx);
                 if(newKps!=kps.load()){
@@ -17825,9 +18170,30 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             g_kpsEditBuffer+=(wchar_t)wp;
             InvalidateRect(hwnd,NULL,FALSE);
         }
+        if(g_pasteEditing){
+            if(wp==0x16){ pasteFromClipboard(hwnd); }              // Ctrl+V
+            else if(wp>=L' ' && g_pasteBuffer.size()<128){
+                g_pasteBuffer+=(wchar_t)wp; pasteRevalidate();
+            }
+            InvalidateRect(hwnd,NULL,FALSE);
+        }
         return 0;
     }
     case WM_KEYDOWN:{
+        if(g_pasteEditing){
+            if(wp==VK_BACK){
+                if(!g_pasteBuffer.empty()){ g_pasteBuffer.pop_back(); pasteRevalidate(); }
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            if(wp==VK_ESCAPE){
+                g_pasteEditing=false; g_pasteBuffer.clear(); g_pasteValid=false;
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            if(wp==VK_DELETE){
+                g_pasteBuffer.clear(); g_pasteValid=false;
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+        }
         if(g_kpsEditing){
             if(wp==VK_BACK){
                 if(!g_kpsEditBuffer.empty()) g_kpsEditBuffer.pop_back();
@@ -17856,6 +18222,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             return 0;
         }
         break;
+    }
+    case WM_RBUTTONDOWN:{
+        // Settings only, and only the profile slots - see settingsHandleRightClick.
+        if(activeTab==2 && g_lockKind==LOCK_NONE && !g_optimiseConfirmOpen){
+            RECT crR; GetClientRect(hwnd,&crR);
+            settingsHandleRightClick(hwnd,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),crR.right,crR.bottom-DOCK_H);
+        }
+        return 0;
     }
     case WM_LBUTTONDOWN:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
@@ -18043,6 +18417,11 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         }
         if(isInSlider(hwnd,mx,my)){
             g_kpsEditing=false;
+            // Take the mouse for the whole drag. Without capture the drag was
+            // re-tested against the slider rect on every move, so sliding a few
+            // pixels off vertically - onto a preset button, say - silently ended it
+            // mid-gesture and left the value wherever it happened to be.
+            g_sliderDragging=true; SetCapture(hwnd);
             kps=sliderVal(hwnd,mx);
             InvalidateRect(hwnd,NULL,FALSE);
         }
@@ -18330,7 +18709,6 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     DWORD splashStartTick=GetTickCount();
     // Real init work - no artificial delays between these anymore, the
     // splash is now a brief identity screen, not a fake loading sequence.
-    recommendedKPS=benchmarkSystem();
     // Check if this is the first run after an update
     {
         std::wstring sv = regGetString(L"SeenVersion",L"");
@@ -18340,7 +18718,9 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     {
         bool hasExisting=false;
         regGetDWORD(L"ThemeIdx",0,&hasExisting);
-        if(!hasExisting) kps=recommendedKPS;
+        // Only measure when there is nothing saved to measure *for*. On every other
+        // launch this skipped work is ~0.3s off startup as well.
+        if(!hasExisting){ recommendedKPS=benchmarkSystem(); kps=recommendedKPS; }
     }
     // Hold the splash visible for ~2s total (not stacked on top of the real
     // work above - if that work took a while, this just tops up whatever's
