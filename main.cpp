@@ -13073,6 +13073,23 @@ int g_tipX=0, g_tipY=0;
 bool g_tipVisible=false;
 DWORD g_tipHoverStart=0;
 int g_tipHoverId=0; // which ? icon is hovered
+// Where each ? icon was drawn this frame. The hover regions used to be
+// recomputed in the mouse handler from hand-stacked offsets like
+// yRes+10+20+6+24+4+pillH+24+4+24+4+5, which duplicated the paint layout and
+// drifted off the icons every time a card height changed. Recording the real
+// positions means the two can no longer disagree.
+struct TipSpot { int id, x, y; };
+static TipSpot g_tipSpots[8]={};
+static int     g_tipSpotCount=0;
+// Text belongs with the id, not with a position.
+static const wchar_t* tipTextFor(int id){
+    switch(id){
+        case 1: return L"Shows CPU, RAM, GPU and disk bars over your game";
+        case 2: return L"Shows a KPS counter floating over your game";
+        case 3: return L"ON = whole system, OFF = just wrathic";
+        default: return L"";
+    }
+}
 DWORD lastKpsTick=0;
 
 // Overlay drag
@@ -15943,6 +15960,7 @@ void paintMain(HWND hwnd){
     // re-derived each frame by drawCard rather than latching on forever.
     g_cardDrawIndex=0;
     g_cardAnimActive=false;
+    g_tipSpotCount=0;   // ? icons re-record themselves as they draw
     PAINTSTRUCT ps;HDC hdc_real=BeginPaint(hwnd,&ps);
     RECT cr;GetClientRect(hwnd,&cr);int W=cr.right,H=cr.bottom;
     if(!s_mainBufDC||W!=s_mainBufW||H!=s_mainBufH){
@@ -16577,20 +16595,30 @@ static bool g_toastCSInit = false;
 // Draw a tooltip box near (tx,ty)
 static void drawSettingsTip(HDC hdc, int tx, int ty, const wchar_t* text, int W, int H){
     const Theme& T2=THEMES[themeIdx];
-    // Measure text
-    int tipW=220, tipH=36;
-    int x=std::min(tx+14, W-tipW-8);
-    int y2=ty-tipH-4;
-    if(y2<0) y2=ty+20;
-    drawRR(hdc,x,y2,tipW,tipH,6,T2.surface,T2.accent,1);
-    RECT tr={x+8,y2,x+tipW-8,y2+tipH};
+    // Measure rather than assume. The box was a fixed 220x36 whatever the text, so
+    // anything that wrapped to a second line was clipped.
+    SelectObject(hdc,hFontSmall);
+    RECT meas={0,0,232,0};
+    DrawText(hdc,text,-1,&meas,DT_CALCRECT|DT_LEFT|DT_WORDBREAK);
+    int tipW=std::min(248,std::max(120,(int)(meas.right-meas.left)+20));
+    int tipH=(int)(meas.bottom-meas.top)+14;
+
+    // Prefer above-right of the icon, but keep every edge inside the window.
+    int x=tx+18, y2=ty-tipH-6;
+    if(x+tipW>W-8) x=W-tipW-8;
+    if(x<8) x=8;
+    if(y2<6) y2=ty+20;                       // no room above - drop below
+    if(y2+tipH>H-6) y2=std::max(6,H-tipH-6);
+
+    drawRR(hdc,x,y2,tipW,tipH,7,T2.surface,T2.accent,1);
+    RECT tr={x+10,y2+7,x+tipW-10,y2+tipH-7};
     SetTextColor(hdc,T2.text); SetBkMode(hdc,TRANSPARENT);
-    // Use hFontSmall - already selected elsewhere, just draw
-    DrawText(hdc,text,-1,&tr,DT_LEFT|DT_VCENTER|DT_WORDBREAK);
+    DrawText(hdc,text,-1,&tr,DT_LEFT|DT_TOP|DT_WORDBREAK);
 }
 
 // Draw a small ? icon, returns true if hovered
 static bool drawTipIcon(HDC hdc, int x, int y, int id, COLORREF col){
+    if(g_tipSpotCount<8){ g_tipSpots[g_tipSpotCount++]={id,x,y}; }
     drawRR(hdc,x,y,14,14,7,THEMES[themeIdx].btn,col,1);
     SetTextColor(hdc,col); SetBkMode(hdc,TRANSPARENT);
     RECT r={x,y,x+14,y+14};
@@ -17298,22 +17326,15 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         g_lastMousePos.x=mx; g_lastMousePos.y=my;
         {TRACKMOUSEEVENT tme={sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};TrackMouseEvent(&tme);}
         if(activeTab==2){
-            // Tooltip hover tracking for ? icons
-            SLayout tl=getSLayout(hwnd);
-            int tp=tl.pad;
-            // Map ? icon IDs to positions and text
-            struct TipDef{int id;int lx,ly;const wchar_t* txt;};
-            int pillH=resOverlayEnabled?(6+14+32+8):0; // matches calcOverlayCardH exactly
-            TipDef tips[]={
-                {1,tp+14,tl.yRes+10+20+6+5,   L"Shows CPU/RAM/GPU/Disk bars over your game"},
-                {2,tp+14,tl.yRes+10+20+6+24+4+pillH+5, L"Shows KPS counter floating over your game"},
-                {3,tp+14,tl.yRes+10+20+6+24+4+pillH+24+4+24+4+5, L"ON=system-wide %, OFF=wrathic process %"},
-                {4,tp+14,tl.yChangelog+10+14+4+14+6+24+4+5,L"Toast when auto-KPS changes"},
-            };
+            // Hover test against where the icons were actually drawn last frame,
+            // rather than against a second copy of the layout arithmetic. The old
+            // table also carried an id 4 that no icon has drawn since the changelog
+            // toggle moved, so that region was hoverable but invisible.
             bool anyHov=false;
-            for(auto& t:tips){
-                if(mx>=t.lx-4&&mx<=t.lx+18&&my>=t.ly-4&&my<=t.ly+18){
-                    g_tipText=t.txt; g_tipX=t.lx; g_tipY=t.ly;
+            for(int i=0;i<g_tipSpotCount;i++){
+                const TipSpot& t=g_tipSpots[i];
+                if(mx>=t.x-4&&mx<=t.x+18&&my>=t.y-4&&my<=t.y+18){
+                    g_tipText=tipTextFor(t.id); g_tipX=t.x; g_tipY=t.y;
                     if(!g_tipVisible||g_tipHoverId!=t.id){
                         g_tipHoverId=t.id; g_tipVisible=true;
                         InvalidateRect(hwnd,NULL,FALSE);
