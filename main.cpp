@@ -12899,6 +12899,9 @@ static void playChime(){
 // ===================== IDs =====================
 #define ID_SET_HOTKEY    101
 #define ID_TB_UPGRADE    140  // triggerbot upgrade button (locked state)
+#define ID_PROFILE_0     150  // three profile slots occupy 150..152
+#define ID_PROFILE_COPY  153
+#define ID_PROFILE_PASTE 154
 #define ID_ADD_KEY       103
 #define ID_REMOVE_KEY    104
 #define ID_MODE_TOGGLE   108
@@ -14671,6 +14674,151 @@ void stopTriggerbotEngine(){
     if(gTrigThread){ WaitForSingleObject(gTrigThread,2000); CloseHandle(gTrigThread); gTrigThread=NULL; }
 }
 
+// ===================== PROFILES =====================
+// Named snapshots of everything that makes a setup: speed, keys, mode, hotkey and
+// the whole triggerbot configuration. Three slots, held in the registry alongside
+// the live settings.
+//
+// A profile also serialises to a short code so it can be pasted into Discord. The
+// format is deliberately plain text with a version prefix rather than a packed
+// binary blob: someone will eventually paste one into a chat window that mangles
+// non-ASCII, and a readable code can be eyeballed when it does not import.
+#define PROFILE_SLOTS 3
+
+struct Profile {
+    bool         used=false;
+    std::wstring name;
+    int  kps=200, hotkey=VK_CONTROL; bool hold=false;
+    std::vector<int> keys;
+    bool tbEnabled=false, tbHold=false;
+    int  tbKey=VK_LBUTTON, tbR=255, tbG=0, tbB=0, tbTol=40, tbBox=16;
+};
+static Profile g_profiles[PROFILE_SLOTS];
+
+// Capture the live settings into a profile.
+static Profile profileFromCurrent(const std::wstring& name){
+    Profile p;
+    p.used=true; p.name=name;
+    p.kps=kps.load(); p.hotkey=hotkeyVK.load(); p.hold=holdMode.load();
+    EnterCriticalSection(&keyListCS);
+    p.keys=keysToSend;
+    LeaveCriticalSection(&keyListCS);
+    p.tbEnabled=triggerbotEnabled.load(); p.tbHold=trigHoldMode.load();
+    p.tbKey=trigKey.load();
+    p.tbR=trigR.load(); p.tbG=trigG.load(); p.tbB=trigB.load();
+    p.tbTol=trigTolerance.load(); p.tbBox=trigBox.load();
+    return p;
+}
+
+// Apply a profile to the live settings.
+static void profileApply(const Profile& p){
+    if(!p.used) return;
+    kps=std::max(MIN_KPS,std::min(MAX_KPS,p.kps));
+    hotkeyVK=p.hotkey;
+    holdMode=p.hold;
+    EnterCriticalSection(&keyListCS);
+    keysToSend=p.keys;
+    LeaveCriticalSection(&keyListCS);
+    rebuildInputBuf();
+    // Loading a profile must not silently start the triggerbot: the two engines are
+    // mutually exclusive, and having a profile flip which one is armed behind the
+    // user's back is the sort of surprise that costs someone a match.
+    trigHoldMode=p.tbHold; trigKey=p.tbKey;
+    trigR=p.tbR; trigG=p.tbG; trigB=p.tbB;
+    trigTolerance=p.tbTol; trigBox=p.tbBox;
+    saveSettings();
+}
+
+// ── Share codes ─────────────────────────────────────────────────────────────
+static std::wstring profileEncode(const Profile& p){
+    std::wstring keys;
+    for(size_t i=0;i<p.keys.size();i++){
+        if(i) keys+=L".";
+        keys+=std::to_wstring(p.keys[i]);
+    }
+    wchar_t buf[320];
+    swprintf(buf,320,L"WR1-%d-%d-%d-%s-%d-%d-%02X%02X%02X-%d-%d",
+             p.kps, p.hotkey, p.hold?1:0, keys.empty()?L"0":keys.c_str(),
+             p.tbHold?1:0, p.tbKey, p.tbR, p.tbG, p.tbB, p.tbTol, p.tbBox);
+    return std::wstring(buf);
+}
+
+// Returns false rather than a half-populated profile if anything is off.
+static bool profileDecode(const std::wstring& codeIn, Profile& out){
+    std::wstring code=codeIn;
+    // Tolerate what a chat client does to a pasted code.
+    while(!code.empty()&&(code.front()==L' '||code.front()==L'`')) code.erase(code.begin());
+    while(!code.empty()&&(code.back()==L' '||code.back()==L'`'||code.back()==L'\n'||code.back()==L'\r')) code.pop_back();
+    if(code.rfind(L"WR1-",0)!=0) return false;
+
+    std::vector<std::wstring> f;
+    size_t start=4;
+    while(start<=code.size()){
+        size_t dash=code.find(L'-',start);
+        if(dash==std::wstring::npos){ f.push_back(code.substr(start)); break; }
+        f.push_back(code.substr(start,dash-start));
+        start=dash+1;
+    }
+    if(f.size()<9) return false;
+
+    Profile p; p.used=true; p.name=L"Imported";
+    try{
+        p.kps    = std::max(MIN_KPS,std::min(MAX_KPS,std::stoi(f[0])));
+        p.hotkey = std::max(1,std::min(254,std::stoi(f[1])));
+        p.hold   = (f[2]==L"1");
+        if(f[3]!=L"0"){
+            size_t s2=0;
+            while(s2<f[3].size()){
+                size_t dot=f[3].find(L'.',s2);
+                std::wstring one=(dot==std::wstring::npos)?f[3].substr(s2):f[3].substr(s2,dot-s2);
+                if(!one.empty()){
+                    int vk=std::stoi(one);
+                    if(vk>0&&vk<255) p.keys.push_back(vk);
+                }
+                if(dot==std::wstring::npos) break;
+                s2=dot+1;
+            }
+        }
+        p.tbHold = (f[4]==L"1");
+        p.tbKey  = std::max(1,std::min(254,std::stoi(f[5])));
+        if(f[6].size()!=6) return false;
+        p.tbR=(int)wcstol(f[6].substr(0,2).c_str(),nullptr,16);
+        p.tbG=(int)wcstol(f[6].substr(2,2).c_str(),nullptr,16);
+        p.tbB=(int)wcstol(f[6].substr(4,2).c_str(),nullptr,16);
+        p.tbTol=std::max(0,std::min(255,std::stoi(f[7])));
+        p.tbBox=std::max(2,std::min(128,std::stoi(f[8])));
+    } catch(...){ return false; } // any malformed field fails the whole import
+    out=p;
+    return true;
+}
+
+// ── Persistence ─────────────────────────────────────────────────────────────
+static void profilesSave(){
+    for(int i=0;i<PROFILE_SLOTS;i++){
+        wchar_t kn[32], kc[32];
+        swprintf(kn,32,L"ProfileName%d",i);
+        swprintf(kc,32,L"ProfileCode%d",i);
+        if(g_profiles[i].used){
+            regSetString(kn,g_profiles[i].name);
+            regSetString(kc,profileEncode(g_profiles[i]));
+        } else {
+            regSetString(kn,L"");
+            regSetString(kc,L"");
+        }
+    }
+}
+static void profilesLoad(){
+    for(int i=0;i<PROFILE_SLOTS;i++){
+        wchar_t kn[32], kc[32];
+        swprintf(kn,32,L"ProfileName%d",i);
+        swprintf(kc,32,L"ProfileCode%d",i);
+        std::wstring nm=regGetString(kn,L""), cd=regGetString(kc,L"");
+        Profile p;
+        if(!nm.empty()&&profileDecode(cd,p)){ p.name=nm; g_profiles[i]=p; }
+        else g_profiles[i]=Profile();
+    }
+}
+
 // ===================== MEMORY CLEANER =====================
 std::wstring cleanRamStatus = L"";
 bool licCopied = false;
@@ -16260,7 +16408,7 @@ void paintMain(HWND hwnd){
 }
 
 // ===================== SETTINGS LAYOUT =====================
-struct SLayout{int W,pad,cw,yVouch,yRes,yLic,yFont,yFontDrop,yTheme,yAutoLaunch,yMinimise,yChangelog,yUpdate,yTrial;};
+struct SLayout{int W,pad,cw,yVouch,yRes,yLic,yFont,yFontDrop,yTheme,yAutoLaunch,yProfiles,yMinimise,yChangelog,yUpdate,yTrial;};
 // â”€â”€ Layout constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Each card has ONE height function. getSLayout, paintSettingsInto, and
 // settingsHandleClick all call the same function - they can never disagree.
@@ -16348,6 +16496,7 @@ SLayout getSLayout(HWND hwnd){
     l.yRes       = y; y += calcOverlayCardH() + GAP;
     if(kpsOverlayEnabled||resOverlayEnabled) y += calcOvPosCardH() + GAP;
     l.yAutoLaunch= y; y += calcUtilsCardH() + GAP;     // utilities card
+    l.yProfiles  = y; y += 118 + GAP;                 // profiles card
     // Appearance card (yFont = card top)
     l.yFont      = y; y += calcAppearanceCardH() + GAP;
     l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22; // font row start
@@ -16380,6 +16529,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     l.yRes       = y2; y2 += calcOverlayCardH() + GAP;
     if(kpsOverlayEnabled||resOverlayEnabled) y2 += calcOvPosCardH() + GAP;
     l.yAutoLaunch= y2; y2 += calcUtilsCardH() + GAP;
+    l.yProfiles  = y2; y2 += 118 + GAP;
     l.yFont      = y2; y2 += calcAppearanceCardH() + GAP;
     l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22;
     l.yTheme     = -1; // embedded in appearance card
@@ -16490,6 +16640,36 @@ void paintSettingsInto(HDC hdc,int W,int H){
         }
         RECT sr={p+14,cx,p+14+cw-28,cx+lines*16+8}; DrawText(hdc,cleanRamStatus.c_str(),-1,&sr,DT_LEFT|DT_TOP|DT_WORDBREAK);
     }(void)cx;}
+
+    // ===== PROFILES CARD =====
+    y=l.yProfiles+sfadeY;
+    drawCard(hdc,p,y,cw,118);
+    drawText(hdc,L"PROFILES",p+14,y+10,200,14,T.subtext,hFontSmall);
+    {
+        int rowY=y+30, slotW=(cw-28-12)/3;
+        for(int i=0;i<PROFILE_SLOTS;i++){
+            int sx=p+14+i*(slotW+6);
+            const Profile& pr=g_profiles[i];
+            float hv=getHoverAlpha(ID_PROFILE_0+i);
+            drawRR(hdc,sx,rowY,slotW,36,9,lerpCol(T.btn,T.btnHov,hv),pr.used?T.accent:T.border,1);
+            wchar_t lbl[48];
+            if(pr.used) swprintf(lbl,48,L"%s",pr.name.c_str());
+            else        swprintf(lbl,48,L"Slot %d",i+1);
+            drawText(hdc,lbl,sx,rowY+3,slotW,17,pr.used?T.text:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            wchar_t sub[48];
+            if(pr.used) swprintf(sub,48,L"%d KPS",pr.kps); else wcscpy(sub,L"tap to save");
+            drawText(hdc,sub,sx,rowY+18,slotW,15,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+        drawText(hdc,L"tap empty to save, saved to load \u00b7 right-click clears",
+                 p+14,y+70,cw-28,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        int bw=(cw-28-6)/2;
+        float ce=getHoverAlpha(ID_PROFILE_COPY), pe=getHoverAlpha(ID_PROFILE_PASTE);
+        drawRR(hdc,p+14,y+88,bw,24,12,lerpCol(T.btn,T.btnHov,ce),T.border,1);
+        drawText(hdc,L"Copy code",p+14,y+88,bw,24,lerpCol(T.subtext,T.text,ce),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        drawRR(hdc,p+14+bw+6,y+88,bw,24,12,lerpCol(T.btn,T.btnHov,pe),T.border,1);
+        drawText(hdc,L"Paste code",p+14+bw+6,y+88,bw,24,lerpCol(T.subtext,T.text,pe),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+
 
     // â”€â”€ APPEARANCE CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     y=l.yFont+sfadeY;
@@ -16844,6 +17024,60 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
         }
 
         // Fine-adjust removed â€” drag overlay directly to reposition
+    }
+
+    // ===== PROFILES CARD clicks =====
+    { int py=l.yProfiles, slotW=(cw-28-12)/3, rowY=py+30;
+      for(int i=0;i<PROFILE_SLOTS;i++){
+          int sx=p+14+i*(slotW+6);
+          if(mx>=sx&&mx<=sx+slotW&&my>=rowY&&my<=rowY+36){
+              if(g_profiles[i].used){
+                  profileApply(g_profiles[i]);
+                  playToggle(true);
+                  showSuccessToast((L"Loaded " + g_profiles[i].name).c_str());
+              } else {
+                  wchar_t nm[24]; swprintf(nm,24,L"Profile %d",i+1);
+                  g_profiles[i]=profileFromCurrent(nm);
+                  profilesSave();
+                  playToggle(true);
+                  showSuccessToast(L"Saved this setup");
+              }
+              InvalidateRect(hwnd,NULL,FALSE);
+              return;
+          }
+      }
+      int bw=(cw-28-6)/2;
+      // Copy: put the code on the clipboard so it can be pasted into Discord.
+      if(mx>=p+14&&mx<=p+14+bw&&my>=py+88&&my<=py+112){
+          playClick();
+          std::wstring code=profileEncode(profileFromCurrent(L"Current"));
+          if(OpenClipboard(hwnd)){
+              EmptyClipboard();
+              size_t bytes=(code.size()+1)*sizeof(wchar_t);
+              HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,bytes);
+              if(h){ memcpy(GlobalLock(h),code.c_str(),bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); }
+              CloseClipboard();
+              showSuccessToast(L"Share code copied");
+          }
+          InvalidateRect(hwnd,NULL,FALSE);
+          return;
+      }
+      // Paste: read a code off the clipboard and apply it.
+      if(mx>=p+14+bw+6&&mx<=p+14+bw+6+bw&&my>=py+88&&my<=py+112){
+          playClick();
+          std::wstring code;
+          if(OpenClipboard(hwnd)){
+              HANDLE h=GetClipboardData(CF_UNICODETEXT);
+              if(h){ const wchar_t* t=(const wchar_t*)GlobalLock(h); if(t) code=t; GlobalUnlock(h); }
+              CloseClipboard();
+          }
+          Profile imported;
+          if(code.empty())                       showToast(L"Clipboard is empty",T.red);
+          else if(!profileDecode(code,imported)) showToast(L"That is not a wrathic share code",T.red);
+          else { profileApply(imported); showSuccessToast(L"Settings applied from code"); }
+          InvalidateRect(hwnd,NULL,FALSE);
+          return;
+      }
     }
 
     // â”€â”€ UTILITIES CARD (l.yAutoLaunch = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -18016,6 +18250,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     std::thread(focusThread).detach();
     startMacroEngine(); // start high-res timer worker
     startTriggerbotEngine(); // colour watcher; idles cheaply until enabled
+    profilesLoad();
     std::thread(macroThread).detach();
     std::thread(hotkeyThread).detach();
     std::thread(resourceThread).detach();
