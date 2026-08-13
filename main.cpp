@@ -12991,6 +12991,11 @@ float g_tabPos=0.0f, g_tabVel=0.0f;
 // Nothing in the app reacted to being held down - only to hover - so a click had
 // no physical response at all. drawRR already lifts a control by its hover amount;
 // a held control now gets pushed the other way instead.
+// Newly added key chips animate in: a key appearing instantly gives no feedback
+// that the capture was accepted. Holds the vk that was last added and how far
+// through its entrance it is.
+int   g_newKeyVk=0;
+float g_newKeyAnim=0.0f;
 int   g_pressedId=0;
 float g_pressAnim=0.0f;
 // Set by drawCard() whenever a card's hover fade is mid-flight, so the animation
@@ -14202,6 +14207,7 @@ void captureThread(bool isHotkey){
                 }else{
                     EnterCriticalSection(&keyListCS);
                     keysToSend.push_back(vk);
+                    g_newKeyVk=vk; g_newKeyAnim=0.0f; // animate this one in
                     LeaveCriticalSection(&keyListCS);
                     capturingKey=false;
                     std::wstring msg=L"Key added: "+vkToString(vk);
@@ -16363,8 +16369,20 @@ void paintMain(HWND hwnd){
                     drawText(hdc,more,kx,ky,40,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
                     break;
                 }
-                drawRR(hdc,kx,ky,44,24,7,T.btn,T.border,1);
-                drawText(hdc,vkToString(keys[i]).c_str(),kx,ky,44,24,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                // The chip just added grows and brightens into place, so the capture
+                // visibly lands rather than a key silently appearing in the row.
+                bool isNew = (keys[i]==g_newKeyVk && g_newKeyAnim<0.999f);
+                if(isNew){
+                    float e=easeOut(g_newKeyAnim);
+                    int inset=(int)((1.0f-e)*9.0f);
+                    COLORREF fillc=lerpCol(T.accent,T.btn,e);
+                    drawRR(hdc,kx+inset,ky+inset/2,44-inset*2,24-inset,7,fillc,T.accent,1);
+                    drawText(hdc,vkToString(keys[i]).c_str(),kx+inset,ky+inset/2,44-inset*2,24-inset,
+                             lerpCol(T.bg,T.text,e),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                } else {
+                    drawRR(hdc,kx,ky,44,24,7,T.btn,T.border,1);
+                    drawText(hdc,vkToString(keys[i]).c_str(),kx,ky,44,24,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                }
                 kx+=50;
             }
         }
@@ -17621,6 +17639,10 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             animateTo(animModeHold,(float)holdMode.load(),0.07f); // ~70ms half-life
             animateTo(animRunning,(float)macroRunning.load(),0.07f);
             animateTo(g_pressAnim,g_pressedId?1.0f:0.0f,g_pressedId?0.025f:0.06f); // fast in, softer out
+            if(g_newKeyVk){
+                animateTo(g_newKeyAnim,1.0f,0.075f);
+                if(g_newKeyAnim>0.995f){ g_newKeyVk=0; g_newKeyAnim=0.0f; } // done, stop tracking
+            }
             // Tab dock indicator animation (smooth bar, instant content)
             // Dock tab animation â€” fixed speed, always finishes in ~600ms
             {
