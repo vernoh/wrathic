@@ -12875,6 +12875,7 @@ static void playChime(){
 
 // ===================== IDs =====================
 #define ID_SET_HOTKEY    101
+#define ID_TB_UPGRADE    140  // triggerbot upgrade button (locked state)
 #define ID_ADD_KEY       103
 #define ID_REMOVE_KEY    104
 #define ID_MODE_TOGGLE   108
@@ -13058,6 +13059,7 @@ ULONG_PTR gdiplusToken=0;
 // ===================== SETTINGS =====================
 // Triggerbot state lives with its engine further down, but the settings code below
 // reads and writes it, so it has to be visible here.
+bool hasTriggerbot=false;   // licence entitles this user to the triggerbot tab
 extern std::atomic<bool> triggerbotEnabled;
 extern std::atomic<int>  trigKey, trigR, trigG, trigB, trigTolerance, trigBox, trigDelayMs;
 extern std::atomic<bool> trigHoldMode;
@@ -13104,6 +13106,7 @@ static void regDeleteValue(const wchar_t* name){
 void saveSettings() {
     regSetDWORD(L"ThemeIdx",(DWORD)themeIdx);
     regSetDWORD(L"Kps",(DWORD)kps.load());
+    regSetDWORD(L"HasTriggerbot",(DWORD)hasTriggerbot);
     regSetDWORD(L"TrigEnabled",(DWORD)triggerbotEnabled.load());
     regSetDWORD(L"TrigKey",(DWORD)trigKey.load());
     regSetDWORD(L"TrigR",(DWORD)trigR.load());
@@ -13170,6 +13173,7 @@ void loadSettings() {
     }
     if (ti>=0&&ti<6) themeIdx=ti;
     kps = std::max(MIN_KPS, std::min(MAX_KPS, (int)regGetDWORD(L"Kps",kps.load())));
+    hasTriggerbot     = regGetDWORD(L"HasTriggerbot",0)!=0;
     triggerbotEnabled = regGetDWORD(L"TrigEnabled",0)!=0;
     trigKey       = (int)regGetDWORD(L"TrigKey",VK_LBUTTON);
     trigR         = (int)regGetDWORD(L"TrigR",255);
@@ -13745,7 +13749,7 @@ std::wstring loadLicense(){ return regGetString(L"LicenseKey",L""); }
 //          3=hwid mismatch, 4=trial expired, 5=client key rejected (build out of date)
 int validateLicense(const std::wstring& key, const std::wstring& hwid) {
     // Silently validate - only log issues
-    std::wstring path=L"/rest/v1/licenses?license_key=eq."+key+L"&select=license_key,hwid,is_active,trial,expires_at";
+    std::wstring path=L"/rest/v1/licenses?license_key=eq."+key+L"&select=license_key,hwid,is_active,trial,expires_at,triggerbot";
     int status=0;
     std::string resp=httpCall(path.c_str(),"",SUPABASE_ANON_STR(),"GET",&status);
     // 401/403 means the key this build ships with is no longer accepted, not that
@@ -13753,6 +13757,9 @@ int validateLicense(const std::wstring& key, const std::wstring& hwid) {
     // below, since the error body is non-empty and would otherwise read as a mismatch.
     if (status==401||status==403) { LOG_ERR(L"Client key rejected - this build is out of date"); return 5; }
     if (resp.empty()) { LOG_ERR(L"Network error - using cached license"); return -1; }
+    // Triggerbot is an add-on: entitlement rides on the licence row.
+    if(resp.find("\"triggerbot\":true")!=std::string::npos) hasTriggerbot=true;
+    else if(resp.find("\"triggerbot\":false")!=std::string::npos) hasTriggerbot=false;
     if (resp=="[]") { LOG_ERR(L"License key not found"); return 0; }
     if (resp.find("\"is_active\":false")!=std::string::npos) { LOG_ERR(L"License deactivated"); return 0; }
 
@@ -16060,7 +16067,22 @@ void paintMain(HWND hwnd){
     } // end activeTab==0
 
     // â”€â”€ SETTINGS TAB CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if(activeTab==1){
+    if(activeTab==1 && !hasTriggerbot){
+        // Not entitled: show what it is and how to get it, rather than a dead tab.
+        int ty=70;
+        drawCard(hdc,p,ty,cw,150);
+        drawText(hdc,L"TRIGGERBOT",p+16,ty+12,200,12,T.subtext,hFontSmall);
+        drawText(hdc,L"Not included in your licence",p+16,ty+34,cw-32,20,T.text,hFontMed,
+                 DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        drawText(hdc,L"Fires a key the moment a colour you pick appears\non screen. Sold as an add-on to the macro.",
+                 p+16,ty+58,cw-32,36,T.subtext,hFontSmall,DT_LEFT|DT_WORDBREAK);
+        float uHov=getHoverAlpha(ID_TB_UPGRADE);
+        drawRR(hdc,p+16,ty+106,cw-32,30,15,lerpCol(T.btn,T.btnHov,uHov),T.border,1);
+        drawText(hdc,L"Upgrade on Discord",p+16,ty+106,cw-32,30,
+                 lerpCol(T.subtext,T.text,uHov),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        g_tbLay.yEnable=ty+106; // reuse as the upgrade button's Y for hit testing
+    }
+    if(activeTab==1 && hasTriggerbot){
         int ty=70;
         drawCard(hdc,p,ty,cw,68);
         drawText(hdc,L"TRIGGERBOT",p+16,ty+10,180,12,T.subtext,hFontSmall);
@@ -17354,7 +17376,17 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             return 0;
         }
         // ── TRIGGERBOT TAB CLICKS ────────────────────────────────────────────
-        if(activeTab==1){
+        if(activeTab==1 && !hasTriggerbot){
+            RECT crU; GetClientRect(hwnd,&crU);
+            int pU=14, cwU=crU.right-pU*2;
+            int mxU=GET_X_LPARAM(lp), myU=GET_Y_LPARAM(lp);
+            if(mxU>=pU+16&&mxU<=pU+cwU-16&&myU>=g_tbLay.yEnable&&myU<=g_tbLay.yEnable+30){
+                playClick();
+                ShellExecuteW(NULL,L"open",L"https://discord.gg/wrathic",NULL,NULL,SW_SHOW);
+                return 0;
+            }
+        }
+        if(activeTab==1 && hasTriggerbot){
             RECT crT; GetClientRect(hwnd,&crT);
             int pT=14, cwT=crT.right-pT*2;
             int mxT=GET_X_LPARAM(lp), myT=GET_Y_LPARAM(lp);
