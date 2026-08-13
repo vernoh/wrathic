@@ -13002,7 +13002,10 @@ float g_tabPos=0.0f, g_tabVel=0.0f;
 // Newly added key chips animate in: a key appearing instantly gives no feedback
 // that the capture was accepted. Holds the vk that was last added and how far
 // through its entrance it is.
-int   g_newKeyVk=0;
+// Which chip is animating in, by position in the list. This used to be the key's
+// virtual-key code, but keysToSend allowed duplicates, so adding a key that was
+// already there lit up every copy of it at once.
+int   g_newKeyIdx=-1;
 float g_newKeyAnim=0.0f;
 int   g_pressedId=0;
 float g_pressAnim=0.0f;
@@ -13120,7 +13123,6 @@ std::atomic<int> keypressCount(0);
 bool uiSoundsEnabled   = true;
 // Drops the glass and depth work in drawCard() back to a flat fill. Geometry is
 // identical either way, so nothing reflows when it is toggled.
-bool performanceMode   = false;
 bool discordRpcEnabled  = false;   // Discord rich presence
 bool overlaySysStats    = true;
 // Version update toast
@@ -13241,7 +13243,6 @@ void saveSettings() {
     regSetDWORD(L"OverlayShowGpu",(DWORD)overlayShowGpu);
     regSetDWORD(L"OverlayShowDisk",(DWORD)overlayShowDisk);
     regSetDWORD(L"UiSoundsEnabled",(DWORD)uiSoundsEnabled);
-    regSetDWORD(L"PerformanceMode",(DWORD)performanceMode);
     regSetDWORD(L"OverlaySysStats",(DWORD)overlaySysStats);
     regSetDWORD(L"DiscordRpcEnabled",(DWORD)discordRpcEnabled);
     LOG_OK(L"Settings saved");
@@ -13321,7 +13322,6 @@ void loadSettings() {
     overlayShowGpu=regGetDWORD(L"OverlayShowGpu",0)!=0;
     overlayShowDisk=regGetDWORD(L"OverlayShowDisk",0)!=0;
     uiSoundsEnabled=regGetDWORD(L"UiSoundsEnabled",1)!=0;
-    performanceMode=regGetDWORD(L"PerformanceMode",0)!=0;
     overlaySysStats=regGetDWORD(L"OverlaySysStats",1)!=0;
     discordRpcEnabled=regGetDWORD(L"DiscordRpcEnabled",0)!=0;
 
@@ -14230,13 +14230,22 @@ void captureThread(bool isHotkey){
                     showSuccessToast(msg.c_str());
                 }else{
                     EnterCriticalSection(&keyListCS);
-                    keysToSend.push_back(vk);
-                    g_newKeyVk=vk; g_newKeyAnim=0.0f; // animate this one in
+                    bool dupe = std::find(keysToSend.begin(),keysToSend.end(),vk)!=keysToSend.end();
+                    if(!dupe){
+                        keysToSend.push_back(vk);
+                        g_newKeyIdx=(int)keysToSend.size()-1; g_newKeyAnim=0.0f; // animate this one in
+                    }
                     LeaveCriticalSection(&keyListCS);
                     capturingKey=false;
-                    std::wstring msg=L"Key added: "+vkToString(vk);
-                    LOG_OK(msg.c_str());
-                    showSuccessToast(msg.c_str());
+                    if(dupe){
+                        // Spamming the same key twice per cycle does not press it twice
+                        // as far as the game is concerned - it just costs sends.
+                        showToast((vkToString(vk)+L" is already in the list").c_str(),T.red);
+                    } else {
+                        std::wstring msg=L"Key added: "+vkToString(vk);
+                        LOG_OK(msg.c_str());
+                        showSuccessToast(msg.c_str());
+                    }
                 }
                 InvalidateRect(hwndMain,NULL,FALSE);
                 return;
@@ -14457,22 +14466,16 @@ void resourceThread(){
         {static PDH_HQUERY gpuQ=NULL; static PDH_HCOUNTER gpuC=NULL;
         static bool gpuOk=false, gpuFail=false;
         if(!gpuFail && !gpuOk){
-            // Try paths in order: 3D â†’ Graphics â†’ all engines
-            const wchar_t* gpuPaths[]={
-                L"\\GPU Engine(*engtype_3D)\\Utilization Percentage",
-                L"\\GPU Engine(*engtype_Graphics)\\Utilization Percentage",
-                L"\\GPU Engine(*)\\Utilization Percentage",
-                NULL
-            };
-            for(int pi=0; gpuPaths[pi] && !gpuOk; pi++){
-                if(gpuQ){ PdhCloseQuery(gpuQ); gpuQ=NULL; }
-                if(PdhOpenQuery(NULL,0,&gpuQ)!=ERROR_SUCCESS){ gpuFail=true; break; }
-                if(PdhAddEnglishCounterW(gpuQ,gpuPaths[pi],0,&gpuC)==ERROR_SUCCESS){
-                    PdhCollectQueryData(gpuQ); // prime â€” first sample not valid
-                    gpuOk=true;
-                }
-            }
-            if(!gpuOk) gpuFail=true;
+            // All engines, not just 3D. The old list tried engtype_3D first and took
+            // it because it *adds* fine - but that counter only covers the 3D engine,
+            // which sits at 0 unless a 3D application is rendering, so the overlay
+            // showed a permanent 0% on the desktop. Copy, video decode and compute
+            // all live under other engine types.
+            if(PdhOpenQuery(NULL,0,&gpuQ)!=ERROR_SUCCESS) gpuFail=true;
+            else if(PdhAddEnglishCounterW(gpuQ,L"\\GPU Engine(*)\\Utilization Percentage",0,&gpuC)==ERROR_SUCCESS){
+                PdhCollectQueryData(gpuQ); // prime - the first sample is not valid
+                gpuOk=true;
+            } else gpuFail=true;
         }
         if(gpuOk && gpuQ){
             if(PdhCollectQueryData(gpuQ)==ERROR_SUCCESS){
@@ -14485,11 +14488,32 @@ void resourceThread(){
                     DWORD sz2=sz;
                     PDH_STATUS st=PdhGetFormattedCounterArrayW(gpuC,PDH_FMT_DOUBLE,&sz2,&cnt,items);
                     if(st==ERROR_SUCCESS){
-                        double total=0;
-                        for(DWORD i=0;i<cnt;i++)
-                            if(items[i].FmtValue.CStatus==ERROR_SUCCESS)
-                                total+=items[i].FmtValue.doubleValue;
-                        gpuUsage=std::min((float)total,100.0f);
+                        // Instance names look like
+                        //   pid_1234_luid_0x0_0xABCD_phys_0_eng_0_engtype_3D
+                        // Every process contributes an instance per engine it touched,
+                        // so a flat sum over all of them adds 3D to Copy to VideoDecode
+                        // and reaches 100% while the card is nearly idle. Sum within
+                        // each engine type, then report the busiest type - which is the
+                        // number Task Manager shows.
+                        double perType[8]={};
+                        static const wchar_t* kTypes[8]={
+                            L"3D",L"Copy",L"VideoDecode",L"VideoEncode",
+                            L"VideoProcessing",L"Compute",L"Security",L"Legacy"
+                        };
+                        for(DWORD i=0;i<cnt;i++){
+                            if(items[i].FmtValue.CStatus!=ERROR_SUCCESS) continue;
+                            const wchar_t* nm=items[i].szName;
+                            const wchar_t* et=nm?wcsstr(nm,L"engtype_"):NULL;
+                            int slot=0; // anything unrecognised counts as 3D
+                            if(et){
+                                et+=8;
+                                for(int t=0;t<8;t++) if(wcscmp(et,kTypes[t])==0){ slot=t; break; }
+                            }
+                            perType[slot]+=items[i].FmtValue.doubleValue;
+                        }
+                        double busiest=0;
+                        for(int t=0;t<8;t++) if(perType[t]>busiest) busiest=perType[t];
+                        gpuUsage=std::min((float)busiest,100.0f);
                     }
                 }
             }
@@ -15543,75 +15567,6 @@ static void addRoundRectPath(Gdiplus::GraphicsPath& p,int x,int y,int w,int h,in
 // with HALFTONE averages neighbouring pixels, which is a decent box blur for a
 // fraction of the cost of a real kernel. Built once per frame from the finished
 // background, then sampled by each card.
-// A single big downscale then upscale is *pixelation*, not blur: scaling 12:1 in one
-// step throws away everything between the sampled pixels, and scaling back up just
-// makes those survivors into blocks. Halving repeatedly instead averages each 2x2 on
-// every step, and reversing the same way interpolates between them - the result
-// approximates a Gaussian and has no blockiness. Six small blits beat one large one.
-#define BLUR_STEPS 3
-static HDC     s_blurDC=NULL,  s_blurStep[BLUR_STEPS]={};
-static HBITMAP s_blurBmp=NULL, s_blurStepBmp[BLUR_STEPS]={}, s_blurOld=NULL, s_blurStepOld[BLUR_STEPS]={};
-static int     s_blurW=0, s_blurH=0, s_stepW[BLUR_STEPS]={}, s_stepH[BLUR_STEPS]={};
-
-static void freeBackdropBlur(){
-    if(s_blurDC){ if(s_blurOld) SelectObject(s_blurDC,s_blurOld); if(s_blurBmp) DeleteObject(s_blurBmp); DeleteDC(s_blurDC); }
-    s_blurDC=NULL; s_blurBmp=NULL; s_blurOld=NULL;
-    for(int i=0;i<BLUR_STEPS;i++){
-        if(s_blurStep[i]){ if(s_blurStepOld[i]) SelectObject(s_blurStep[i],s_blurStepOld[i]);
-                           if(s_blurStepBmp[i]) DeleteObject(s_blurStepBmp[i]); DeleteDC(s_blurStep[i]); }
-        s_blurStep[i]=NULL; s_blurStepBmp[i]=NULL; s_blurStepOld[i]=NULL;
-    }
-    s_blurW=s_blurH=0;
-}
-void buildBackdropBlur(HDC src,int W,int H){
-    if(W<=0||H<=0) return;
-    // The backdrop is a slow drift behind heavy blur, so a frame-old copy is not
-    // distinguishable from a fresh one - but rebuilding the whole pyramid every
-    // frame is the single most expensive thing in the paint. Every third frame.
-    static int tick=0;
-    static int lastW=0,lastH=0;
-    bool sized = (W!=lastW||H!=lastH||!s_blurDC);
-    if(!sized && (++tick % 3)!=0) return;
-    lastW=W; lastH=H;
-    if(!s_blurDC||W!=s_blurW||H!=s_blurH){
-        freeBackdropBlur();
-        // Every buffer is a 32-bit top-down DIB, matching the back buffer and the sky
-        // buffer. Mixing DIB and device bitmaps makes GDI convert format per pixel on
-        // each blit, and with eight blits a frame that dominated the cost.
-        auto makeDib=[&](int w,int h,HBITMAP& bmp)->HDC{
-            BITMAPINFO bi={};
-            bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-            bi.bmiHeader.biWidth=w; bi.bmiHeader.biHeight=-h;
-            bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
-            void* bits=NULL;
-            bmp=CreateDIBSection(src,&bi,DIB_RGB_COLORS,&bits,NULL,0);
-            if(!bmp) bmp=CreateCompatibleBitmap(src,w,h);
-            HDC dc=CreateCompatibleDC(src);
-            return dc;
-        };
-        s_blurDC=makeDib(W,H,s_blurBmp);
-        s_blurOld=(HBITMAP)SelectObject(s_blurDC,s_blurBmp);
-        int w=W,h=H;
-        for(int i=0;i<BLUR_STEPS;i++){
-            w=std::max(1,w/2); h=std::max(1,h/2);
-            s_stepW[i]=w; s_stepH[i]=h;
-            s_blurStep[i]=makeDib(w,h,s_blurStepBmp[i]);
-            s_blurStepOld[i]=(HBITMAP)SelectObject(s_blurStep[i],s_blurStepBmp[i]);
-            SetStretchBltMode(s_blurStep[i],HALFTONE); SetBrushOrgEx(s_blurStep[i],0,0,NULL);
-        }
-        SetStretchBltMode(s_blurDC,HALFTONE); SetBrushOrgEx(s_blurDC,0,0,NULL);
-        s_blurW=W; s_blurH=H;
-    }
-    // Down the pyramid, halving each time - every step averages a 2x2 neighbourhood.
-    StretchBlt(s_blurStep[0],0,0,s_stepW[0],s_stepH[0],src,0,0,W,H,SRCCOPY);
-    for(int i=1;i<BLUR_STEPS;i++)
-        StretchBlt(s_blurStep[i],0,0,s_stepW[i],s_stepH[i],s_blurStep[i-1],0,0,s_stepW[i-1],s_stepH[i-1],SRCCOPY);
-    // Back up the same way, interpolating between the averages rather than blocking.
-    for(int i=BLUR_STEPS-1;i>0;i--)
-        StretchBlt(s_blurStep[i-1],0,0,s_stepW[i-1],s_stepH[i-1],s_blurStep[i],0,0,s_stepW[i],s_stepH[i],SRCCOPY);
-    StretchBlt(s_blurDC,0,0,W,H,s_blurStep[0],0,0,s_stepW[0],s_stepH[0],SRCCOPY);
-}
-
 // Float variant. Integer geometry made the card jump in whole-pixel steps as it
 // lifted, so the eye tracked individual pixels shifting rather than one solid
 // object moving. Sub-pixel coordinates let GDI+ antialias the motion.
@@ -15638,155 +15593,25 @@ static CardFx g_cardFx[32]={};
 int g_cardDrawIndex=0; // reset once per frame by paintMain
 
 void drawCard(HDC hdc,int x,int y,int w,int h){
-    const int R=14;
-    if(performanceMode){
-        drawRR(hdc,x,y,w,h,R,T.card,T.border,1);
-        return;
-    }
-    // Cards scrolled out of view were still being fully rendered - shadows, gradient
-    // and all. Settings draws nine of them, so most of that work was invisible.
-    if(y+h<-24 || y>APP_H+24){ g_cardDrawIndex++; return; }
-
-    using namespace Gdiplus;
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-
-    int idx=g_cardDrawIndex++; if(idx>=32) idx=31;
-    CardFx& fx=g_cardFx[idx];
-
-    POINT m=g_lastMousePos;
-    bool inside = m.x>=x && m.x<=x+w && m.y>=y && m.y<=y+h;
-    animateTo(fx.hv, inside?1.0f:0.0f, inside?0.055f:0.085f);
-    float hv=fx.hv;
-    if(hv>0.002f&&hv<0.998f) g_cardAnimActive=true;
-
-    // Geometry is fixed. The card used to grow and rise on hover, with its shadow
-    // sliding away from the cursor to fake a tilt, and it carried a cursor-tracking
-    // specular blob and a directional sheen on top of that - five effects competing
-    // on one small surface, which read as busy rather than expensive. What is left is
-    // a plain pane and one soft glow when you point at it. Nothing tracks the cursor
-    // within the card any more, so CardFx no longer needs to remember where it was.
-    REAL cx=(REAL)x, cy=(REAL)y, cw=(REAL)w, ch=(REAL)h;
-
-    GraphicsPath body;
-    addRoundRectPathF(body,cx,cy,cw,ch,(REAL)R);
-
-    // 1. Hover glow, drawn outside the card so it reads as light around the edge
-    //    rather than anything happening on the face. This is the whole hover effect.
-    if(hv>0.004f){
-        for(int i=3;i>=1;i--){
-            REAL sp=(REAL)(i*2);
-            GraphicsPath halo;
-            addRoundRectPathF(halo,cx-sp,cy-sp,cw+sp*2,ch+sp*2,(REAL)R+sp);
-            SolidBrush hb(Color((BYTE)((7-i)*3*hv),255,255,255));
-            g.FillPath(&hb,&halo);
-        }
-    }
-
-    // 2. Ambient drop shadow - one pass, straight down, no cursor tracking.
-    {
-        GraphicsPath sh;
-        addRoundRectPathF(sh,cx,cy+3.0f,cw,ch,(REAL)R);
-        SolidBrush sb(Color(22,0,0,0));
-        g.FillPath(&sb,&sh);
-    }
-
-    // 3. Frosted interior. Kept, but behind a much denser tint than before: a hint
-    //    that there is something behind the pane, not a lens. GDI+ clipping does not
-    //    apply to BitBlt, so the rounded mask has to be a GDI region.
-    if(s_blurDC){
-        int bx=(int)cx, by=(int)cy, bw=(int)(cw+0.5f), bh=(int)(ch+0.5f);
-        HRGN rgn=CreateRoundRectRgn(bx,by,bx+bw+1,by+bh+1,R*2,R*2);
-        SelectClipRgn(hdc,rgn);
-        BitBlt(hdc,bx,by,bw,bh,s_blurDC,bx,by,SRCCOPY);
-        SelectClipRgn(hdc,NULL);
-        DeleteObject(rgn);
-    }
-
-    // 4. Body. A shallow vertical gradient so it is still lit from above, and a
-    //    constant density - the pane no longer clarifies as you hover it.
-    int r0=std::min(255,GetRValue(T.card)+10), g0=std::min(255,GetGValue(T.card)+10), b0=std::min(255,GetBValue(T.card)+13);
-    BYTE aTop=(BYTE)(s_blurDC?226:255);
-    BYTE aBot=(BYTE)(s_blurDC?238:255);
-    LinearGradientBrush lg(RectF(cx,cy,cw,ch+1),
-        Color(aTop,(BYTE)r0,(BYTE)g0,(BYTE)b0),
-        Color(aBot,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
-        LinearGradientModeVertical);
-    g.FillPath(&lg,&body);
-
-    // 5. A single hairline along the top edge, and a border that comes up gently on
-    //    hover. At rest the cards should read as shapes in the dark.
-    g.SetClip(&body);
-    Pen hi(Color(18,255,255,255),1.0f);
-    g.DrawArc(&hi,cx,cy,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
-    g.DrawLine(&hi,cx+R,cy+0.5f,cx+cw-R,cy+0.5f);
-    g.DrawArc(&hi,cx+cw-R*2,cy,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
-    g.ResetClip();
-
-    if(hv>0.004f){
-        Pen bp(Color((BYTE)(34*hv),255,255,255),1.0f);
-        g.DrawPath(&bp,&body);
-    }
+    // Flat. This used to be a frosted pane with a hover glow, a fake tilt, a
+    // cursor-tracking specular and a directional sheen, switchable off via a
+    // "Performance Mode" toggle. The toggle is gone and so is the glass: what it
+    // bought was noise, and the off state was the better-looking one anyway.
+    // Cards scrolled out of view are still skipped - settings draws nine of them.
+    if(y+h<-24 || y>APP_H+24) return;
+    drawRR(hdc,x,y,w,h,14,T.card,T.border,1);
 }
 // A free-floating rounded pill of glass: frosted backdrop, tint, lit top edge and a
 // soft shadow beneath, so it reads as sitting above the content rather than being a
 // strip welded to the window edge.
 void drawGlassPill(HDC hdc,int x,int y,int w,int h,int r){
-    if(performanceMode||!s_blurDC){
-        drawRR(hdc,x,y,w,h,r,T.surface,T.border,1);
-        return;
-    }
-    using namespace Gdiplus;
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-    for(int i=2;i>=1;i--){                 // ambient shadow, widest first
-        int sp=i*3;
-        GraphicsPath sh;
-        addRoundRectPath(sh,x-sp/2,y+sp,w+sp,h,r+sp/2);
-        SolidBrush sb(Color((BYTE)(11-i*3),0,0,0));
-        g.FillPath(&sb,&sh);
-    }
-    HRGN rgn=CreateRoundRectRgn(x,y,x+w+1,y+h+1,r*2,r*2);
-    SelectClipRgn(hdc,rgn);
-    BitBlt(hdc,x,y,w,h,s_blurDC,x,y,SRCCOPY);   // frosted backdrop
-    SelectClipRgn(hdc,NULL);
-    DeleteObject(rgn);
-    GraphicsPath body;
-    addRoundRectPath(body,x,y,w,h,r);
-    int r0=std::min(255,GetRValue(T.surface)+9), g0=std::min(255,GetGValue(T.surface)+9), b0=std::min(255,GetBValue(T.surface)+11);
-    LinearGradientBrush lg(Rect(x,y,w,h+1),
-        Color(228,(BYTE)r0,(BYTE)g0,(BYTE)b0),
-        Color(240,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
-        LinearGradientModeVertical);
-    g.FillPath(&lg,&body);
-    g.SetClip(&body);
-    Pen hi(Color(20,255,255,255),1.0f);
-    g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(r*2),(REAL)(r*2),180.0f,90.0f);
-    g.DrawLine(&hi,(REAL)(x+r),(REAL)y+0.5f,(REAL)(x+w-r),(REAL)y+0.5f);
-    g.DrawArc(&hi,(REAL)(x+w-r*2),(REAL)y,(REAL)(r*2),(REAL)(r*2),270.0f,90.0f);
-    g.ResetClip();
-    Pen bp(Color(14,255,255,255),1.0f); // barely there - shadow does the separating
-    g.DrawPath(&bp,&body);
+    drawRR(hdc,x,y,w,h,r,T.surface,T.border,1);
 }
 
 // The selected-tab bubble that rides inside the dock pill.
 void drawSelBubble(HDC hdc,int x,int y,int w,int h,int r){
     if(w<=0||h<=0) return;
-    using namespace Gdiplus;
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-    GraphicsPath body;
-    addRoundRectPath(body,x,y,w,h,r);
-    if(performanceMode){
-        SolidBrush b(Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)));
-        g.FillPath(&b,&body);
-        return;
-    }
-    LinearGradientBrush lg(Rect(x,y,w,h+1),
-        Color(40,255,255,255),Color(18,255,255,255),LinearGradientModeVertical);
-    g.FillPath(&lg,&body);
-    Pen bp(Color(22,255,255,255),1.0f);
-    g.DrawPath(&bp,&body);
+    drawRR(hdc,x,y,w,h,r,T.card,T.border,1);
 }
 
 // A flat horizontal band of glass - the header and the dock. Same material as the
@@ -15795,49 +15620,17 @@ void drawSelBubble(HDC hdc,int x,int y,int w,int h,int r){
 // the dock. Without this the chrome stayed opaque while the cards went glassy, and
 // the two read as different applications.
 void drawGlassBand(HDC hdc,int x,int y,int w,int h,bool lightBottomEdge){
-    if(performanceMode||!s_blurDC){
-        fillRect(hdc,x,y,w,h,T.surface);
-        return;
-    }
-    BitBlt(hdc,x,y,w,h,s_blurDC,x,y,SRCCOPY);
-    using namespace Gdiplus;
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-    int r0=std::min(255,GetRValue(T.surface)+8), g0=std::min(255,GetGValue(T.surface)+8), b0=std::min(255,GetBValue(T.surface)+10);
-    LinearGradientBrush lg(RectF((REAL)x,(REAL)y,(REAL)w,(REAL)h+1),
-        Color(232,(BYTE)r0,(BYTE)g0,(BYTE)b0),
-        Color(244,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
-        LinearGradientModeVertical);
-    g.FillRectangle(&lg,RectF((REAL)x,(REAL)y,(REAL)w,(REAL)h));
-    Pen hi(Color(18,255,255,255),1.0f);
-    REAL ey = lightBottomEdge ? (REAL)(y+h)-0.5f : (REAL)y+0.5f;
-    g.DrawLine(&hi,(REAL)x,ey,(REAL)(x+w),ey);
+    fillRect(hdc,x,y,w,h,T.surface);
+    // One hairline on the edge facing the content, so the chrome still reads as a
+    // separate surface from the page without any of the glass.
+    fillRect(hdc,x,lightBottomEdge?(y+h-1):y,w,1,T.border);
 }
 
 // The card's resting appearance with none of the hover work: same gradient body,
 // same caught-light top edge, same hairline border. Used by the in-game overlay so
 // it reads as the same material as the app, without animating over someone's game.
 void drawCardStatic(HDC hdc,int x,int y,int w,int h,int R){
-    if(performanceMode){ drawRR(hdc,x,y,w,h,R,T.card,T.border,1); return; }
-    using namespace Gdiplus;
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-    GraphicsPath body;
-    addRoundRectPath(body,x,y,w,h,R);
-    int r0=std::min(255,GetRValue(T.card)+8), g0=std::min(255,GetGValue(T.card)+8), b0=std::min(255,GetBValue(T.card)+10);
-    LinearGradientBrush lg(Rect(x,y,w,h+1),
-        Color(255,(BYTE)r0,(BYTE)g0,(BYTE)b0),
-        Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
-        LinearGradientModeVertical);
-    g.FillPath(&lg,&body);
-    g.SetClip(&body);
-    Pen hi(Color(18,255,255,255),1.0f);
-    g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
-    g.DrawLine(&hi,(REAL)(x+R),(REAL)y+0.5f,(REAL)(x+w-R),(REAL)y+0.5f);
-    g.DrawArc(&hi,(REAL)(x+w-R*2),(REAL)y,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
-    g.ResetClip();
-    Pen bp(Color(16,255,255,255),1.0f);
-    g.DrawPath(&bp,&body);
+    drawRR(hdc,x,y,w,h,R,T.card,T.border,1);
 }
 void drawDot(HDC hdc,int cx,int cy,int r,COLORREF c){
     using namespace Gdiplus;
@@ -16349,7 +16142,6 @@ void paintMain(HWND hwnd){
     if(themeIdx==5) drawVoidStars(hdc,W,H);
     // Snapshot the finished background, blurred, before any card covers it - each
     // card samples this for its frosted interior.
-    if(!performanceMode) buildBackdropBlur(hdc,W,H);
 
     if(activeTab==0){
     // â”€â”€ TITLE BAR (macro tab) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -16423,7 +16215,7 @@ void paintMain(HWND hwnd){
                 }
                 // The chip just added grows and brightens into place, so the capture
                 // visibly lands rather than a key silently appearing in the row.
-                bool isNew = (keys[i]==g_newKeyVk && g_newKeyAnim<0.999f);
+                bool isNew = ((int)i==g_newKeyIdx && g_newKeyAnim<0.999f);
                 if(isNew){
                     float e=easeOut(g_newKeyAnim);
                     int inset=(int)((1.0f-e)*9.0f);
@@ -16685,8 +16477,7 @@ static int calcApplicationCardH(){
     h+=14+6;                           // header
     h+=24+4;                           // UI Sounds
     h+=24+4;                           // Discord Rich Presence
-    h+=24+4;                           // Minimise to Tray
-    h+=24+6;                           // Performance Mode
+    h+=24+6;                           // Minimise to Tray
     h+=8;
     return h;
 }
@@ -16982,8 +16773,6 @@ void paintSettingsInto(HDC hdc,int W,int H){
     drawToggle(hdc,p+cw-48,cx,discordRpcEnabled); cx+=24+4;
     drawText(hdc,L"Minimise to Tray",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-48,cx,minimiseToTray); cx+=24+4;
-    drawText(hdc,L"Performance Mode",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    drawToggle(hdc,p+cw-48,cx,performanceMode); cx+=24+6;
     (void)cx;}
 
     // â”€â”€ UPDATE CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -17475,8 +17264,6 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();discordRpcEnabled=!discordRpcEnabled;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
       cx+=24+4;
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();minimiseToTray=!minimiseToTray;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
-      cx+=24+4;
-      if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();performanceMode=!performanceMode;saveSettings();InvalidateRect(hwnd,NULL,TRUE);}
     }
 
     // â”€â”€ UPDATE CARD (l.yUpdate) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -17638,12 +17425,17 @@ static void paintOverlay(HWND hwnd){
             cy+=7;
         }
 
+        // GPU and disk have no per-process figure - Windows exposes them per engine
+        // and per physical disk, not per application. They used to carry a hardcoded
+        // 0 as their "macro" value, so with the Sys/Macro toggle on the macro side
+        // both read a permanent 0% whatever the machine was doing. There is only one
+        // number for them, so show it in either mode.
         struct ResRow { const wchar_t* lbl; float sys; float pulse; bool show; };
         ResRow rows[]={
-            {L"CPU", sysCpu,   procCpu,  overlayShowCpu},
-            {L"RAM", sysRam,   pulseRam, overlayShowRam},
-            {L"GPU", gpuUsage, 0.0f,     overlayShowGpu},
-            {L"Disk",diskUsage,0.0f,     overlayShowDisk},
+            {L"CPU", sysCpu,   procCpu,   overlayShowCpu},
+            {L"RAM", sysRam,   pulseRam,  overlayShowRam},
+            {L"GPU", gpuUsage, gpuUsage,  overlayShowGpu},
+            {L"Disk",diskUsage,diskUsage, overlayShowDisk},
         };
         int activeRows=0;
         for(auto& r:rows) if(r.show) activeRows++;
@@ -17874,9 +17666,9 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             animateTo(animModeHold,(float)holdMode.load(),0.07f); // ~70ms half-life
             animateTo(animRunning,(float)macroRunning.load(),0.07f);
             animateTo(g_pressAnim,g_pressedId?1.0f:0.0f,g_pressedId?0.025f:0.06f); // fast in, softer out
-            if(g_newKeyVk){
+            if(g_newKeyIdx>=0){
                 animateTo(g_newKeyAnim,1.0f,0.075f);
-                if(g_newKeyAnim>0.995f){ g_newKeyVk=0; g_newKeyAnim=0.0f; } // done, stop tracking
+                if(g_newKeyAnim>0.995f){ g_newKeyIdx=-1; g_newKeyAnim=0.0f; } // done, stop tracking
             }
             // Tab dock indicator animation (smooth bar, instant content)
             // Dock tab animation â€” fixed speed, always finishes in ~600ms
@@ -18376,7 +18168,17 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         }
         if(isInSlider(hwnd,pt.x,pt.y)){
             int delta=(GET_WHEEL_DELTA_WPARAM(wp)>0?5:-5);
-            kps=std::max(MIN_KPS,std::min(MAX_KPS,kps.load()+delta));
+            int nk=std::max(MIN_KPS,std::min(MAX_KPS,kps.load()+delta));
+            if(nk!=kps.load()){
+                // The detent tick fired on drag but not on the wheel, so the same
+                // adjustment made a sound one way and not the other. Rate-limited
+                // exactly as the drag is - a fast scroll outruns 25 ticks/sec.
+                static DWORD lastWheelTick=0;
+                DWORD nowW=GetTickCount();
+                if(nowW-lastWheelTick>40){ playTick(); lastWheelTick=nowW; }
+                kps=nk;
+                saveSettings();
+            }
             InvalidateRect(hwnd,NULL,FALSE);
         } else {
             RECT cr5;GetClientRect(hwnd,&cr5);
