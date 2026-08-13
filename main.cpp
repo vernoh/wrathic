@@ -15633,9 +15633,7 @@ static void addRoundRectPathF(Gdiplus::GraphicsPath& p,Gdiplus::REAL x,Gdiplus::
 // Per-card hover state. Keyed by draw order rather than position: settings cards
 // live at y = 8 - settScrollPos, so a position key changed on every scroll step and
 // churned through the table until every card shared one slot. Draw order is stable.
-// mx/my remember where the cursor was so the highlight can fade out from where it
-// was left, instead of snapping off the moment the pointer leaves the window.
-struct CardFx { float hv, mx, my; };
+struct CardFx { float hv; };
 static CardFx g_cardFx[32]={};
 int g_cardDrawIndex=0; // reset once per frame by paintMain
 
@@ -15658,50 +15656,44 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
 
     POINT m=g_lastMousePos;
     bool inside = m.x>=x && m.x<=x+w && m.y>=y && m.y<=y+h;
-    if(inside){ fx.mx=(float)m.x; fx.my=(float)m.y; }
     animateTo(fx.hv, inside?1.0f:0.0f, inside?0.055f:0.085f);
     float hv=fx.hv;
     if(hv>0.002f&&hv<0.998f) g_cardAnimActive=true;
 
-    // Where the cursor sits relative to the card centre, -1..1 per axis. Uses the
-    // remembered position so the tilt eases back rather than snapping flat.
-    float dx=0.0f, dy=0.0f;
-    if(hv>0.001f){
-        dx=(fx.mx-(x+w*0.5f))/(w*0.5f);
-        dy=(fx.my-(y+h*0.5f))/(h*0.5f);
-        dx=std::max(-1.0f,std::min(1.0f,dx));
-        dy=std::max(-1.0f,std::min(1.0f,dy));
-    }
-    // Three cues together sell the tilt, where a 2px nudge alone read as nothing:
-    // the card grows slightly (coming toward you), rises, and its shadow slides
-    // well away from the pointer so the near corner looks furthest off the surface.
-    // All of it in floats so the card glides rather than stepping pixel by pixel.
-    // A card's text is drawn by the caller afterwards, in screen space, so the
-    // surface cannot actually rotate without the content sliding off it - and
-    // rotating the text too (via a GDI world transform) would cost ClearType on
-    // every label. Tilt is therefore faked, but with the cues turned up far enough
-    // to actually register: the card scales up, rises, and the corner nearest the
-    // cursor drops a much longer shadow than the far one.
-    REAL grow=hv*4.0f, lift=hv*7.0f;
-    REAL cx=(REAL)x-grow, cy=(REAL)y-grow-lift, cw=(REAL)w+grow*2, ch=(REAL)h+grow*2;
-    REAL shX=-dx*13.0f*hv, shY=-dy*9.0f*hv;
-
-    // 1. Ambient drop shadow. Two passes rather than three - the third was costing a
-    //    full extra path fill per card per frame for a barely visible difference.
-    for(int i=2;i>=1;i--){
-        REAL sp=(REAL)(i*3);
-        GraphicsPath sh;
-        addRoundRectPathF(sh,cx-sp*0.5f+shX,cy+sp+lift*2+shY,cw+sp,ch,(REAL)R+sp*0.5f);
-        SolidBrush sb(Color((BYTE)((18-i*4)+(int)(hv*12.0f)),0,0,0));
-        g.FillPath(&sb,&sh);
-    }
+    // Geometry is fixed. The card used to grow and rise on hover, with its shadow
+    // sliding away from the cursor to fake a tilt, and it carried a cursor-tracking
+    // specular blob and a directional sheen on top of that - five effects competing
+    // on one small surface, which read as busy rather than expensive. What is left is
+    // a plain pane and one soft glow when you point at it. Nothing tracks the cursor
+    // within the card any more, so CardFx no longer needs to remember where it was.
+    REAL cx=(REAL)x, cy=(REAL)y, cw=(REAL)w, ch=(REAL)h;
 
     GraphicsPath body;
     addRoundRectPathF(body,cx,cy,cw,ch,(REAL)R);
 
-    // 2a. Frosted interior: the blurred background showing through the pane. GDI+
-    //     clipping does not apply to BitBlt, so the rounded mask is a GDI region.
-    //     This is what makes it read as glass rather than a translucent rectangle.
+    // 1. Hover glow, drawn outside the card so it reads as light around the edge
+    //    rather than anything happening on the face. This is the whole hover effect.
+    if(hv>0.004f){
+        for(int i=3;i>=1;i--){
+            REAL sp=(REAL)(i*2);
+            GraphicsPath halo;
+            addRoundRectPathF(halo,cx-sp,cy-sp,cw+sp*2,ch+sp*2,(REAL)R+sp);
+            SolidBrush hb(Color((BYTE)((7-i)*3*hv),255,255,255));
+            g.FillPath(&hb,&halo);
+        }
+    }
+
+    // 2. Ambient drop shadow - one pass, straight down, no cursor tracking.
+    {
+        GraphicsPath sh;
+        addRoundRectPathF(sh,cx,cy+3.0f,cw,ch,(REAL)R);
+        SolidBrush sb(Color(22,0,0,0));
+        g.FillPath(&sb,&sh);
+    }
+
+    // 3. Frosted interior. Kept, but behind a much denser tint than before: a hint
+    //    that there is something behind the pane, not a lens. GDI+ clipping does not
+    //    apply to BitBlt, so the rounded mask has to be a GDI region.
     if(s_blurDC){
         int bx=(int)cx, by=(int)cy, bw=(int)(cw+0.5f), bh=(int)(ch+0.5f);
         HRGN rgn=CreateRoundRectRgn(bx,by,bx+bw+1,by+bh+1,R*2,R*2);
@@ -15711,99 +15703,29 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         DeleteObject(rgn);
     }
 
-    // 2b. Tint over the frost - the glass's own colour and density. Semi-transparent
-    //     so the refracted background stays visible through it, and lighter at the
-    //     top so the pane still reads as lit from above.
-    int r0=std::min(255,GetRValue(T.card)+20), g0=std::min(255,GetGValue(T.card)+20), b0=std::min(255,GetBValue(T.card)+26);
-    // Thinner over the frost while hovered - the pane clarifies as it lifts toward
-    // you, which is most of what makes the material feel alive rather than printed.
-    BYTE aTop=(BYTE)(s_blurDC?(190-(int)(26*hv)):255);
-    BYTE aBot=(BYTE)(s_blurDC?(214-(int)(22*hv)):255);
+    // 4. Body. A shallow vertical gradient so it is still lit from above, and a
+    //    constant density - the pane no longer clarifies as you hover it.
+    int r0=std::min(255,GetRValue(T.card)+10), g0=std::min(255,GetGValue(T.card)+10), b0=std::min(255,GetBValue(T.card)+13);
+    BYTE aTop=(BYTE)(s_blurDC?226:255);
+    BYTE aBot=(BYTE)(s_blurDC?238:255);
     LinearGradientBrush lg(RectF(cx,cy,cw,ch+1),
         Color(aTop,(BYTE)r0,(BYTE)g0,(BYTE)b0),
         Color(aBot,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
         LinearGradientModeVertical);
     g.FillPath(&lg,&body);
 
-    // 2c. Inner shading just inside the rim, top darker than bottom. Real glass is
-    //     thicker at the edge than the middle, and that gradient across the first
-    //     few pixels is what separates a pane from a flat translucent shape.
-    if(s_blurDC){
-        GraphicsPath inner;
-        addRoundRectPathF(inner,cx+1.0f,cy+1.0f,cw-2.0f,ch-2.0f,(REAL)R-1.0f);
-        g.SetClip(&body);
-        g.SetClip(&inner,CombineModeExclude);
-        LinearGradientBrush rim(PointF(cx,cy),PointF(cx,cy+ch),
-            Color(52,255,255,255),Color(16,255,255,255));
-        rim.SetWrapMode(WrapModeTileFlipXY);
-        g.FillPath(&rim,&body);
-        g.ResetClip();
-    }
-
-    // 3. Caught light along the top edge - clipped to the card so it follows the
-    //    corner radius instead of running straight across.
+    // 5. A single hairline along the top edge, and a border that comes up gently on
+    //    hover. At rest the cards should read as shapes in the dark.
     g.SetClip(&body);
-    Pen hi(Color(30,255,255,255),1.0f);
+    Pen hi(Color(18,255,255,255),1.0f);
     g.DrawArc(&hi,cx,cy,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
     g.DrawLine(&hi,cx+R,cy+0.5f,cx+cw-R,cy+0.5f);
     g.DrawArc(&hi,cx+cw-R*2,cy,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
     g.ResetClip();
 
-    // 4. Border only while hovered - at rest the cards should read as shapes in the
-    //    dark, not as outlined boxes.
     if(hv>0.004f){
-        Pen bp(Color((BYTE)(30*hv),255,255,255),1.0f);
+        Pen bp(Color((BYTE)(34*hv),255,255,255),1.0f);
         g.DrawPath(&bp,&body);
-    }
-
-    // 5. Specular sweep - a soft light centred on the cursor, clipped to a 2px ring
-    //    just inside the border so it reads as light catching the card's edge
-    //    rather than a blob floating on its face.
-    //    Driven by the remembered cursor position and hv, so when the pointer leaves
-    //    the card the highlight stays put and dims away instead of vanishing.
-    if(hv>0.01f){
-        GraphicsPath innerEdge;
-        addRoundRectPathF(innerEdge,cx+2,cy+2,cw-4,ch-4,(REAL)R-2);
-        g.SetClip(&body);
-        g.SetClip(&innerEdge,CombineModeExclude);
-        // The highlight drifts along the edge rather than sitting where the cursor
-        // is - a slow sweep either side of the pointer, so the card looks like it is
-        // catching a moving light instead of holding a static hotspot.
-        REAL sweep=(REAL)sin((double)GetTickCount()/900.0)*(cw*0.13f);
-        REAL gx=fx.mx+sweep, gy=fx.my;
-        REAL rad=(REAL)std::max(cw,ch)*0.62f;
-        GraphicsPath spot;
-        spot.AddEllipse(gx-rad,gy-rad,rad*2,rad*2);
-        PathGradientBrush pg(&spot);
-        pg.SetCenterPoint(PointF(gx,gy));
-        pg.SetCenterColor(Color((BYTE)(190*hv),255,255,255));
-        Color edge(0,255,255,255); int cnt=1;
-        pg.SetSurroundColors(&edge,&cnt);
-        g.FillPath(&pg,&spot);
-        g.ResetClip();
-    }
-
-    // Directional sheen across the face, brightest on the side the cursor is on.
-    // This is what carries the sense of a tilted plane catching light, now that the
-    // surface itself cannot rotate.
-    if(hv>0.01f && (fabsf(dx)>0.01f || fabsf(dy)>0.01f)){
-        REAL nx=-dx, ny=-dy;
-        REAL len=(REAL)sqrt(nx*nx+ny*ny); if(len<0.001f) len=1.0f;
-        nx/=len; ny/=len;
-        // Span the full diagonal, not half the width: a shorter span leaves the rest
-        // of the card outside the gradient, and GDI+ tiles by default, which drew a
-        // hard repeating band across the face.
-        REAL reach=(REAL)sqrt(cw*cw+ch*ch)*0.62f;
-        PointF ctr(cx+cw*0.5f, cy+ch*0.5f);
-        PointF p1(ctr.X-nx*reach, ctr.Y-ny*reach);
-        PointF p2(ctr.X+nx*reach, ctr.Y+ny*reach);
-        if(fabsf(p1.X-p2.X)>0.5f||fabsf(p1.Y-p2.Y)>0.5f){
-            LinearGradientBrush sheen(p1,p2,Color((BYTE)(34*hv),255,255,255),Color(0,255,255,255));
-            sheen.SetWrapMode(WrapModeTileFlipXY); // mirrors instead of hard-repeating
-            g.SetClip(&body);
-            g.FillPath(&sheen,&body);
-            g.ResetClip();
-        }
     }
 }
 // A free-floating rounded pill of glass: frosted backdrop, tint, lit top edge and a
@@ -15831,14 +15753,14 @@ void drawGlassPill(HDC hdc,int x,int y,int w,int h,int r){
     DeleteObject(rgn);
     GraphicsPath body;
     addRoundRectPath(body,x,y,w,h,r);
-    int r0=std::min(255,GetRValue(T.surface)+18), g0=std::min(255,GetGValue(T.surface)+18), b0=std::min(255,GetBValue(T.surface)+22);
+    int r0=std::min(255,GetRValue(T.surface)+9), g0=std::min(255,GetGValue(T.surface)+9), b0=std::min(255,GetBValue(T.surface)+11);
     LinearGradientBrush lg(Rect(x,y,w,h+1),
-        Color(198,(BYTE)r0,(BYTE)g0,(BYTE)b0),
-        Color(220,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
+        Color(228,(BYTE)r0,(BYTE)g0,(BYTE)b0),
+        Color(240,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
         LinearGradientModeVertical);
     g.FillPath(&lg,&body);
     g.SetClip(&body);
-    Pen hi(Color(40,255,255,255),1.0f);
+    Pen hi(Color(20,255,255,255),1.0f);
     g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(r*2),(REAL)(r*2),180.0f,90.0f);
     g.DrawLine(&hi,(REAL)(x+r),(REAL)y+0.5f,(REAL)(x+w-r),(REAL)y+0.5f);
     g.DrawArc(&hi,(REAL)(x+w-r*2),(REAL)y,(REAL)(r*2),(REAL)(r*2),270.0f,90.0f);
@@ -15861,7 +15783,7 @@ void drawSelBubble(HDC hdc,int x,int y,int w,int h,int r){
         return;
     }
     LinearGradientBrush lg(Rect(x,y,w,h+1),
-        Color(64,255,255,255),Color(26,255,255,255),LinearGradientModeVertical);
+        Color(40,255,255,255),Color(18,255,255,255),LinearGradientModeVertical);
     g.FillPath(&lg,&body);
     Pen bp(Color(22,255,255,255),1.0f);
     g.DrawPath(&bp,&body);
@@ -15881,13 +15803,13 @@ void drawGlassBand(HDC hdc,int x,int y,int w,int h,bool lightBottomEdge){
     using namespace Gdiplus;
     Graphics g(hdc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
-    int r0=std::min(255,GetRValue(T.surface)+16), g0=std::min(255,GetGValue(T.surface)+16), b0=std::min(255,GetBValue(T.surface)+20);
+    int r0=std::min(255,GetRValue(T.surface)+8), g0=std::min(255,GetGValue(T.surface)+8), b0=std::min(255,GetBValue(T.surface)+10);
     LinearGradientBrush lg(RectF((REAL)x,(REAL)y,(REAL)w,(REAL)h+1),
-        Color(206,(BYTE)r0,(BYTE)g0,(BYTE)b0),
-        Color(226,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
+        Color(232,(BYTE)r0,(BYTE)g0,(BYTE)b0),
+        Color(244,GetRValue(T.surface),GetGValue(T.surface),GetBValue(T.surface)),
         LinearGradientModeVertical);
     g.FillRectangle(&lg,RectF((REAL)x,(REAL)y,(REAL)w,(REAL)h));
-    Pen hi(Color(34,255,255,255),1.0f);
+    Pen hi(Color(18,255,255,255),1.0f);
     REAL ey = lightBottomEdge ? (REAL)(y+h)-0.5f : (REAL)y+0.5f;
     g.DrawLine(&hi,(REAL)x,ey,(REAL)(x+w),ey);
 }
@@ -15902,14 +15824,14 @@ void drawCardStatic(HDC hdc,int x,int y,int w,int h,int R){
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     GraphicsPath body;
     addRoundRectPath(body,x,y,w,h,R);
-    int r0=std::min(255,GetRValue(T.card)+14), g0=std::min(255,GetGValue(T.card)+14), b0=std::min(255,GetBValue(T.card)+16);
+    int r0=std::min(255,GetRValue(T.card)+8), g0=std::min(255,GetGValue(T.card)+8), b0=std::min(255,GetBValue(T.card)+10);
     LinearGradientBrush lg(Rect(x,y,w,h+1),
         Color(255,(BYTE)r0,(BYTE)g0,(BYTE)b0),
         Color(255,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)),
         LinearGradientModeVertical);
     g.FillPath(&lg,&body);
     g.SetClip(&body);
-    Pen hi(Color(30,255,255,255),1.0f);
+    Pen hi(Color(18,255,255,255),1.0f);
     g.DrawArc(&hi,(REAL)x,(REAL)y,(REAL)(R*2),(REAL)(R*2),180.0f,90.0f);
     g.DrawLine(&hi,(REAL)(x+R),(REAL)y+0.5f,(REAL)(x+w-R),(REAL)y+0.5f);
     g.DrawArc(&hi,(REAL)(x+w-R*2),(REAL)y,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
@@ -15989,26 +15911,19 @@ void drawSlider(HDC hdc,int x,int y,int w,int val,int minV,int maxV){
     REAL grow=g_sliderDragging?2.0f:0.0f;
     REAL kr=KW/2.0f+grow;
 
-    // Halo - two soft passes, stronger while dragging.
+    // One soft halo, and only really visible while dragging. The bead used to carry
+    // two halo passes and a specular dot on top of that, which is a lot of lighting
+    // for a 20px circle.
     {
-        BYTE o1=(BYTE)(g_sliderDragging?46:26), o2=(BYTE)(g_sliderDragging?22:12);
-        SolidBrush h2(Color(o2,ar,ag,ab)); g.FillEllipse(&h2,cx-kr-7,cy-kr-7,(kr+7)*2,(kr+7)*2);
-        SolidBrush h1(Color(o1,ar,ag,ab)); g.FillEllipse(&h1,cx-kr-3,cy-kr-3,(kr+3)*2,(kr+3)*2);
+        BYTE o=(BYTE)(g_sliderDragging?28:14);
+        SolidBrush h1(Color(o,ar,ag,ab)); g.FillEllipse(&h1,cx-kr-4,cy-kr-4,(kr+4)*2,(kr+4)*2);
     }
-    // Body: near-white, shaded top-to-bottom so it looks spherical rather than flat.
+    // Body: flat near-white with a thin accent rim. No gradient, no highlight.
     {
-        GraphicsPath bead; bead.AddEllipse(cx-kr,cy-kr,kr*2,kr*2);
-        LinearGradientBrush body(PointF(cx,cy-kr),PointF(cx,cy+kr),
-            Color(255,255,255,255),
-            Color(255,(BYTE)(GetRValue(T.text)*0.80f),
-                      (BYTE)(GetGValue(T.text)*0.80f),
-                      (BYTE)(GetBValue(T.text)*0.80f)));
-        g.FillPath(&body,&bead);
+        SolidBrush body(Color(255,GetRValue(T.text),GetGValue(T.text),GetBValue(T.text)));
+        g.FillEllipse(&body,cx-kr,cy-kr,kr*2,kr*2);
         Pen rim(Color(255,ar,ag,ab),2.0f);
         g.DrawEllipse(&rim,cx-kr,cy-kr,kr*2,kr*2);
-        // Specular dot, offset up-left like every other lit surface in the app.
-        SolidBrush spec(Color(150,255,255,255));
-        g.FillEllipse(&spec,cx-kr*0.55f,cy-kr*0.68f,kr*0.66f,kr*0.46f);
     }
 }
 
