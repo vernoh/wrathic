@@ -13306,7 +13306,11 @@ void loadSettings() {
             size_t comma=keysStr.find(L',',pos);
             if(comma==std::wstring::npos) break;
             int v=_wtoi(keysStr.substr(pos,comma-pos).c_str());
-            if(v>0&&v<256) keysToSend.push_back(v);
+            // Reject duplicates here too, not just on capture. Adding the same key
+            // twice was possible until now, so saved lists can already contain them,
+            // and the stored list outlives the fix that stopped new ones appearing.
+            if(v>0&&v<256 && std::find(keysToSend.begin(),keysToSend.end(),v)==keysToSend.end())
+                keysToSend.push_back(v);
             pos=comma+1;
         }
         LeaveCriticalSection(&keyListCS);
@@ -14941,7 +14945,12 @@ static void profileApply(const Profile& p){
     hotkeyVK=p.hotkey;
     holdMode=p.hold;
     EnterCriticalSection(&keyListCS);
-    keysToSend=p.keys;
+    keysToSend.clear();
+    // Share codes can carry duplicates from before they were rejected, and a code can
+    // come from anyone's machine - so filter on the way in rather than trusting it.
+    for(int v:p.keys)
+        if(std::find(keysToSend.begin(),keysToSend.end(),v)==keysToSend.end())
+            keysToSend.push_back(v);
     LeaveCriticalSection(&keyListCS);
     rebuildInputBuf();
     // Loading a profile must not silently start the triggerbot: the two engines are
@@ -16399,6 +16408,10 @@ void paintMain(HWND hwnd){
         drawRR(hdc,tx,ty,tw,th,8,T.accent,T.accent,0);
         int closeW=28;
         drawText(hdc,L"\u2728  What\u2019s new in " APP_VERSION,tx+10,ty,tw-closeW-10,th,T.bg,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        // Say what the click does. It looked like a link and behaved like one only in
+        // the sense that it vanished - the in-app changelog it used to open was
+        // removed for going stale, and nothing took its place.
+        drawText(hdc,L"tap to read",tx+10,ty,tw-closeW-20,th,T.bg,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         drawText(hdc,L"\u2715",tx+tw-closeW,ty,closeW,th,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
@@ -18064,6 +18077,15 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             int tw2=cr10.right-28, th2=34, tx2=14, ty2=cr10.bottom-DOCK_H-8-th2;
             bool inToast=mx>=tx2&&mx<=tx2+tw2&&my>=ty2&&my<=ty2+th2;
             if(inToast){
+                playClick();
+                // The X just closes it; the body opens this version's release notes on
+                // GitHub. Linking out rather than shipping the notes in the binary is
+                // why they can never go stale - the tag always matches APP_VERSION.
+                bool onClose = mx >= tx2+tw2-28;
+                if(!onClose){
+                    std::wstring url=L"https://github.com/vernoh/wrathic/releases/tag/" APP_VERSION;
+                    ShellExecuteW(NULL,L"open",url.c_str(),NULL,NULL,SW_SHOW);
+                }
                 g_versionToast=false;
                 InvalidateRect(hwnd,NULL,FALSE);
                 return 0;
