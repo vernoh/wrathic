@@ -12982,6 +12982,16 @@ HWND hwndHovered=NULL;
 POINT g_lastMousePos={-1,-1};
 // Recorded while painting the Keys card so hit testing follows the same layout.
 int g_keysBtnY=0, g_keysAddX=0, g_keysRemX=0, g_keysBtnW=30;
+// The dock bubble runs on a real spring rather than exponential decay. Decay only
+// ever asymptotes toward the target, so the bubble creeps to a stop; a lightly
+// underdamped spring overshoots a couple of pixels and settles, which is what
+// reads as a deliberate movement rather than a fade.
+float g_tabPos=0.0f, g_tabVel=0.0f;
+// Nothing in the app reacted to being held down - only to hover - so a click had
+// no physical response at all. drawRR already lifts a control by its hover amount;
+// a held control now gets pushed the other way instead.
+int   g_pressedId=0;
+float g_pressAnim=0.0f;
 // Set by drawCard() whenever a card's hover fade is mid-flight, so the animation
 // tick knows to keep painting after the mouse has stopped moving.
 bool g_cardAnimActive=false;
@@ -13021,8 +13031,17 @@ float smoothStep(float t){
 // Uses exponential decay so animation speed is framerate-independent
 static DWORD lastAnimTick=0;
 void animateTo(float& val, float target, float halfLife){
-    DWORD now=GetTickCount();
-    float dt=(lastAnimTick>0)?(float)(now-lastAnimTick)/1000.0f:0.016f;
+    // QPC, not GetTickCount. GetTickCount only advances every ~15.6ms, so against a
+    // 16ms timer the measured delta quantised to 0 / 16 / 31 and every animation in
+    // the app - hover fades, the tab slide, toasts - advanced in uneven jumps. This
+    // is the same clock problem the starfield had, and it was making all of the
+    // motion feel cheap for a reason that had nothing to do with the easing.
+    static LARGE_INTEGER freq={}, last={};
+    if(freq.QuadPart==0){ QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
+    LARGE_INTEGER nowQ; QueryPerformanceCounter(&nowQ);
+    float dt=(float)((double)(nowQ.QuadPart-last.QuadPart)/(double)freq.QuadPart);
+    last=nowQ;
+    if(dt<=0.0f) dt=0.016f;
     dt=std::min(dt,0.1f); // clamp to avoid huge jumps on lag
     float diff=target-val;
     if(fabsf(diff)<0.0005f){val=target;return;}
@@ -13041,6 +13060,7 @@ int   hoverBtnId[16]={500,501,502,503,504,505,506,
 
 // Get hover alpha for a given hit ID
 float getHoverAlpha(int id){
+    if(id!=0&&id==g_pressedId&&g_pressAnim>0.01f) return -g_pressAnim;
     for(int i=0;i<16;i++) if(hoverBtnId[i]==id) return hoverBtn[i];
     return 0.0f;
 }
@@ -15265,7 +15285,9 @@ void fillRect(HDC hdc,int x,int y,int w,int h,COLORREF c){
 }
 void drawRR(HDC hdc,int x,int y,int w,int h,int r,COLORREF fill,COLORREF border=0,int bw=0,float hov=0.0f){
     using namespace Gdiplus;
+    // hov > 0 lifts on hover; hov < 0 means held, which sinks it instead.
     if(hov>0.01f){ int lift=(int)(hov*2); y-=lift; }
+    else if(hov<-0.01f){ int sink=(int)(-hov*2.0f); y+=sink; x+=sink/2; w-=sink; h-=sink/2; }
     Graphics g(hdc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     // Build rounded rect path
@@ -16379,7 +16401,7 @@ void paintMain(HWND hwnd){
         int segW=pw/N;
         // The selection bubble follows tabAnim continuously, so switching tabs
         // slides it rather than snapping between cells.
-        float selX=(float)px + tabAnim*(float)segW;
+        float selX=(float)px + g_tabPos*(float)segW;
         drawSelBubble(hdc,(int)(selX+3),py+3,segW-6,pillH-6,(pillH-6)/2);
         for(int i=0;i<N;i++){
             float on=1.0f-std::min(1.0f,fabsf(tabAnim-(float)i));
@@ -17455,11 +17477,25 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // Mode and running state - smooth transitions
             animateTo(animModeHold,(float)holdMode.load(),0.07f); // ~70ms half-life
             animateTo(animRunning,(float)macroRunning.load(),0.07f);
+            animateTo(g_pressAnim,g_pressedId?1.0f:0.0f,g_pressedId?0.025f:0.06f); // fast in, softer out
             // Tab dock indicator animation (smooth bar, instant content)
             // Dock tab animation â€” fixed speed, always finishes in ~600ms
             {
                 float tabTarget=(float)activeTab;
-                animateTo(tabAnim,tabTarget,0.10f); // 100ms half-life for tab slide
+                animateTo(tabAnim,tabTarget,0.10f); // still drives label crossfade
+                {   // Semi-implicit Euler: stable at this stiffness and trivially cheap.
+                    static LARGE_INTEGER sfreq={}, slast={};
+                    if(sfreq.QuadPart==0){ QueryPerformanceFrequency(&sfreq); QueryPerformanceCounter(&slast); }
+                    LARGE_INTEGER snow; QueryPerformanceCounter(&snow);
+                    float sdt=(float)((double)(snow.QuadPart-slast.QuadPart)/(double)sfreq.QuadPart);
+                    slast=snow;
+                    if(sdt<=0.0f||sdt>0.05f) sdt=1.0f/60.0f;
+                    const float k=190.0f, damp=19.0f; // ~1 small overshoot, settles in ~250ms
+                    float accel=(tabTarget-g_tabPos)*k - g_tabVel*damp;
+                    g_tabVel+=accel*sdt;
+                    g_tabPos+=g_tabVel*sdt;
+                    if(fabsf(tabTarget-g_tabPos)<0.0008f&&fabsf(g_tabVel)<0.01f){ g_tabPos=tabTarget; g_tabVel=0.0f; }
+                }
             }
 
             // Hover states - fast ease out
@@ -17555,6 +17591,9 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
                         }
         break;
+    case WM_LBUTTONUP:
+        if(g_pressedId){ g_pressedId=0; InvalidateRect(hwnd,NULL,FALSE); }
+        return 0;
     case WM_MOUSEMOVE:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
         g_lastMousePos.x=mx; g_lastMousePos.y=my;
@@ -17613,6 +17652,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_MOUSELEAVE:{
         g_lastMousePos.x=-1; g_lastMousePos.y=-1;
+        if(g_pressedId) g_pressedId=0; // cursor left while held
         if(hwndHovered){hwndHovered=NULL;InvalidateRect(hwnd,NULL,FALSE);}
         break;
     }
@@ -17655,6 +17695,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_LBUTTONDOWN:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
+        g_pressedId=hitTest(hwnd,mx,my); // which control is being held
         if(g_lockKind!=LOCK_NONE){
             if(!g_lockRedirectUrl.empty()){
                 RECT crL;GetClientRect(hwnd,&crL);
