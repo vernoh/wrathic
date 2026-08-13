@@ -12977,6 +12977,8 @@ int  fontDropHov=-1;
 HFONT hFontBig, hFontMed, hFontSmall, hFontMono;
 HWND hwndHovered=NULL;
 POINT g_lastMousePos={-1,-1};
+// Recorded while painting the Keys card so hit testing follows the same layout.
+int g_keysBtnY=0, g_keysAddX=0, g_keysRemX=0, g_keysBtnW=30;
 // Set by drawCard() whenever a card's hover fade is mid-flight, so the animation
 // tick knows to keep painting after the mouse has stopped moving.
 bool g_cardAnimActive=false;
@@ -15568,10 +15570,10 @@ Layout getLayout(HWND hwnd){
     RECT cr;GetClientRect(hwnd,&cr);
     Layout l;l.W=cr.right;l.pad=14;l.cw=l.W-l.pad*2;
     int off=-mainScrollPos; // scroll offset
-    l.yHotkey      =70 +off;
+    l.yHotkey      =58 +off;
     l.yMode        =l.yHotkey +68;
     l.yKeys        =l.yMode   +68;
-    l.yKps         =l.yKeys   +124;
+    l.yKps         =l.yKeys   +102;
     l.yVouch       =l.yKps    +102;
     mainTotalHeight=l.yVouch+54+mainScrollPos; // last card + padding
     return l;
@@ -15580,10 +15582,14 @@ Layout getLayout(HWND hwnd){
 int hitTest(HWND hwnd,int mx,int my){
     Layout l=getLayout(hwnd);int p=l.pad;
     if(mx>=p+108&&mx<=p+224&&my>=l.yHotkey+22&&my<=l.yHotkey+50) return ID_SET_HOTKEY;
-    if(mx>=p+14 &&mx<=p+112&&my>=l.yMode+22  &&my<=l.yMode+50)   return ID_MODE_TOGGLE;
-    if(mx>=p+120&&mx<=p+218&&my>=l.yMode+22  &&my<=l.yMode+50)   return ID_MODE_HOLD;
-    if(mx>=p+14 &&mx<=p+50 &&my>=l.yKeys+82  &&my<=l.yKeys+106)   return ID_ADD_KEY;
-    if(mx>=p+56 &&mx<=p+92 &&my>=l.yKeys+82  &&my<=l.yKeys+106)   return ID_REMOVE_KEY;
+    // Single switch: the whole row toggles between Toggle and Hold.
+    if(mx>=p+14 &&mx<=p+l.cw-8&&my>=l.yMode+24 &&my<=l.yMode+52)   return ID_MODE_TOGGLE;
+    // Follows the positions the paint recorded, so the buttons stay hittable
+    // wherever the card lays them out.
+    if(g_keysBtnY){
+        if(mx>=g_keysAddX&&mx<=g_keysAddX+g_keysBtnW&&my>=g_keysBtnY&&my<=g_keysBtnY+26) return ID_ADD_KEY;
+        if(mx>=g_keysRemX&&mx<=g_keysRemX+g_keysBtnW&&my>=g_keysBtnY&&my<=g_keysBtnY+26) return ID_REMOVE_KEY;
+    }
     int pw=44,pg=5,px=p+14;
     for(int i=0;i<KPS_PRESET_COUNT;i++){
         if(mx>=px&&mx<=px+pw&&my>=l.yKps+56&&my<=l.yKps+78)return 500+i;
@@ -16007,43 +16013,56 @@ void paintMain(HWND hwnd){
     // MODE CARD
     drawCard(hdc,p,y,cw,58);
     drawText(hdc,L"MODE",p+16,y+10,200,14,T.subtext,hFontSmall);
+    // One switch rather than two buttons: this is a binary choice, and a pair of
+    // pills where one is always lit reads as two separate controls. The label says
+    // which way it is set, and what that means.
     bool isHold=holdMode.load();
-    // Smooth mode buttons using animModeHold (0=Toggle active, 1=Hold active)
-    float mh=easeInOut(animModeHold);
-    COLORREF togBg=lerpCol(T.accent,lerpCol(T.btn,T.btnHov,getHoverAlpha(ID_MODE_TOGGLE)),mh);
-    COLORREF holBg=lerpCol(lerpCol(T.btn,T.btnHov,getHoverAlpha(ID_MODE_HOLD)),T.accent,mh);
-    COLORREF togText=lerpCol(T.text,T.subtext,mh);
-    COLORREF holText=lerpCol(T.subtext,T.text,mh);
-    float togH=getHoverAlpha(ID_MODE_TOGGLE),holH=getHoverAlpha(ID_MODE_HOLD);
-    drawRR(hdc,p+16, y+26,96,26,14,togBg,RGB(0,0,0),0,!isHold?0.0f:togH);
-    drawText(hdc,L"Toggle",p+16, y+26,96,26,togText,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    drawRR(hdc,p+120,y+26,96,26,14,holBg,RGB(0,0,0),0,isHold?0.0f:holH);
-    drawText(hdc,L"Hold",  p+120,y+26,96,26,holText,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,isHold?L"Hold":L"Toggle",p+16,y+28,120,22,T.text,hFontSmall,
+             DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,isHold?L"fires while held":L"press to start and stop",
+             p+16,y+28,cw-90,22,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    drawToggle(hdc,p+cw-56,y+28,isHold);
     y=l.yKeys;
 
     // KEYS CARD
-    drawCard(hdc,p,y,cw,114);
+    // The add/remove buttons used to sit on their own line under a gap the key chips
+    // rarely filled, which left the card looking half-drawn. They now sit on the same
+    // row as the chips, pushed to the right, so the card is the same height whether
+    // there is one key or six.
+    drawCard(hdc,p,y,cw,92);
     drawText(hdc,L"KEYS TO SPAM",p+16,y+10,cw-32,14,T.subtext,hFontSmall);
-    drawText(hdc,L"M1 = lower CPU, less stable KPS",p+16,y+26,cw-32,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"M1 costs less CPU but holds KPS less steadily",p+16,y+26,cw-32,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     EnterCriticalSection(&keyListCS);
     std::vector<int> keys=keysToSend;
     LeaveCriticalSection(&keyListCS);
-    int kx=p+14,ky=y+42;
-    if(keys.empty()){
-        drawText(hdc,L"No keys - tap + to add",kx,ky,cw-28,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    }else{
-        for(int vk:keys){
-            drawRR(hdc,kx,ky,50,22,6,T.btn,T.border,1);
-            drawText(hdc,vkToString(vk).c_str(),kx,ky,50,22,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            kx+=56;if(kx>W-p-70){kx=p+14;ky+=26;}
+    {
+        float addHov=getHoverAlpha(ID_ADD_KEY);
+        float remHov=getHoverAlpha(ID_REMOVE_KEY);
+        int btnW=30, btnY=y+50, gap=6;
+        int remX=p+cw-16-btnW, addX=remX-btnW-gap;
+        drawRR(hdc,addX,btnY,btnW,26,13,lerpCol(T.btn,T.btnHov,addHov),RGB(0,0,0),0);
+        drawText(hdc,capturingKey?L"...":L"+",addX,btnY,btnW,26,lerpCol(T.subtext,T.accent,addHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        drawRR(hdc,remX,btnY,btnW,26,13,lerpCol(T.btn,T.btnHov,remHov),RGB(0,0,0),0);
+        drawText(hdc,L"\u2212",remX,btnY,btnW,26,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        g_keysBtnY=btnY; g_keysAddX=addX; g_keysRemX=remX; g_keysBtnW=btnW;
+
+        int kx=p+16, ky=btnY+1, avail=addX-gap-kx;
+        if(keys.empty()){
+            drawText(hdc,capturingKey?L"press any key...":L"none yet - tap + to add one",
+                     kx,ky,avail,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        } else {
+            for(size_t i=0;i<keys.size();i++){
+                if(kx+46>addX-gap){ // ran out of room - say how many are hidden
+                    wchar_t more[24]; swprintf(more,24,L"+%d",(int)(keys.size()-i));
+                    drawText(hdc,more,kx,ky,40,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+                    break;
+                }
+                drawRR(hdc,kx,ky,44,24,7,T.btn,T.border,1);
+                drawText(hdc,vkToString(keys[i]).c_str(),kx,ky,44,24,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                kx+=50;
+            }
         }
     }
-    float addHov=getHoverAlpha(ID_ADD_KEY);
-    float remHov=getHoverAlpha(ID_REMOVE_KEY);
-    drawRR(hdc,p+16,y+84,32,22,12,lerpCol(T.btn,T.btnHov,addHov),RGB(0,0,0),0);
-    drawText(hdc,capturingKey?L"...":L"+",p+16,y+84,32,22,lerpCol(T.subtext,T.accent,addHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    drawRR(hdc,p+54,y+84,32,22,12,lerpCol(T.btn,T.btnHov,remHov),RGB(0,0,0),0);
-    drawText(hdc,L"\u2212",p+54,y+84,32,22,lerpCol(T.subtext,T.text,remHov),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     y=l.yKps;
 
     // KPS CARD - presets inside
@@ -17424,7 +17443,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             int mxU=GET_X_LPARAM(lp), myU=GET_Y_LPARAM(lp);
             if(mxU>=pU+16&&mxU<=pU+cwU-16&&myU>=g_tbLay.yEnable&&myU<=g_tbLay.yEnable+30){
                 playClick();
-                ShellExecuteW(NULL,L"open",L"https://discord.gg/wrathic",NULL,NULL,SW_SHOW);
+                ShellExecuteW(NULL,L"open",L"https://discord.gg/MhdqYF4n8m",NULL,NULL,SW_SHOW);
                 return 0;
             }
         }
@@ -17533,15 +17552,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             InvalidateRect(hwnd,NULL,FALSE);
         }
         if(hit==ID_MODE_TOGGLE){
-            playClick();
-            if(!holdMode){ showToast(L"Toggle mode is already enabled",RGB(99,102,241)); }
-            else { holdMode=false; LOG_OK(L"Mode set to Toggle"); showSuccessToast(L"Toggle mode enabled"); }
-            InvalidateRect(hwnd,NULL,FALSE);
-        }
-        if(hit==ID_MODE_HOLD){
-            playClick();
-            if(holdMode){ showToast(L"Hold mode is already enabled",RGB(139,92,246)); }
-            else { holdMode=true; macroRunning=false; LOG_OK(L"Mode set to Hold"); showSuccessToast(L"Hold mode enabled"); }
+            bool toHold=!holdMode.load();
+            playToggle(toHold);
+            holdMode=toHold;
+            if(toHold) macroRunning=false; // hold mode starts from idle
+            LOG_OK(toHold?L"Mode set to Hold":L"Mode set to Toggle");
+            saveSettings();
             InvalidateRect(hwnd,NULL,FALSE);
         }
         if(hit>=500&&hit<500+KPS_PRESET_COUNT){
