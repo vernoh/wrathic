@@ -15304,46 +15304,11 @@ HWND hwndSplash=NULL;
 void showSplash(HINSTANCE hInst); // forward decl - reused by WndProc's version toast click
 void fadeSplash(int from,int to,int step); // pumps messages so animation keeps running
 std::wstring splashMsg=L"Starting...";
-bool splashShowChangelog=false;
-int  splashChangelogScroll=0;
 float g_splashProgress    = 0.0f;   // target 0-1 set from WinMain
 float g_splashDisplayProg = 0.0f;   // spring-animated display value
 float g_splashVeloc       = 0.0f;   // spring velocity
 bool  g_splashDone        = false;  // triggers "hope you enjoy" phase
 float g_splashDoneAlpha   = 0.0f;   // fades in the enjoy text
-const wchar_t* CHANGELOG_TEXT =
-    L"wrathic v3.0.1\n"
-    L"====================\n\n"
-    // TODO: fill in what actually changed in this build before shipping -
-    // not auto-generating fake entries here.
-    L"\n"
-    L"v2.5.1\n"
-    L"====================\n\n"
-    L"NEW FEATURES\n"
-    L"--------------------\n"
-    L"+ Engine rewrite: instant KPS on activation\n"
-    L"+ All parry inputs fire simultaneously (batched)\n"
-    L"+ High-resolution timer for precise intervals\n"
-    L"+ Thread priority maximised (TIME_CRITICAL)\n"
-    L"+ Dual-bar overlay: wrathic vs system CPU/RAM\n"
-    L"+ Overlay themed to active colour theme\n"
-    L"+ Vouch card in settings\n"
-    L"+ License revalidation every 30s\n"
-    L"\n"
-    L"BUG FIXES\n"
-    L"--------------------\n"
-    L"~ Fixed M1 key not registering\n"
-    L"~ Fixed overlay showing 0 KPS when idle\n"
-    L"~ Fixed overlay RAM showing KB not MB\n"
-    L"~ Fixed settings buttons misaligned\n"
-    L"~ Fixed macro CPU pegging one core\n"
-    L"\n"
-    L"v2.3.0\n"
-    L"====================\n\n"
-    L"+ GDI+ anti-aliased rendering\n"
-    L"+ 60fps animations\n"
-    L"~ Fixed multiple click/toggle bugs\n"
-    L"~ Reduced idle CPU usage";
 void drawRR(HDC,int,int,int,int,int,COLORREF,COLORREF,int,float);
 // Cached splash resources - previously reloaded from disk (icon) and
 // recreated (fonts) on every single WM_PAINT, which fired at ~60fps during
@@ -15425,11 +15390,10 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // Background â€” pure black, matching the Void theme
         HBRUSH bg=CreateSolidBrush(RGB(0,0,0)); FillRect(mdc,&cr,bg); DeleteObject(bg);
 
-        if(!splashShowChangelog){
-            // â”€â”€ Void background (same drifting-stars background used by the
-            //    in-app Void theme) instead of icon + progress bar + status
-            //    text - this is now just a brief identity splash, not a
-            //    fake loading sequence. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {
+            // Void background (the same drifting stars as the in-app Void theme)
+            // instead of icon + progress bar + status text - this is a brief identity
+            // splash, not a fake loading sequence.
             drawVoidStars(mdc,W,H);
 
             SetBkMode(mdc,TRANSPARENT);
@@ -15467,64 +15431,12 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             RECT vr={0,H-16,W-8,H-2};
             DrawText(mdc,APP_VERSION,-1,&vr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
 
-        } else {
-            // â”€â”€ Changelog screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            HBRUSH hb=CreateSolidBrush(RGB(10,10,16));
-            RECT hr2={0,0,W,44}; FillRect(mdc,&hr2,hb); DeleteObject(hb);
-
-            SelectObject(mdc,s_splashFontMed); SetTextColor(mdc,RGB(99,102,241)); SetBkMode(mdc,TRANSPARENT);
-            RECT hr3={14,0,W/2,44}; DrawText(mdc,L"wrathic",-1,&hr3,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            SelectObject(mdc,s_splashFontSmall); SetTextColor(mdc,RGB(60,60,80));
-            RECT hr4={0,0,W-14,44}; DrawText(mdc,L"WHAT'S NEW",-1,&hr4,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-
-            HPEN lp2=CreatePen(PS_SOLID,1,RGB(99,102,241));
-            HPEN op3=(HPEN)SelectObject(mdc,lp2);
-            MoveToEx(mdc,0,43,NULL); LineTo(mdc,W,43);
-            SelectObject(mdc,op3); DeleteObject(lp2);
-
-            HRGN clip=CreateRectRgn(14,48,W-14,H-44);
-            SelectClipRgn(mdc,clip);
-            SelectObject(mdc,s_splashFontSmall); SetTextColor(mdc,RGB(170,170,200));
-            RECT ctr={14,48-splashChangelogScroll,W-14,48-splashChangelogScroll+2000};
-            DrawText(mdc,CHANGELOG_TEXT,-1,&ctr,DT_LEFT|DT_TOP|DT_WORDBREAK);
-            SelectClipRgn(mdc,NULL); DeleteObject(clip);
-
-            HBRUSH bb=CreateSolidBrush(RGB(10,10,16));
-            RECT br2={0,H-40,W,H}; FillRect(mdc,&br2,bb); DeleteObject(bb);
-            HPEN lp3=CreatePen(PS_SOLID,1,RGB(25,25,38));
-            HPEN op4=(HPEN)SelectObject(mdc,lp3);
-            MoveToEx(mdc,0,H-41,NULL); LineTo(mdc,W,H-41);
-            SelectObject(mdc,op4); DeleteObject(lp3);
-
-            // Continue button
-            drawRR(mdc,W/2-55,H-30,110,22,11,RGB(99,102,241),RGB(0,0,0),0,0.0f);
-            SelectObject(mdc,s_splashFontSmall); SetTextColor(mdc,RGB(255,255,255));
-            RECT cont={W/2-55,H-30,W/2+55,H-8};
-            DrawText(mdc,L"Continue",-1,&cont,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-
-            SetTextColor(mdc,RGB(40,40,55));
-            RECT sh2={0,H-40,W/2-60,H}; DrawText(mdc,L"scroll to read",-1,&sh2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
 
         BitBlt(hdc,0,0,W,H,mdc,0,0,SRCCOPY);
         SelectObject(mdc,ob); DeleteObject(bmp); DeleteDC(mdc);
         EndPaint(hwnd,&ps); return 0;
     }
-    case WM_MOUSEWHEEL:
-        if(splashShowChangelog){
-            splashChangelogScroll+=GET_WHEEL_DELTA_WPARAM(wp)>0?-30:30;
-            splashChangelogScroll=std::max(0,splashChangelogScroll);
-            InvalidateRect(hwnd,NULL,FALSE);
-        }
-        return 0;
-    case WM_LBUTTONDOWN:
-        if(splashShowChangelog){
-            RECT cr2; GetClientRect(hwnd,&cr2);
-            int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
-            int W=cr2.right,H=cr2.bottom;
-            if(mx>=W/2-55&&mx<=W/2+55&&my>=H-30&&my<=H-8) DestroyWindow(hwnd);
-        }
-        return 0;
     case WM_ERASEBKGND: return 1;
     default: return DefWindowProc(hwnd,msg,wp,lp);
     }
