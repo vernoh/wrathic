@@ -12792,8 +12792,31 @@ static void playPcm(const std::vector<short>& pcm){
         s_sndActive--;
     }).detach();
 }
+// A detent tick for sliders. Dragging fires this many times a second, so it is far
+// quieter and shorter than the button thock and has no pitch glide - a repeated
+// note with movement in it turns into a melody and grates within seconds.
+static std::vector<short> s_tickPcm;
+static void buildTickPcm(){
+    const int SR=44100;
+    const int n=(int)(SR*0.028f);
+    s_tickPcm.resize((size_t)n*2);
+    float lp=0.0f; unsigned rng=97531u;
+    for(int i=0;i<n;i++){
+        float t=(float)i/(float)SR;
+        float env=expf(-t*150.0f)*(1.0f-expf(-t*1400.0f));
+        float body=sinf(6.2831853f*430.0f*t)*0.5f;
+        rng=rng*1664525u+1013904223u;
+        float wh=((float)((rng>>16)&0xFFFF)/32768.0f)-1.0f;
+        lp+=(wh-lp)*0.10f;
+        short v=(short)std::max(-14000.0f,std::min(14000.0f,(body+lp*0.6f)*env*4200.0f));
+        s_tickPcm[(size_t)i*2]=v; s_tickPcm[(size_t)i*2+1]=v;
+    }
+}
+void playTick(){ playPcm(s_tickPcm); }
+
 static void initClickSound(){
     buildClickSound();
+    buildTickPcm();
     buildTogglePcm(s_toggleOnPcm ,300.0f,430.0f); // rising  = on
     buildTogglePcm(s_toggleOffPcm,430.0f,290.0f); // falling = off
 }
@@ -15263,7 +15286,7 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
         REAL sp=(REAL)(i*3);
         GraphicsPath sh;
         addRoundRectPathF(sh,cx-sp*0.5f+shX,cy+sp+lift*2+shY,cw+sp,ch,(REAL)R+sp*0.5f);
-        SolidBrush sb(Color((BYTE)((10-i*3)+(int)(hv*10.0f)),0,0,0));
+        SolidBrush sb(Color((BYTE)((18-i*4)+(int)(hv*12.0f)),0,0,0));
         g.FillPath(&sb,&sh);
     }
 
@@ -15323,7 +15346,7 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // 4. Border only while hovered - at rest the cards should read as shapes in the
     //    dark, not as outlined boxes.
     if(hv>0.004f){
-        Pen bp(Color((BYTE)(70*hv),255,255,255),1.0f);
+        Pen bp(Color((BYTE)(30*hv),255,255,255),1.0f);
         g.DrawPath(&bp,&body);
     }
 
@@ -15414,7 +15437,7 @@ void drawGlassPill(HDC hdc,int x,int y,int w,int h,int r){
     g.DrawLine(&hi,(REAL)(x+r),(REAL)y+0.5f,(REAL)(x+w-r),(REAL)y+0.5f);
     g.DrawArc(&hi,(REAL)(x+w-r*2),(REAL)y,(REAL)(r*2),(REAL)(r*2),270.0f,90.0f);
     g.ResetClip();
-    Pen bp(Color(34,255,255,255),1.0f);
+    Pen bp(Color(14,255,255,255),1.0f); // barely there - shadow does the separating
     g.DrawPath(&bp,&body);
 }
 
@@ -15434,7 +15457,7 @@ void drawSelBubble(HDC hdc,int x,int y,int w,int h,int r){
     LinearGradientBrush lg(Rect(x,y,w,h+1),
         Color(64,255,255,255),Color(26,255,255,255),LinearGradientModeVertical);
     g.FillPath(&lg,&body);
-    Pen bp(Color(52,255,255,255),1.0f);
+    Pen bp(Color(22,255,255,255),1.0f);
     g.DrawPath(&bp,&body);
 }
 
@@ -15485,7 +15508,7 @@ void drawCardStatic(HDC hdc,int x,int y,int w,int h,int R){
     g.DrawLine(&hi,(REAL)(x+R),(REAL)y+0.5f,(REAL)(x+w-R),(REAL)y+0.5f);
     g.DrawArc(&hi,(REAL)(x+w-R*2),(REAL)y,(REAL)(R*2),(REAL)(R*2),270.0f,90.0f);
     g.ResetClip();
-    Pen bp(Color(46,255,255,255),1.0f);
+    Pen bp(Color(16,255,255,255),1.0f);
     g.DrawPath(&bp,&body);
 }
 void drawDot(HDC hdc,int cx,int cy,int r,COLORREF c){
@@ -15960,11 +15983,10 @@ void paintMain(HWND hwnd){
 
     if(activeTab==0){
     // â”€â”€ TITLE BAR (macro tab) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    drawGlassBand(hdc,0,0,W,56,true);   // header: lit along its lower edge
-    fillRect(hdc,0,55,W,1,RGB(GetRValue(T.accent)/3,GetGValue(T.accent)/3,GetBValue(T.accent)/3));
-    if(gAppIcon) DrawIconEx(hdc,14,12,gAppIcon,28,28,0,NULL,DI_NORMAL);
-    drawText(hdc,L"WRATHIC",gAppIcon?52:16,0,120,56,T.text,hFontBig,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    drawText(hdc,APP_VERSION,W-84,0,70,56,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    drawGlassBand(hdc,0,0,W,44,true);   // header: lit along its lower edge
+    if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
+    drawText(hdc,L"WRATHIC",gAppIcon?44:16,0,140,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,APP_VERSION,W-84,0,70,44,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
 
     int y=l.yHotkey;
 
@@ -16067,6 +16089,11 @@ void paintMain(HWND hwnd){
     } // end activeTab==0
 
     // â”€â”€ SETTINGS TAB CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if(activeTab==1){
+        drawGlassBand(hdc,0,0,W,44,true);
+        if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
+        drawText(hdc,L"TRIGGERBOT",gAppIcon?44:16,0,180,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    }
     if(activeTab==1 && !hasTriggerbot){
         // Not entitled: show what it is and how to get it, rather than a dead tab.
         int ty=70;
@@ -16125,6 +16152,7 @@ void paintMain(HWND hwnd){
         {   wchar_t tb[64];
             swprintf(tb,64,L"TOLERANCE   %d",trigTolerance.load());
             drawText(hdc,tb,p+16,ty+10,220,12,T.subtext,hFontSmall);
+            drawText(hdc,L"how close a pixel must be to the colour",p+16+112,ty+10,cw-140,12,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
             int sx=p+16, sy=ty+30, sw2=cw-32;
             fillRect(hdc,sx,sy+3,sw2,3,T.btn);
             int fw=(int)((float)trigTolerance.load()/255.0f*(float)sw2);
@@ -16134,6 +16162,7 @@ void paintMain(HWND hwnd){
 
             swprintf(tb,64,L"SCAN BOX   %d px",trigBox.load());
             drawText(hdc,tb,p+16,ty+52,220,12,T.subtext,hFontSmall);
+            drawText(hdc,L"size of the square it watches, at screen centre",p+16+112,ty+52,cw-140,12,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
             int bx=p+16, by=ty+72, bw2=cw-32;
             fillRect(hdc,bx,by+3,bw2,3,T.btn);
             int bfw=(int)((float)(trigBox.load()-2)/126.0f*(float)bw2);
@@ -16516,7 +16545,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     fillRect(hdc,0,47,W,2,T.accent);
     {HFONT oldF=(HFONT)SelectObject(hdc,hFontBig);
     SetTextColor(hdc,T.text);SetBkMode(hdc,TRANSPARENT);
-    RECT hr={14,0,W-14,48};DrawText(hdc,L"SETTINGS",-1,&hr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    RECT hr={14,0,W-14,44};DrawText(hdc,L"SETTINGS",-1,&hr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     SelectObject(hdc,oldF);}
 }
 
@@ -16570,6 +16599,11 @@ void drawToasts(HDC hdc, int W, int H) {
     // Remove expired toasts (3s lifetime)
     g_toasts.erase(std::remove_if(g_toasts.begin(), g_toasts.end(),
         [now](const ToastItem& t){ return now - t.start > 3000; }), g_toasts.end());
+
+    // Bail before building any GDI+ objects when there is nothing to draw. This ran
+    // every frame regardless, and constructing a Font from an HDC queries its metrics
+    // - which is not cheap to do 60 times a second for an empty list.
+    if (g_toasts.empty()) { LeaveCriticalSection(&g_toastCS); return; }
 
     using namespace Gdiplus;
     Graphics g(hdc);
@@ -17274,7 +17308,15 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             bool draggingSlider=(wp&MK_LBUTTON)&&isInSlider(hwnd,mx,my);
             if(draggingSlider){
                 int newKps=sliderVal(hwnd,mx);
-                if(newKps!=kps.load()){ kps=newKps; InvalidateRect(hwnd,NULL,FALSE); }
+                if(newKps!=kps.load()){
+                    // A detent tick per notch, but rate-limited: the slider changes
+                    // value far faster than 25/sec while dragging, and firing on
+                    // every change turns into a buzz rather than a series of ticks.
+                    static DWORD lastTick=0;
+                    DWORD nowT=GetTickCount();
+                    if(nowT-lastTick>40){ playTick(); lastTick=nowT; }
+                    kps=newKps; InvalidateRect(hwnd,NULL,FALSE);
+                }
             } else {
                 HWND prev=hwndHovered;
                 hwndHovered=(HWND)(INT_PTR)hitTest(hwnd,mx,my);
