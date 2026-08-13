@@ -12902,6 +12902,7 @@ static void playChime(){
 #define ID_PROFILE_0     150  // three profile slots occupy 150..152
 #define ID_PROFILE_COPY  153
 #define ID_PROFILE_PASTE 154
+#define ID_BENCHMARK     155
 #define ID_ADD_KEY       103
 #define ID_REMOVE_KEY    104
 #define ID_MODE_TOGGLE   108
@@ -13030,26 +13031,31 @@ float smoothStep(float t){
 // Delta-time based smooth lerp - speed is half-life in seconds (0.05=snappy, 0.12=normal, 0.25=slow)
 // Uses exponential decay so animation speed is framerate-independent
 static DWORD lastAnimTick=0;
+// Frame delta, measured once per frame by updateAnimTick() below.
+// It has to be shared: animateTo runs many times per frame, so if each call
+// measured and consumed the elapsed time itself, the first would take the whole
+// delta and every later one would see ~0 - which stalls most of the animations in
+// the app to a crawl. QPC because GetTickCount only advances every ~15.6ms, which
+// at a 16ms timer quantises the delta to 0 / 16 / 31 and makes the motion lurch.
+float g_frameDt=1.0f/60.0f;
+
 void animateTo(float& val, float target, float halfLife){
-    // QPC, not GetTickCount. GetTickCount only advances every ~15.6ms, so against a
-    // 16ms timer the measured delta quantised to 0 / 16 / 31 and every animation in
-    // the app - hover fades, the tab slide, toasts - advanced in uneven jumps. This
-    // is the same clock problem the starfield had, and it was making all of the
-    // motion feel cheap for a reason that had nothing to do with the easing.
+    float dt=g_frameDt;
+    float diff=target-val;
+    if(fabsf(diff)<0.0005f){val=target;return;}
+    float decay=(float)exp(-0.693f*dt/std::max(halfLife,0.001f));
+    val=target+(val-target)*decay;
+}
+void updateAnimTick(){
     static LARGE_INTEGER freq={}, last={};
     if(freq.QuadPart==0){ QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
     LARGE_INTEGER nowQ; QueryPerformanceCounter(&nowQ);
     float dt=(float)((double)(nowQ.QuadPart-last.QuadPart)/(double)freq.QuadPart);
     last=nowQ;
-    if(dt<=0.0f) dt=0.016f;
-    dt=std::min(dt,0.1f); // clamp to avoid huge jumps on lag
-    float diff=target-val;
-    if(fabsf(diff)<0.0005f){val=target;return;}
-    // Exponential decay: val approaches target with given half-life
-    float decay=(float)exp(-0.693f*dt/std::max(halfLife,0.001f));
-    val=target+(val-target)*decay;
+    if(dt<=0.0f||dt>0.1f) dt=1.0f/60.0f; // idle, minimised, or a hitch
+    g_frameDt=dt;
+    lastAnimTick=GetTickCount();
 }
-void updateAnimTick(){ lastAnimTick=GetTickCount(); }
 
 // Per-button hover animation values (smooth 0->1)
 float hoverBtn[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
@@ -14692,6 +14698,118 @@ void startTriggerbotEngine(){
 void stopTriggerbotEngine(){
     gTrigThreadRun=false;
     if(gTrigThread){ WaitForSingleObject(gTrigThread,2000); CloseHandle(gTrigThread); gTrigThread=NULL; }
+}
+
+// ===== LIVE BENCHMARK =====
+// The startup benchmark times SendInput on an idle desktop, which is not the
+// condition that matters: what decides whether the macro helps or hurts is the rate
+// the machine can *sustain* while Roblox is rendering. Measured on this machine the
+// idle figure swung between 249us and 642us per call across runs, so a
+// recommendation derived from it can be out by a factor of two - and setting a rate
+// the system cannot hold means the engine spins without achieving it, stealing
+// frames from the game. Which is what dying feels like.
+//
+// This runs while the game is open, ramps through candidate rates, and reports the
+// highest one actually achieved rather than a theoretical maximum.
+std::atomic<bool> g_benchRunning{false};
+std::atomic<int>  g_benchStage{0};      // 0 idle, 1..N testing, used by the UI
+std::atomic<int>  g_benchBest{0};       // highest sustained rate measured
+std::atomic<int>  g_benchRecommend{0};
+std::wstring      g_benchMessage;
+
+// Sends a harmless key-up for a key that is not down. Windows still does the full
+// journey through the input stack, so the timing is real, but nothing reaches the
+// game as a keystroke.
+static inline void benchPulse(INPUT* pair){ SendInput(2,pair,sizeof(INPUT)); }
+
+static DWORD WINAPI benchmarkThread(LPVOID){
+    const int rates[]={200,500,800,1200,1600,2000};
+    const int nRates=(int)(sizeof(rates)/sizeof(rates[0]));
+
+    INPUT pair[2]={};
+    pair[0].type=INPUT_KEYBOARD; pair[0].ki.wVk=0; pair[0].ki.dwFlags=KEYEVENTF_KEYUP;
+    pair[1]=pair[0];
+
+    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
+    HANDLE hTimer=CreateWaitableTimerExW(NULL,NULL,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
+    if(!hTimer) hTimer=CreateWaitableTimerW(NULL,FALSE,NULL);
+    timeBeginPeriod(1);
+
+    int best=0;
+    for(int r=0;r<nRates;r++){
+        if(!g_benchRunning.load()) break;
+        g_benchStage=r+1;
+        const int target=rates[r];
+        const long long intervalTicks=freq.QuadPart/target;
+        const double windowSec=0.45;
+
+        LARGE_INTEGER t0,now; QueryPerformanceCounter(&t0);
+        long long deadline=t0.QuadPart+(long long)(freq.QuadPart*windowSec);
+        long long next=t0.QuadPart;
+        int sent=0;
+
+        while(true){
+            QueryPerformanceCounter(&now);
+            if(now.QuadPart>=deadline) break;
+            benchPulse(pair); sent++;
+            next+=intervalTicks;
+            // Same wait strategy as the click engine, so the number reflects what the
+            // engine will actually manage rather than an idealised loop.
+            long long spinFrom=next-(freq.QuadPart/2000);
+            QueryPerformanceCounter(&now);
+            if(now.QuadPart<spinFrom){
+                LONGLONG due=-(((spinFrom-now.QuadPart)*10000LL)/freq.QuadPart)*100LL;
+                if(due<-100LL){ SetWaitableTimer(hTimer,(LARGE_INTEGER*)&due,0,NULL,NULL,FALSE); WaitForSingleObject(hTimer,10); }
+            }
+            do{ QueryPerformanceCounter(&now); _mm_pause(); } while(now.QuadPart<next && g_benchRunning.load());
+        }
+
+        QueryPerformanceCounter(&now);
+        double elapsed=(double)(now.QuadPart-t0.QuadPart)/freq.QuadPart;
+        int achieved=(int)(sent/elapsed);
+        wchar_t line[192];
+        swprintf(line,192,L"Benchmark: asked %d KPS, achieved %d KPS (%.0f%%)",
+                 target,achieved,100.0*achieved/target);
+        LOG_INFO(line);
+        // Counts as sustained only if it held ~95% of the requested rate.
+        if(achieved >= (int)(target*0.95)) best=target;
+        else break; // it will only get worse from here
+    }
+
+    timeEndPeriod(1);
+    if(hTimer){ CancelWaitableTimer(hTimer); CloseHandle(hTimer); }
+
+    if(best==0) best=rates[0];
+    // Leave headroom: running at exactly the ceiling leaves the game nothing.
+    int rec=std::max(MIN_KPS,std::min(MAX_KPS,(int)(best*0.8)));
+    g_benchBest=best;
+    g_benchRecommend=rec;
+    wchar_t msg[192];
+    swprintf(msg,192,L"Sustained %d KPS. Recommended %d - applied.",best,rec);
+    g_benchMessage=msg;
+    LOG_OK(msg);
+    kps=rec;
+    saveSettings();
+    g_benchStage=0;
+    g_benchRunning=false;
+    if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+    showSuccessToast(msg);
+    return 0;
+}
+
+// Starts the benchmark, refusing if the game is not up: a measurement taken on an
+// idle desktop is the exact thing this is meant to replace.
+void startLiveBenchmark(){
+    if(g_benchRunning.load()) return;
+    if(!robloxFocused.load() && !gRobloxHwnd){
+        showToast(L"Open Roblox first - the result is only useful under game load",T.red);
+        LOG_ERR(L"Benchmark refused - Roblox is not running");
+        return;
+    }
+    g_benchRunning=true;
+    g_benchStage=1;
+    g_benchMessage=L"Measuring...";
+    CreateThread(NULL,0,benchmarkThread,NULL,0,NULL);
 }
 
 // ===================== PROFILES =====================
@@ -16456,6 +16574,7 @@ static int calcUtilsCardH(){
     int h=10;
     h+=14+6;                           // header label
     h+=28+6;                           // Optimise / Open Logs
+    h+=28+6;                           // Benchmark
     if(!cleanRamStatus.empty()){
         // Count real \n-separated segments, each further estimated for
         // word-wrap at ~40 chars/line - the old size()/32 guess ignored
@@ -16647,6 +16766,27 @@ void paintSettingsInto(HDC hdc,int W,int H){
     int hw2=(cw-28-8)/2;
     drawRR(hdc,p+14,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Optimise",p+14,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     drawRR(hdc,p+14+hw2+8,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Open Logs",p+14+hw2+8,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    // Benchmark sits on its own row: it is the one control here that changes how the
+    // macro behaves, rather than being a utility.
+    cx+=28+6;
+    {
+        bool busy=g_benchRunning.load();
+        float bh=getHoverAlpha(ID_BENCHMARK);
+        drawRR(hdc,p+14,cx,cw-28,28,8,busy?T.btn:lerpCol(T.btn,T.btnHov,bh),busy?T.accent:T.border,1);
+        std::wstring lbl;
+        if(busy){
+            int st=g_benchStage.load();
+            wchar_t t[64]; swprintf(t,64,L"Testing... step %d of 6",st<1?1:st);
+            lbl=t;
+        } else if(g_benchBest.load()>0){
+            wchar_t t[96]; swprintf(t,96,L"Benchmark  -  sustained %d KPS",g_benchBest.load());
+            lbl=t;
+        } else {
+            lbl=L"Benchmark my KPS  (Roblox must be open)";
+        }
+        drawText(hdc,lbl.c_str(),p+14,cx,cw-28,28,busy?T.accent:lerpCol(T.subtext,T.text,bh),
+                 hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
     cx+=28+6;
     if(!cleanRamStatus.empty()){
         bool done=cleanRamStatus.find(L"Freed")!=std::wstring::npos;
@@ -16865,7 +17005,7 @@ void drawToasts(HDC hdc, int W, int H) {
 
     int n = (int)g_toasts.size();
     int th = 40, tw = W - 32, tx = 16;
-    int restBottom = H - DOCK_H - 8; // bottom edge of the newest (bottom-most) toast's resting slot
+    int restBottom = H - DOCK_H - 16; // clears the floating dock pill, which sits 6px off the bottom
 
     for (int i = 0; i < n; i++) {
         auto& t = g_toasts[i];
@@ -16873,7 +17013,7 @@ void drawToasts(HDC hdc, int W, int H) {
         int targetTy = restBottom - th - slot * (th + 8);
 
         if (!t.animInit) { t.animY = (float)H; t.animInit = true; } // starts hidden behind the dock
-        animateTo(t.animY, (float)targetTy, 0.09f); // Apple-ish snappy-but-smooth slide
+        animateTo(t.animY, (float)targetTy, 0.055f); // quick in, then settles
 
         float elapsed = (float)(now - t.start);
         float alpha = 1.0f;
@@ -17107,6 +17247,8 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       int hw=(cw-28-8)/2;
       if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();g_optimiseConfirmOpen=true;InvalidateRect(hwnd,NULL,FALSE);}
       if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",dataPath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
+      cx+=28+6;
+      if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+28){ playClick(); startLiveBenchmark(); InvalidateRect(hwnd,NULL,FALSE); }
     }
 
     // â”€â”€ APPEARANCE CARD (l.yFont = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -17468,6 +17610,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             break;
         }
         if(wp==TIMER_ANIM){
+            updateAnimTick(); // must run before any animateTo this frame
             // Throttle: if minimised to tray, skip all rendering work
             static int frameCount=0;
             frameCount++;
@@ -17511,7 +17654,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             animMacroStatus=pulse*animRunning; // fade in/out with running state
 
             // Window fade-in animation (delta-time)
-            updateAnimTick();
             animateTo(fadeAlpha,1.0f,0.08f);
             animateTo(settFadeAlpha,1.0f,0.08f);
 
