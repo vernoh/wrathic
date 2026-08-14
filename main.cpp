@@ -12879,7 +12879,9 @@ static void playChime(){
             float freq=f1+(f2-f1)*std::min(1.0f,t/0.16f);
             float s=sinf(2.0f*3.14159265f*freq*t)*0.6f
                    +sinf(2.0f*3.14159265f*freq*2.0f*t)*0.15f;
-            s*=env*0.5f;
+            // A toast is a confirmation, not an event. At half this level it was the
+            // loudest thing the app did, for the least important thing it says.
+            s*=env*0.16f;
             short v=(short)std::max(-32000.0f,std::min(32000.0f,s*32000.0f));
             pcm[(size_t)i*2]=v; pcm[(size_t)i*2+1]=v;
         }
@@ -13645,6 +13647,10 @@ void showTrayIcon(HWND hwnd) {
     addTrayIcon(hwnd);
     trayIconVisible = true;
 }
+// The icon now stays for the whole life of the process rather than appearing only
+// while hidden - it is how you find a window you have lost behind a game, and a tray
+// entry that comes and goes is one people stop looking for. showTrayIcon already
+// guards on trayIconVisible, so there can only ever be one.
 void hideTrayIcon() {
     if (!trayIconVisible) return;
     removeTrayIcon();
@@ -15561,6 +15567,8 @@ bool licCopied = false;
 // should open on the simple thing, and advanced is a place you go rather than a mode
 // you get stuck in.
 bool g_advancedMode=false;
+float g_modeSwitchPos=0.0f;  // 0 basic, 1 advanced - spring target, not a snap
+float g_modeSwitchVel=0.0f;
 int  g_advScroll=0;          // step list scroll, in rows
 bool g_advBinding=false;     // waiting for a key for the selected macro
 bool g_sliderDragging=false;  // mouse captured for a slider drag
@@ -16117,7 +16125,9 @@ Layout getLayout(HWND hwnd){
     RECT cr;GetClientRect(hwnd,&cr);
     Layout l;l.W=cr.right;l.pad=14;l.cw=l.W-l.pad*2;
     int off=-mainScrollPos; // scroll offset
-    l.yHotkey      =58 +off;
+    // Below the mode switch, which sits below the 44px header. The switch used to be
+    // drawn at yHotkey-40, which put it straight through the wrathic wordmark.
+    l.yHotkey      =96 +off;
     l.yMode        =l.yHotkey +68;
     l.yKeys        =l.yMode   +68;
     l.yKps         =l.yKeys   +102;
@@ -16545,10 +16555,14 @@ void paintMain(HWND hwnd){
     // Two tabs, because "advanced" is a different job rather than more knobs on the
     // same one. Drawn first so it sits above whichever panel follows.
     {
-        int sw=(cw-4)/2, sy=l.yHotkey-40;
+        int sw=(cw-4)/2, sy=l.yHotkey-38;
         drawRR(hdc,p,sy,cw,30,15,T.surface,T.border,1);
-        drawRR(hdc,g_advancedMode?p+2+sw:p+2,sy+2,sw,26,13,T.card,T.border,1);
-        drawText(hdc,L"Basic macro",p+2,sy+2,sw,26,
+        // The selection slides between the two halves on the same spring as the dock,
+        // rather than jumping - the two live a few pixels apart and had no business
+        // behaving differently.
+        int bubbleX = p + 2 + (int)(g_modeSwitchPos * sw);
+        drawSelBubble(hdc,bubbleX,sy+2,sw,26,13);
+        drawText(hdc,L"Basic",p+2,sy+2,sw,26,
                  g_advancedMode?T.subtext:T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         drawText(hdc,L"Advanced",p+2+sw,sy+2,sw,26,
                  g_advancedMode?T.text:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -16624,8 +16638,18 @@ void paintMain(HWND hwnd){
         int listH=170;
         drawCard(hdc,p,ay,cw,listH);
         {
+            // While recording, show the capture buffer rather than the saved macro, so
+            // the list fills in as you go. Copied under the lock because the hook
+            // callbacks append to it from the message loop.
+            std::vector<Step> live;
+            if(g_advRecording.load()){
+                advLock();
+                live=g_advCapture;
+                advUnlock();
+            }
             const AdvMacro* m=(g_advSelected<(int)g_advMacros.size())?&g_advMacros[g_advSelected]:NULL;
-            int count=m?(int)m->steps.size():0;
+            const std::vector<Step>* src = g_advRecording.load() ? &live : (m?&m->steps:NULL);
+            int count=src?(int)src->size():0;
             wchar_t hdr[96];
             if(m && m->recW) swprintf(hdr,96,L"STEPS  \u00b7  %d  \u00b7  recorded at %dx%d",count,m->recW,m->recH);
             else            swprintf(hdr,96,L"STEPS  \u00b7  %d",count);
@@ -16638,21 +16662,25 @@ void paintMain(HWND hwnd){
             drawText(hdc,L"clear",p+cw-16-56,ay+6,56,20,lerpCol(T.subtext,T.text,ch2),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
             if(!count){
-                drawText(hdc,L"Nothing recorded yet.\nHit record, do the thing, hit stop.",
+                drawText(hdc,g_advRecording.load()?L"Recording...\nEverything you do lands here."
+                                                  :L"Nothing recorded yet.\nHit record, do the thing, hit stop.",
                          p+16,ay+62,cw-32,40,T.subtext,hFontSmall,DT_CENTER|DT_WORDBREAK);
             } else {
                 int rowH=18, rows=(listH-40)/rowH;
+                // Follow the tail while recording; a list that fills up off-screen is
+                // no more useful than no list at all.
+                if(g_advRecording.load()) g_advScroll=count-rows;
                 if(g_advScroll>count-rows) g_advScroll=count-rows;
                 if(g_advScroll<0) g_advScroll=0;
                 int depth=0;
                 for(int i=0;i<g_advScroll && i<count;i++){
-                    if(m->steps[i].kind==ST_LOOP_START) depth++;
-                    else if(m->steps[i].kind==ST_LOOP_END && depth>0) depth--;
+                    if((*src)[i].kind==ST_LOOP_START) depth++;
+                    else if((*src)[i].kind==ST_LOOP_END && depth>0) depth--;
                 }
                 for(int r=0;r<rows;r++){
                     int i=g_advScroll+r;
                     if(i>=count) break;
-                    const Step& st=m->steps[i];
+                    const Step& st=(*src)[i];
                     if(st.kind==ST_LOOP_END && depth>0) depth--;
                     wchar_t line[128];
                     switch(st.kind){
@@ -17436,7 +17464,10 @@ void drawToasts(HDC hdc, int W, int H) {
     fmt.SetTrimming(StringTrimmingEllipsisCharacter);
 
     int n = (int)g_toasts.size();
-    int th = 40, tw = W - 32, tx = 16;
+    // Smaller and narrower than before. A toast is a receipt, not an announcement -
+    // full width at 40px tall read as a dialog appearing every time you nudged a
+    // slider.
+    int th = 30, tw = W - 88, tx = 44;
     int restBottom = H - DOCK_H - 16; // clears the floating dock pill, which sits 6px off the bottom
 
     for (int i = 0; i < n; i++) {
@@ -17462,16 +17493,18 @@ void drawToasts(HDC hdc, int W, int H) {
 
         // Expand slightly on hover - grows outward from centre, doesn't
         // shift the toast's anchor position
-        int expand=(int)(4*hv);
+        int expand=(int)(2*hv);
         int ty = tyBase - expand;
         int txH = tx - expand, twH = tw + expand*2, thH = th + expand*2;
 
+        // Barely tinted. The colour belongs on the one dot that carries the meaning,
+        // not washed across the whole surface.
         COLORREF bg = RGB(
-            (int)(GetRValue(t.col)*0.15f + GetRValue(T.card)*0.85f),
-            (int)(GetGValue(t.col)*0.15f + GetGValue(T.card)*0.85f),
-            (int)(GetBValue(t.col)*0.15f + GetBValue(T.card)*0.85f));
+            (int)(GetRValue(t.col)*0.06f + GetRValue(T.card)*0.94f),
+            (int)(GetGValue(t.col)*0.06f + GetGValue(T.card)*0.94f),
+            (int)(GetBValue(t.col)*0.06f + GetBValue(T.card)*0.94f));
 
-        int rr=10, d=rr*2;
+        int rr=8, d=rr*2;
         GraphicsPath path;
         path.AddArc(txH,ty,d,d,180,90);
         path.AddArc(txH+twH-d,ty,d,d,270,90);
@@ -17483,30 +17516,17 @@ void drawToasts(HDC hdc, int W, int H) {
         // Border brightens on hover (border alpha isn't scaled by a here since
         // BYTE + float mixing needs the cast; hoverBorderA stays full-alpha
         // multiplied by the toast's own fade alpha)
-        BYTE hoverBorderA=(BYTE)std::min(255.0f,a*(1.0f+hv*0.3f));
-        Pen borderPen(Color(hoverBorderA,GetRValue(t.col),GetGValue(t.col),GetBValue(t.col)),1.0f+hv*0.6f);
+        // A hairline, not a lit outline, and no accent bar down the side.
+        BYTE borderA=(BYTE)std::min(255.0f,a*(0.35f+hv*0.25f));
+        Pen borderPen(Color(borderA,255,255,255),1.0f);
         g.DrawPath(&borderPen,&path);
 
-        SolidBrush accentBrush(Color(a,GetRValue(t.col),GetGValue(t.col),GetBValue(t.col)));
-        g.FillRectangle(&accentBrush,(REAL)(txH+1),(REAL)(ty+6),3.0f,(REAL)(thH-12));
-
-        int textX = txH+12;
-        if (t.icon==TOAST_CHECK) {
-            int iconCx=txH+12+9, iconCy=ty+thH/2;
-            for(int gi=4;gi>=1;gi--){
-                int rad=6+gi*3;
-                BYTE ga=(BYTE)(alpha*std::max(2,14-gi*2));
-                SolidBrush glow(Color(ga,GetRValue(T.green),GetGValue(T.green),GetBValue(T.green)));
-                g.FillEllipse(&glow,iconCx-rad,iconCy-rad,rad*2,rad*2);
-            }
-            SolidBrush circleBrush(Color(a,GetRValue(T.green),GetGValue(T.green),GetBValue(T.green)));
-            g.FillEllipse(&circleBrush,iconCx-9,iconCy-9,18,18);
-            Pen checkPen(Color(a,255,255,255),2.0f);
-            checkPen.SetStartCap(LineCapRound); checkPen.SetEndCap(LineCapRound);
-            g.DrawLine(&checkPen,(REAL)(iconCx-4),(REAL)(iconCy),(REAL)(iconCx-1),(REAL)(iconCy+3));
-            g.DrawLine(&checkPen,(REAL)(iconCx-1),(REAL)(iconCy+3),(REAL)(iconCx+5),(REAL)(iconCy-4));
-            textX = iconCx+9+8;
-        }
+        // One small dot in the toast's colour is enough to say what kind it is. The
+        // circled tick with four glow passes was more artwork than the message.
+        int dotCx=txH+14, dotCy=ty+thH/2;
+        SolidBrush dot(Color(a,GetRValue(t.col),GetGValue(t.col),GetBValue(t.col)));
+        g.FillEllipse(&dot,(REAL)(dotCx-3),(REAL)(dotCy-3),6.0f,6.0f);
+        int textX = dotCx+12;
 
         SolidBrush textBrush(Color(a,GetRValue(T.text),GetGValue(T.text),GetBValue(T.text)));
         RectF layoutRect((REAL)textX,(REAL)ty,(REAL)(txH+twH-(textX-txH)-8),(REAL)thH);
@@ -18221,6 +18241,13 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     g_tabVel+=accel*sdt;
                     g_tabPos+=g_tabVel*sdt;
                     if(fabsf(tabTarget-g_tabPos)<0.0008f&&fabsf(g_tabVel)<0.01f){ g_tabPos=tabTarget; g_tabVel=0.0f; }
+                    // Same spring, same constants, for the Basic/Advanced switch.
+                    float mTarget=g_advancedMode?1.0f:0.0f;
+                    float mAccel=(mTarget-g_modeSwitchPos)*k - g_modeSwitchVel*damp;
+                    g_modeSwitchVel+=mAccel*sdt;
+                    g_modeSwitchPos+=g_modeSwitchVel*sdt;
+                    if(fabsf(mTarget-g_modeSwitchPos)<0.0008f&&fabsf(g_modeSwitchVel)<0.01f){ g_modeSwitchPos=mTarget; g_modeSwitchVel=0.0f; }
+                    else if(activeTab==0) InvalidateRect(hwnd,NULL,FALSE);
                 }
             }
 
@@ -18299,6 +18326,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
                 if(g_optimiseRunning||g_optimiseDecisionPending) needRepaint=true;
                 if(g_kpsEditing) needRepaint=true;
+                if(g_advRecording.load()) needRepaint=true;   // step list is filling
                 if(g_cardAnimActive) needRepaint=true; // card hover fade still settling
                 // Active toasts need continuous repaints too (slide-in/stack
                 // animation, fade in/out) - a single InvalidateRect from
@@ -18624,7 +18652,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(activeTab==0){
             Layout la=getLayout(hwnd);
             int pa=la.pad, cwa=la.cw;
-            int sw=(cwa-4)/2, sy=la.yHotkey-40;
+            int sw=(cwa-4)/2, sy=la.yHotkey-38;
             if(my>=sy&&my<=sy+30&&mx>=pa&&mx<=pa+cwa){
                 playClick();
                 g_advancedMode = (mx >= pa+2+sw);
@@ -18901,8 +18929,7 @@ int maxS=std::max(0,(int)contentH6-(int)cr5.bottom);
     }
     case WM_CLOSE:
         if(minimiseToTray){
-            ShowWindow(hwnd, SW_HIDE);
-            showTrayIcon(hwnd);
+            ShowWindow(hwnd, SW_HIDE);   // icon is already there, nothing to add
         } else {
             hideTrayIcon();
             DestroyWindow(hwnd);
@@ -18912,7 +18939,6 @@ int maxS=std::max(0,(int)contentH6-(int)cr5.bottom);
         if(lp==WM_LBUTTONDBLCLK||lp==WM_LBUTTONUP){
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
-            hideTrayIcon();
         } else if(lp==WM_RBUTTONUP){
             POINT pt; GetCursorPos(&pt);
             HMENU hMenu=CreatePopupMenu();
@@ -18925,7 +18951,6 @@ int maxS=std::max(0,(int)contentH6-(int)cr5.bottom);
             if(cmd==ID_TRAY_SHOW){
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
-                hideTrayIcon();
             } else if(cmd==ID_TRAY_EXIT){
                 hideTrayIcon();
                 DestroyWindow(hwnd);
@@ -19051,6 +19076,19 @@ bool showLicenseWindow(HINSTANCE hInst){
 
 // ===================== WINMAIN =====================
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
+    // One copy only. Two running at once means two macro engines racing on SendInput,
+    // two tray icons, and two processes writing the same settings - the second one to
+    // exit wins and the first one's changes vanish. Raise the existing window instead,
+    // which is what someone double-clicking the exe again actually wants.
+    HANDLE hOnce=CreateMutexW(NULL,TRUE,L"Global\\wrathic_single_instance");
+    if(hOnce && GetLastError()==ERROR_ALREADY_EXISTS){
+        HWND prev=FindWindowW(L"MApp_91x",NULL);
+        if(prev){
+            ShowWindow(prev,SW_RESTORE);
+            SetForegroundWindow(prev);
+        }
+        return 0;
+    }
     // If launched with /tray, start hidden in tray
     bool startHidden=(lpCmdLine&&strstr(lpCmdLine,"/tray")!=nullptr);
     if(startHidden)nCmdShow=SW_HIDE;
@@ -19153,6 +19191,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,CW_USEDEFAULT,APP_W,APP_H,
         NULL,NULL,hInst,NULL);
+    if(hwnd) showTrayIcon(hwnd);   // present for the whole session, added exactly once
 
     // Set window frame icon (system menu + taskbar)
     {wchar_t ep2[MAX_PATH]={};GetModuleFileNameW(NULL,ep2,MAX_PATH);
