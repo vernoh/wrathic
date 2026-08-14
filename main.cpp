@@ -14206,8 +14206,14 @@ void captureTriggerKey(){
                 continue;
             }
             if(GetAsyncKeyState(vk)&0x8000){
-                trigKey=vk;
                 g_tbCapturing=false;
+                // Both engines can run at once, so the one thing that must not happen
+                // is them sharing a bind - one press would arm both.
+                if(vk==hotkeyVK.load()){
+                    showToast((vkToString(vk)+L" is the macro hotkey - pick another").c_str(),T.red);
+                    break;
+                }
+                trigKey=vk;
                 saveSettings();
                 std::wstring msg=L"Trigger key set to: "+vkToString(vk);
                 LOG_OK(msg.c_str());
@@ -14228,7 +14234,12 @@ void captureThread(bool isHotkey){
             // Allow all keys including mouse buttons as hotkey
             if(GetAsyncKeyState(vk)&0x8000){
                 if(isHotkey){
-                    hotkeyVK=vk;capturingHotkey=false;
+                    capturingHotkey=false;
+                    if(triggerbotEnabled.load() && vk==trigKey.load()){
+                        showToast((vkToString(vk)+L" is the triggerbot key - pick another").c_str(),T.red);
+                        break;
+                    }
+                    hotkeyVK=vk;
                     std::wstring msg=L"Hotkey set to: "+vkToString(vk);
                     LOG_OK(msg.c_str());
                     showSuccessToast(msg.c_str());
@@ -14265,8 +14276,9 @@ void hotkeyThread(){
         if(!capturingHotkey&&!capturingKey){
             bool focused=robloxFocused.load();
             bool pressed=(GetAsyncKeyState(hotkeyVK.load())&0x8000)!=0;
-            // Both engines drive SendInput; only one may hold the input at a time.
-            if(pressed && triggerbotEnabled.load()){ triggerbotEnabled=false; saveSettings(); }
+            // The two engines may run together. They interleave on SendInput without
+            // trouble; what does not work is sharing a bind, which is refused at the
+            // point the bind is set rather than by disabling one here.
             if(holdMode){
                 bool prev=macroRunning.load();
                 macroRunning=pressed&&focused;
@@ -14953,9 +14965,9 @@ static void profileApply(const Profile& p){
             keysToSend.push_back(v);
     LeaveCriticalSection(&keyListCS);
     rebuildInputBuf();
-    // Loading a profile must not silently start the triggerbot: the two engines are
-    // mutually exclusive, and having a profile flip which one is armed behind the
-    // user's back is the sort of surprise that costs someone a match.
+    // Loading a profile still does not arm the triggerbot. The two can run together
+    // now, but having a profile switch one on behind the user's back is the sort of
+    // surprise that costs someone a match.
     trigHoldMode=p.tbHold; trigKey=p.tbKey;
     trigR=p.tbR; trigG=p.tbG; trigB=p.tbB;
     trigTolerance=p.tbTol; trigBox=p.tbBox;
@@ -17924,9 +17936,11 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     playToggle();
                     bool now=!triggerbotEnabled.load();
                     triggerbotEnabled=now;
-                    // The two engines both drive SendInput; running them together
-                    // would interleave presses, so enabling one stops the other.
-                    if(now){ macroRunning=false; showToast(L"Triggerbot enabled - macro disabled",T.green); }
+                    if(now && trigKey.load()==hotkeyVK.load()){
+                        // Same bind means one keypress arms both, and neither behaves.
+                        triggerbotEnabled=false;
+                        showToast(L"Triggerbot needs its own key - it shares the macro hotkey",T.red);
+                    } else if(now) showToast(L"Triggerbot enabled",T.green);
                     saveSettings(); handled=true;
                 }
                 // rebind key
