@@ -12911,6 +12911,15 @@ static void playChime(){
 #define ID_PROFILE_ASSIGN_0 156     // "-> Slot N" buttons occupy 156..158
 // Slots + hint + copy + paste box + assign row.
 #define PROFILE_CARD_H   188
+// Advanced macro widgets. 160..167 are the per-macro slot chips.
+#define ID_ADV_BASIC     170
+#define ID_ADV_ADVANCED  171
+#define ID_ADV_RECORD    172
+#define ID_ADV_PLAY      173
+#define ID_ADV_BIND      174
+#define ID_ADV_LOOP      175
+#define ID_ADV_CLEAR     176
+#define ID_ADV_SLOT_0    160
 #define ID_ADD_KEY       103
 #define ID_REMOVE_KEY    104
 #define ID_MODE_TOGGLE   108
@@ -15068,6 +15077,17 @@ static void advThinMoves(std::vector<Step>& v,double tolPx){
         if(dist>tolPx) out.push_back(v[i]);   // a real corner, keep it
     }
     v.swap(out);
+
+    // Thinning leaves the gaps of the points it dropped, so the list fills with
+    // consecutive waits. Fold them into one - same total time, a list a human can read,
+    // and one fewer sleep per pair at playback.
+    std::vector<Step> merged;
+    merged.reserve(v.size());
+    for(const Step& st : v){
+        if(st.kind==ST_DELAY && !merged.empty() && merged.back().kind==ST_DELAY) merged.back().a += st.a;
+        else merged.push_back(st);
+    }
+    v.swap(merged);
 }
 
 void advStopRecording();
@@ -15537,6 +15557,12 @@ bool licCopied = false;
 
 // Custom KPS/ms entry - click the speed label to type an exact value
 // instead of only dragging the slider or picking a preset.
+// Which half of the wrathic tab is showing. Not persisted deliberately - the app
+// should open on the simple thing, and advanced is a place you go rather than a mode
+// you get stuck in.
+bool g_advancedMode=false;
+int  g_advScroll=0;          // step list scroll, in rows
+bool g_advBinding=false;     // waiting for a key for the selected macro
 bool g_sliderDragging=false;  // mouse captured for a slider drag
 bool g_kpsEditing=false;
 bool g_kpsEditIsMs=false; // false = typing a KPS value directly, true = typing ms-between-clicks
@@ -16515,6 +16541,144 @@ void paintMain(HWND hwnd){
     drawText(hdc,L"WRATHIC",gAppIcon?44:16,0,140,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawText(hdc,APP_VERSION,W-84,0,70,44,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
 
+    // ── MODE SWITCH ──────────────────────────────────────────────────────────
+    // Two tabs, because "advanced" is a different job rather than more knobs on the
+    // same one. Drawn first so it sits above whichever panel follows.
+    {
+        int sw=(cw-4)/2, sy=l.yHotkey-40;
+        drawRR(hdc,p,sy,cw,30,15,T.surface,T.border,1);
+        drawRR(hdc,g_advancedMode?p+2+sw:p+2,sy+2,sw,26,13,T.card,T.border,1);
+        drawText(hdc,L"Basic macro",p+2,sy+2,sw,26,
+                 g_advancedMode?T.subtext:T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        drawText(hdc,L"Advanced",p+2+sw,sy+2,sw,26,
+                 g_advancedMode?T.text:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+
+    if(g_advancedMode){
+        int ay=l.yHotkey;
+
+        // ---- SLOTS ----
+        drawCard(hdc,p,ay,cw,64);
+        drawText(hdc,L"MACRO",p+16,ay+10,120,12,T.subtext,hFontSmall);
+        {
+            int n=(int)g_advMacros.size(); if(n<1) n=1;
+            int shown=n>4?4:n;
+            int sw2=(cw-32-(shown-1)*6)/shown;
+            for(int i=0;i<shown;i++){
+                int sx=p+16+i*(sw2+6);
+                bool sel=(i==g_advSelected);
+                drawRR(hdc,sx,ay+28,sw2,24,8,sel?T.card:T.btn,sel?T.accent:T.border,1);
+                wchar_t nm[32];
+                if(i<(int)g_advMacros.size()) swprintf(nm,32,L"%s",g_advMacros[i].name.c_str());
+                else swprintf(nm,32,L"Slot %d",i+1);
+                drawText(hdc,nm,sx,ay+28,sw2,24,sel?T.text:T.subtext,hFontSmall,
+                         DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            }
+        }
+        ay+=74;
+
+        // ---- RECORD + WHAT TO CAPTURE ----
+        drawCard(hdc,p,ay,cw,132);
+        bool rec=g_advRecording.load();
+        drawText(hdc,rec?L"RECORDING":L"RECORD",p+16,ay+10,140,12,rec?T.red:T.subtext,hFontSmall);
+        {
+            float rh=getHoverAlpha(ID_ADV_RECORD);
+            drawRR(hdc,p+16,ay+26,cw-32,28,14,rec?RGB(60,20,20):lerpCol(T.btn,T.btnHov,rh),
+                   rec?T.red:T.border,1);
+            drawText(hdc,rec?L"Stop recording":L"Start recording",p+16,ay+26,cw-32,28,
+                     rec?T.red:lerpCol(T.subtext,T.text,rh),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+        // Four capture switches. Unticking one stops it being recorded at all, which
+        // is why they sit next to the record button and not in a settings page.
+        {
+            const wchar_t* lbl[4]={L"Mouse movement",L"Mouse clicks",L"Scroll wheel",L"Keystrokes"};
+            bool* val[4]={&g_advRecMove,&g_advRecClicks,&g_advRecScroll,&g_advRecKeys};
+            int colW=(cw-32)/2;
+            for(int i=0;i<4;i++){
+                int bx=p+16+(i%2)*colW, by=ay+62+(i/2)*30;
+                drawRR(hdc,bx,by,16,16,4,*val[i]?T.accent:T.btn,*val[i]?T.accent:T.border,1);
+                if(*val[i]) drawText(hdc,L"\u2713",bx,by,16,16,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                drawText(hdc,lbl[i],bx+22,by,colW-26,16,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            }
+        }
+        ay+=142;
+
+        // ---- BIND + PLAY ----
+        drawCard(hdc,p,ay,cw,66);
+        drawText(hdc,L"HOTKEY",p+16,ay+10,120,12,T.subtext,hFontSmall);
+        {
+            int vk=(g_advSelected<(int)g_advMacros.size())?g_advMacros[g_advSelected].hotkey:0;
+            drawRR(hdc,p+16,ay+28,86,26,8,T.btn,g_advBinding?T.accent:T.border,1);
+            drawText(hdc,g_advBinding?L"press a key":(vk?vkToString(vk).c_str():L"unbound"),
+                     p+16,ay+28,86,26,vk?T.accent:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            bool playing=g_advPlaying.load();
+            float ph=getHoverAlpha(ID_ADV_PLAY);
+            drawRR(hdc,p+cw-16-120,ay+28,120,26,13,playing?RGB(20,60,30):lerpCol(T.btn,T.btnHov,ph),
+                   playing?T.green:T.border,1);
+            drawText(hdc,playing?L"Stop":L"Play once",p+cw-16-120,ay+28,120,26,
+                     playing?T.green:lerpCol(T.subtext,T.text,ph),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+        ay+=76;
+
+        // ---- STEPS ----
+        int listH=170;
+        drawCard(hdc,p,ay,cw,listH);
+        {
+            const AdvMacro* m=(g_advSelected<(int)g_advMacros.size())?&g_advMacros[g_advSelected]:NULL;
+            int count=m?(int)m->steps.size():0;
+            wchar_t hdr[96];
+            if(m && m->recW) swprintf(hdr,96,L"STEPS  \u00b7  %d  \u00b7  recorded at %dx%d",count,m->recW,m->recH);
+            else            swprintf(hdr,96,L"STEPS  \u00b7  %d",count);
+            drawText(hdc,hdr,p+16,ay+10,cw-140,12,T.subtext,hFontSmall);
+
+            float lh=getHoverAlpha(ID_ADV_LOOP), ch2=getHoverAlpha(ID_ADV_CLEAR);
+            drawRR(hdc,p+cw-16-116,ay+6,56,20,10,lerpCol(T.btn,T.btnHov,lh),T.border,1);
+            drawText(hdc,L"+ loop",p+cw-16-116,ay+6,56,20,lerpCol(T.subtext,T.text,lh),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            drawRR(hdc,p+cw-16-56,ay+6,56,20,10,lerpCol(T.btn,T.btnHov,ch2),T.border,1);
+            drawText(hdc,L"clear",p+cw-16-56,ay+6,56,20,lerpCol(T.subtext,T.text,ch2),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+
+            if(!count){
+                drawText(hdc,L"Nothing recorded yet.\nHit record, do the thing, hit stop.",
+                         p+16,ay+62,cw-32,40,T.subtext,hFontSmall,DT_CENTER|DT_WORDBREAK);
+            } else {
+                int rowH=18, rows=(listH-40)/rowH;
+                if(g_advScroll>count-rows) g_advScroll=count-rows;
+                if(g_advScroll<0) g_advScroll=0;
+                int depth=0;
+                for(int i=0;i<g_advScroll && i<count;i++){
+                    if(m->steps[i].kind==ST_LOOP_START) depth++;
+                    else if(m->steps[i].kind==ST_LOOP_END && depth>0) depth--;
+                }
+                for(int r=0;r<rows;r++){
+                    int i=g_advScroll+r;
+                    if(i>=count) break;
+                    const Step& st=m->steps[i];
+                    if(st.kind==ST_LOOP_END && depth>0) depth--;
+                    wchar_t line[128];
+                    switch(st.kind){
+                        case ST_MOVE:   swprintf(line,128,L"move   %d, %d",st.a,st.b); break;
+                        case ST_CLICK:  swprintf(line,128,L"%s  %s",st.b?L"press ":L"release",
+                                          st.a==1?L"right mouse":st.a==2?L"middle mouse":L"left mouse"); break;
+                        case ST_SCROLL: swprintf(line,128,L"scroll %s%d",st.a>0?L"up ":L"down ",abs(st.a)/120); break;
+                        case ST_KEY:    swprintf(line,128,L"%s  %s",st.b?L"press ":L"release",vkToString(st.a).c_str()); break;
+                        case ST_DELAY:  swprintf(line,128,L"wait   %d ms",st.a); break;
+                        case ST_LOOP_START: if(st.a<=0) swprintf(line,128,L"loop forever");
+                                            else        swprintf(line,128,L"repeat %d times",st.a); break;
+                        case ST_LOOP_END:   swprintf(line,128,L"end"); break;
+                        default: swprintf(line,128,L"?"); break;
+                    }
+                    COLORREF col = (st.kind==ST_DELAY) ? T.subtext
+                                 : (st.kind==ST_LOOP_START||st.kind==ST_LOOP_END) ? T.accent : T.text;
+                    int indent=depth*12;
+                    drawText(hdc,line,p+20+indent,ay+34+r*rowH,cw-40-indent,rowH,col,hFontSmall,
+                             DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+                    if(st.kind==ST_LOOP_START) depth++;
+                }
+            }
+        }
+        mainTotalHeight = ay+listH+40+mainScrollPos;
+    } else {
+
     int y=l.yHotkey;
 
     // ---- HOTKEY CARD ----
@@ -16638,6 +16802,7 @@ void paintMain(HWND hwnd){
         px+=pw+pg;
     }
 
+    } // end of the basic panel
     } // end activeTab==0
 
     // â”€â”€ SETTINGS TAB CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -18455,6 +18620,142 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
         }}
+        // ── mode switch + advanced panel ────────────────────────────────────
+        if(activeTab==0){
+            Layout la=getLayout(hwnd);
+            int pa=la.pad, cwa=la.cw;
+            int sw=(cwa-4)/2, sy=la.yHotkey-40;
+            if(my>=sy&&my<=sy+30&&mx>=pa&&mx<=pa+cwa){
+                playClick();
+                g_advancedMode = (mx >= pa+2+sw);
+                mainScrollPos=0;
+                InvalidateRect(hwnd,NULL,FALSE);
+                return 0;
+            }
+
+            if(g_advancedMode){
+                int ay=la.yHotkey;
+
+                // slot chips
+                {
+                    int n=(int)g_advMacros.size(); if(n<1) n=1;
+                    int shown=n>4?4:n;
+                    int sw2=(cwa-32-(shown-1)*6)/shown;
+                    for(int i=0;i<shown;i++){
+                        int sx=pa+16+i*(sw2+6);
+                        if(mx>=sx&&mx<=sx+sw2&&my>=ay+28&&my<=ay+52){
+                            playClick();
+                            if(g_advRecording.load()) advStopRecording();
+                            g_advSelected=i; g_advScroll=0; g_advBinding=false;
+                            InvalidateRect(hwnd,NULL,FALSE);
+                            return 0;
+                        }
+                    }
+                }
+                ay+=74;
+
+                // record / stop
+                if(mx>=pa+16&&mx<=pa+cwa-16&&my>=ay+26&&my<=ay+54){
+                    playClick();
+                    if(g_advRecording.load()){
+                        advStopRecording();
+                        advSaveAll();
+                        showSuccessToast(L"Recording saved");
+                    } else if(advStartRecording()){
+                        showToast(L"Recording - press stop when you are done",T.accent);
+                    } else {
+                        showToast(L"Could not start recording",T.red);
+                    }
+                    InvalidateRect(hwnd,NULL,FALSE);
+                    return 0;
+                }
+                // capture switches
+                {
+                    bool* val[4]={&g_advRecMove,&g_advRecClicks,&g_advRecScroll,&g_advRecKeys};
+                    int colW=(cwa-32)/2;
+                    for(int i=0;i<4;i++){
+                        int bx=pa+16+(i%2)*colW, by=ay+62+(i/2)*30;
+                        if(mx>=bx&&mx<=bx+colW-8&&my>=by&&my<=by+18){
+                            playToggle(!*val[i]);
+                            *val[i]=!*val[i];
+                            InvalidateRect(hwnd,NULL,FALSE);
+                            return 0;
+                        }
+                    }
+                }
+                ay+=142;
+
+                // bind
+                if(mx>=pa+16&&mx<=pa+102&&my>=ay+28&&my<=ay+54){
+                    playClick();
+                    g_advBinding=true;
+                    InvalidateRect(hwnd,NULL,FALSE);
+                    std::thread([]{
+                        // Same shape as the other capture threads: wait for a key, then
+                        // refuse it if something else already answers to it.
+                        Sleep(250);
+                        while(g_advBinding){
+                            for(int vk=1;vk<255;vk++){
+                                if(!(GetAsyncKeyState(vk)&0x8000)) continue;
+                                if(vk==VK_ESCAPE){ g_advBinding=false; break; }
+                                std::wstring who;
+                                if(advKeyInUse(vk,g_advSelected,who)){
+                                    showToast((vkToString(vk)+L" is already "+who).c_str(),T.red);
+                                } else if(g_advSelected<(int)g_advMacros.size()){
+                                    g_advMacros[g_advSelected].hotkey=vk;
+                                    advSaveAll();
+                                    showSuccessToast((L"Bound to "+vkToString(vk)).c_str());
+                                }
+                                g_advBinding=false;
+                                break;
+                            }
+                            Sleep(16);
+                        }
+                        if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+                    }).detach();
+                    return 0;
+                }
+                // play / stop
+                if(mx>=pa+cwa-16-120&&mx<=pa+cwa-16&&my>=ay+28&&my<=ay+54){
+                    playClick();
+                    if(g_advPlaying.load()) advStop(); else advPlay(g_advSelected);
+                    InvalidateRect(hwnd,NULL,FALSE);
+                    return 0;
+                }
+                ay+=76;
+
+                // + loop  /  clear
+                if(my>=ay+6&&my<=ay+26){
+                    if(mx>=pa+cwa-16-116&&mx<=pa+cwa-16-60){
+                        playClick();
+                        if(g_advSelected<(int)g_advMacros.size()){
+                            // Wraps whatever is there, which is what people mean by
+                            // "loop this" far more often than "insert an empty loop".
+                            AdvMacro& m=g_advMacros[g_advSelected];
+                            m.steps.insert(m.steps.begin(),Step(ST_LOOP_START,0,0));
+                            m.steps.push_back(Step(ST_LOOP_END,0,0));
+                            advSaveAll();
+                            showSuccessToast(L"Wrapped in a forever loop");
+                        }
+                        InvalidateRect(hwnd,NULL,FALSE);
+                        return 0;
+                    }
+                    if(mx>=pa+cwa-16-56&&mx<=pa+cwa-16){
+                        playClick();
+                        if(g_advSelected<(int)g_advMacros.size()){
+                            g_advMacros[g_advSelected].steps.clear();
+                            advSaveAll();
+                            showToast(L"Steps cleared",T.red);
+                        }
+                        g_advScroll=0;
+                        InvalidateRect(hwnd,NULL,FALSE);
+                        return 0;
+                    }
+                }
+                return 0;   // advanced mode owns the whole panel
+            }
+        }
+
         int hit=hitTest(hwnd,mx,my);
         // ID_SETTINGS_BTN handled by dock click above
 
@@ -18545,6 +18846,12 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
             settingsDirty=true;
             InvalidateRect(hwnd,NULL,FALSE);
             break;
+        }
+        if(activeTab==0 && g_advancedMode){
+            g_advScroll += (GET_WHEEL_DELTA_WPARAM(wp)>0 ? -3 : 3);
+            if(g_advScroll<0) g_advScroll=0;
+            InvalidateRect(hwnd,NULL,FALSE);
+            return 0;
         }
         if(isInSlider(hwnd,pt.x,pt.y)){
             int delta=(GET_WHEEL_DELTA_WPARAM(wp)>0?5:-5);
