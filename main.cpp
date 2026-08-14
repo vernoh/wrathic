@@ -14914,6 +14914,438 @@ void startLiveBenchmark(){
     CreateThread(NULL,0,benchmarkThread,NULL,0,NULL);
 }
 
+// ===================== ADVANCED MACRO ENGINE =====================
+// The basic macro spams one set of keys at a fixed rate. This is the other thing
+// people want: record what I actually did, then play it back, and let me edit it
+// afterwards like a list of instructions.
+//
+// Everything is one flat vector of Steps. Loops are not nested structures but paired
+// marker steps, so the list stays a list - which is what makes it editable in a plain
+// scrolling UI, reorderable by swapping two entries, and trivial to serialise. The
+// player keeps a small stack to match ends to starts.
+//
+// Coordinates are absolute, with the recording resolution stored alongside. Relative
+// deltas survive a resolution change but drift over a long recording, and drift is
+// worse than a scale factor: a macro that ends up 200px off target is useless, while
+// one scaled to a different monitor is usually still right. Playback scales when the
+// screen differs, and the UI says which resolution a macro was made at.
+enum StepKind {
+    ST_MOVE = 0,    // a.b = x,y  (in recording-resolution pixels)
+    ST_CLICK,       // a = button (0 L, 1 R, 2 M), b = 1 down / 0 up
+    ST_SCROLL,      // a = signed notches
+    ST_KEY,         // a = virtual key, b = 1 down / 0 up
+    ST_DELAY,       // a = milliseconds
+    ST_LOOP_START,  // a = 0 forever, else repeat count
+    ST_LOOP_END,
+};
+
+struct Step {
+    int kind;
+    int a, b;
+    Step(int k=ST_DELAY,int x=0,int y=0):kind(k),a(x),b(y){}
+};
+
+struct AdvMacro {
+    std::wstring      name;
+    std::vector<Step> steps;
+    int  hotkey    = 0;      // its own bind; 0 = unbound
+    bool holdToRun = false;  // hold the key vs press to toggle
+    int  recW      = 0;      // resolution this was recorded at
+    int  recH      = 0;
+};
+
+#define ADV_MAX_MACROS 8
+static std::vector<AdvMacro> g_advMacros;
+static int  g_advSelected = 0;
+
+// Recording state. The hook callbacks run on the UI thread's message loop, so they
+// must do almost nothing - append and return.
+static std::atomic<bool> g_advRecording{false};
+static HHOOK g_advMouseHook = NULL;
+static HHOOK g_advKeyHook   = NULL;
+static std::vector<Step>  g_advCapture;
+static LARGE_INTEGER      g_advLastEvent{};
+static LARGE_INTEGER      g_advFreq{};
+static CRITICAL_SECTION   g_advCS;
+static bool g_advCSInit = false;
+
+// What to capture. Unticking one of these does not hide events, it stops recording
+// them - a movement-free recording is thousands of steps smaller, not filtered later.
+static bool g_advRecMove   = true;
+static bool g_advRecClicks = true;
+static bool g_advRecScroll = true;
+static bool g_advRecKeys   = true;
+
+// Playback state.
+static std::atomic<bool> g_advPlaying{false};
+static std::atomic<int>  g_advPlayingIdx{-1};
+static HANDLE g_advPlayThread = NULL;
+
+static void advLock()   { if(g_advCSInit) EnterCriticalSection(&g_advCS); }
+static void advUnlock() { if(g_advCSInit) LeaveCriticalSection(&g_advCS); }
+
+// Time since the previous captured event, as its own DELAY step. Storing gaps rather
+// than absolute timestamps means an edit in the middle does not shift everything after
+// it, and a step can be deleted without recomputing the rest.
+static void advPushGap(){
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if(g_advLastEvent.QuadPart){
+        double ms=(double)(now.QuadPart-g_advLastEvent.QuadPart)*1000.0/(double)g_advFreq.QuadPart;
+        // Sub-millisecond gaps are noise from the hook, not intent.
+        if(ms>=1.0) g_advCapture.push_back(Step(ST_DELAY,(int)(ms+0.5),0));
+    }
+    g_advLastEvent=now;
+}
+
+static LRESULT CALLBACK advMouseProc(int code,WPARAM wp,LPARAM lp){
+    if(code==HC_ACTION && g_advRecording.load()){
+        const MSLLHOOKSTRUCT* m=(const MSLLHOOKSTRUCT*)lp;
+        advLock();
+        switch(wp){
+            case WM_MOUSEMOVE:
+                if(g_advRecMove){ advPushGap(); g_advCapture.push_back(Step(ST_MOVE,m->pt.x,m->pt.y)); }
+                break;
+            case WM_LBUTTONDOWN: if(g_advRecClicks){advPushGap();g_advCapture.push_back(Step(ST_CLICK,0,1));} break;
+            case WM_LBUTTONUP:   if(g_advRecClicks){advPushGap();g_advCapture.push_back(Step(ST_CLICK,0,0));} break;
+            case WM_RBUTTONDOWN: if(g_advRecClicks){advPushGap();g_advCapture.push_back(Step(ST_CLICK,1,1));} break;
+            case WM_RBUTTONUP:   if(g_advRecClicks){advPushGap();g_advCapture.push_back(Step(ST_CLICK,1,0));} break;
+            case WM_MBUTTONDOWN: if(g_advRecClicks){advPushGap();g_advCapture.push_back(Step(ST_CLICK,2,1));} break;
+            case WM_MBUTTONUP:   if(g_advRecClicks){advPushGap();g_advCapture.push_back(Step(ST_CLICK,2,0));} break;
+            case WM_MOUSEWHEEL:
+                if(g_advRecScroll){
+                    advPushGap();
+                    g_advCapture.push_back(Step(ST_SCROLL,GET_WHEEL_DELTA_WPARAM(m->mouseData),0));
+                }
+                break;
+            default: break;
+        }
+        advUnlock();
+    }
+    return CallNextHookEx(NULL,code,wp,lp);
+}
+
+static LRESULT CALLBACK advKeyProc(int code,WPARAM wp,LPARAM lp){
+    if(code==HC_ACTION && g_advRecording.load() && g_advRecKeys){
+        const KBDLLHOOKSTRUCT* k=(const KBDLLHOOKSTRUCT*)lp;
+        // Never record the key that starts and stops this macro. Playing it back would
+        // press its own trigger and the macro would restart itself.
+        int selfKey = (g_advSelected>=0 && g_advSelected<(int)g_advMacros.size())
+                      ? g_advMacros[g_advSelected].hotkey : 0;
+        if((int)k->vkCode != selfKey && (int)k->vkCode != hotkeyVK.load()){
+            bool down = (wp==WM_KEYDOWN || wp==WM_SYSKEYDOWN);
+            bool up   = (wp==WM_KEYUP   || wp==WM_SYSKEYUP);
+            if(down||up){
+                advLock();
+                advPushGap();
+                g_advCapture.push_back(Step(ST_KEY,(int)k->vkCode,down?1:0));
+                advUnlock();
+            }
+        }
+    }
+    return CallNextHookEx(NULL,code,wp,lp);
+}
+
+// Raw capture is ~120 near-identical points a second. A point that sits on the line
+// between its neighbours carries no information, so drop it - same path, a fraction of
+// the steps, and a list a human can actually scroll through.
+static void advThinMoves(std::vector<Step>& v,double tolPx){
+    if(v.size()<3) return;
+    std::vector<Step> out;
+    out.reserve(v.size());
+    for(size_t i=0;i<v.size();i++){
+        if(v[i].kind!=ST_MOVE){ out.push_back(v[i]); continue; }
+        // Find the previous and next MOVE with only delays between them.
+        size_t j=i+1; while(j<v.size() && v[j].kind==ST_DELAY) j++;
+        if(out.empty() || j>=v.size() || v[j].kind!=ST_MOVE){ out.push_back(v[i]); continue; }
+        size_t p=out.size(); bool havePrev=false; Step prev(ST_MOVE,0,0);
+        while(p>0){ p--; if(out[p].kind==ST_MOVE){ prev=out[p]; havePrev=true; break; } }
+        if(!havePrev){ out.push_back(v[i]); continue; }
+        double ax=prev.a, ay=prev.b, bx=v[j].a, by=v[j].b, cx=v[i].a, cy=v[i].b;
+        double dx=bx-ax, dy=by-ay;
+        double len=sqrt(dx*dx+dy*dy);
+        double dist = (len<0.001) ? sqrt((cx-ax)*(cx-ax)+(cy-ay)*(cy-ay))
+                                  : fabs(dy*cx - dx*cy + bx*ay - by*ax)/len;
+        if(dist>tolPx) out.push_back(v[i]);   // a real corner, keep it
+    }
+    v.swap(out);
+}
+
+void advStopRecording();
+
+bool advStartRecording(){
+    if(g_advRecording.load()) return false;
+    if(!g_advCSInit){ InitializeCriticalSection(&g_advCS); g_advCSInit=true; }
+    QueryPerformanceFrequency(&g_advFreq);
+    g_advLastEvent.QuadPart=0;
+    advLock(); g_advCapture.clear(); advUnlock();
+
+    g_advMouseHook = SetWindowsHookExW(WH_MOUSE_LL, advMouseProc, GetModuleHandleW(NULL), 0);
+    g_advKeyHook   = SetWindowsHookExW(WH_KEYBOARD_LL, advKeyProc, GetModuleHandleW(NULL), 0);
+    if(!g_advMouseHook && !g_advKeyHook){
+        LOG_ERR(L"Could not install input hooks - recording unavailable");
+        return false;
+    }
+    g_advRecording=true;
+    LOG_OK(L"Recording started");
+    return true;
+}
+
+void advStopRecording(){
+    if(!g_advRecording.load()) return;
+    g_advRecording=false;
+    if(g_advMouseHook){ UnhookWindowsHookEx(g_advMouseHook); g_advMouseHook=NULL; }
+    if(g_advKeyHook){   UnhookWindowsHookEx(g_advKeyHook);   g_advKeyHook=NULL; }
+
+    advLock();
+    std::vector<Step> taken; taken.swap(g_advCapture);
+    advUnlock();
+
+    size_t before=taken.size();
+    advThinMoves(taken,2.0);
+
+    if(g_advSelected<0 || g_advSelected>=(int)g_advMacros.size()) return;
+    AdvMacro& m=g_advMacros[g_advSelected];
+    m.steps=taken;
+    m.recW=GetSystemMetrics(SM_CXSCREEN);
+    m.recH=GetSystemMetrics(SM_CYSCREEN);
+    wchar_t buf[160];
+    swprintf(buf,160,L"Recorded %d steps (%d before thinning) at %dx%d",
+             (int)m.steps.size(),(int)before,m.recW,m.recH);
+    LOG_OK(buf);
+}
+
+// One step, sent. Movement is scaled if the screen is not the one it was recorded on,
+// and absolute mouse input wants 0..65535 across the virtual desktop.
+static void advSendStep(const Step& s,double sx,double sy){
+    INPUT in{};
+    switch(s.kind){
+        case ST_MOVE: {
+            int x=(int)(s.a*sx+0.5), y=(int)(s.b*sy+0.5);
+            int vw=GetSystemMetrics(SM_CXVIRTUALSCREEN), vh=GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if(vw<1) vw=1; if(vh<1) vh=1;
+            in.type=INPUT_MOUSE;
+            in.mi.dwFlags=MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK;
+            in.mi.dx=(LONG)((x*65535LL)/vw);
+            in.mi.dy=(LONG)((y*65535LL)/vh);
+            SendInput(1,&in,sizeof(INPUT));
+            break;
+        }
+        case ST_CLICK: {
+            in.type=INPUT_MOUSE;
+            if(s.a==1)      in.mi.dwFlags = s.b?MOUSEEVENTF_RIGHTDOWN :MOUSEEVENTF_RIGHTUP;
+            else if(s.a==2) in.mi.dwFlags = s.b?MOUSEEVENTF_MIDDLEDOWN:MOUSEEVENTF_MIDDLEUP;
+            else            in.mi.dwFlags = s.b?MOUSEEVENTF_LEFTDOWN  :MOUSEEVENTF_LEFTUP;
+            SendInput(1,&in,sizeof(INPUT));
+            break;
+        }
+        case ST_SCROLL: {
+            in.type=INPUT_MOUSE; in.mi.dwFlags=MOUSEEVENTF_WHEEL; in.mi.mouseData=(DWORD)s.a;
+            SendInput(1,&in,sizeof(INPUT));
+            break;
+        }
+        case ST_KEY: {
+            in.type=INPUT_KEYBOARD;
+            in.ki.wVk=(WORD)s.a;
+            in.ki.dwFlags = s.b?0:KEYEVENTF_KEYUP;
+            SendInput(1,&in,sizeof(INPUT));
+            break;
+        }
+        default: break;
+    }
+}
+
+// Waits out a gap without burning a core on it: sleep the bulk, spin the last half
+// millisecond. Same approach as the click engine, and it stays responsive to a stop
+// because it checks the flag on every pass.
+static void advWait(int ms){
+    if(ms<=0) return;
+    LARGE_INTEGER f,target,now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    target.QuadPart = now.QuadPart + (LONGLONG)((double)ms*0.001*(double)f.QuadPart);
+    while(g_advPlaying.load()){
+        QueryPerformanceCounter(&now);
+        LONGLONG left=target.QuadPart-now.QuadPart;
+        if(left<=0) break;
+        double leftMs=(double)left*1000.0/(double)f.QuadPart;
+        if(leftMs>2.0) Sleep((DWORD)(leftMs-1.0));
+        else _mm_pause();
+    }
+}
+
+static DWORD WINAPI advPlayThread(LPVOID param){
+    int idx=(int)(INT_PTR)param;
+    if(idx<0 || idx>=(int)g_advMacros.size()){ g_advPlaying=false; return 0; }
+    AdvMacro m=g_advMacros[idx];   // a copy, so editing while it runs cannot tear it
+
+    double sx=1.0, sy=1.0;
+    int curW=GetSystemMetrics(SM_CXSCREEN), curH=GetSystemMetrics(SM_CYSCREEN);
+    if(m.recW>0 && m.recH>0 && (m.recW!=curW || m.recH!=curH)){
+        sx=(double)curW/(double)m.recW;
+        sy=(double)curH/(double)m.recH;
+        wchar_t w[128];
+        swprintf(w,128,L"Macro recorded at %dx%d, playing at %dx%d - positions scaled",
+                 m.recW,m.recH,curW,curH);
+        LOG_INFO(w);
+    }
+
+    timeBeginPeriod(1);
+    // Loop bookkeeping: index of the matching start, and how many passes remain.
+    struct Frame { size_t start; int left; };
+    std::vector<Frame> stack;
+
+    for(size_t i=0; i<m.steps.size() && g_advPlaying.load(); i++){
+        const Step& s=m.steps[i];
+        switch(s.kind){
+            case ST_DELAY: advWait(s.a); break;
+            case ST_LOOP_START:
+                stack.push_back(Frame{ i, s.a<=0 ? -1 : s.a });
+                break;
+            case ST_LOOP_END: {
+                if(stack.empty()) break;      // unmatched end, ignore rather than crash
+                Frame& fr=stack.back();
+                if(fr.left<0){ i=fr.start; }               // forever
+                else if(--fr.left>0){ i=fr.start; }        // another pass
+                else stack.pop_back();                     // done
+                break;
+            }
+            default: advSendStep(s,sx,sy); break;
+        }
+    }
+    timeEndPeriod(1);
+
+    // Never leave a key or button held because playback was stopped mid-press.
+    for(const Step& s : m.steps){
+        if(s.kind==ST_KEY && s.b==1){ Step up(ST_KEY,s.a,0); advSendStep(up,sx,sy); }
+        if(s.kind==ST_CLICK && s.b==1){ Step up(ST_CLICK,s.a,0); advSendStep(up,sx,sy); }
+    }
+
+    g_advPlaying=false;
+    g_advPlayingIdx=-1;
+    if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+    return 0;
+}
+
+void advPlay(int idx){
+    if(g_advPlaying.load()) return;
+    if(idx<0 || idx>=(int)g_advMacros.size()) return;
+    if(g_advMacros[idx].steps.empty()){ showToast(L"Nothing recorded yet",T.red); return; }
+    g_advPlaying=true;
+    g_advPlayingIdx=idx;
+    if(g_advPlayThread){ CloseHandle(g_advPlayThread); g_advPlayThread=NULL; }
+    g_advPlayThread=CreateThread(NULL,0,advPlayThread,(LPVOID)(INT_PTR)idx,0,NULL);
+}
+
+void advStop(){ g_advPlaying=false; g_advPlayingIdx=-1; }
+
+// ---- storage -----------------------------------------------------------------
+// One file per macro under the data folder, one step per line. Text on purpose: a
+// macro is a thing people will want to send each other, and a format you can read is
+// a format you can trust.
+static std::wstring advDir(){
+    std::wstring d = gDataDir.empty() ? L"macros" : (gDataDir + L"\\macros");
+    CreateDirectoryW(d.c_str(), NULL);
+    return d;
+}
+
+void advSaveAll(){
+    std::wstring dir=advDir();
+    for(size_t i=0;i<g_advMacros.size();i++){
+        const AdvMacro& m=g_advMacros[i];
+        wchar_t path[MAX_PATH];
+        swprintf(path,MAX_PATH,L"%s\\macro%d.wrm",dir.c_str(),(int)i);
+        FILE* f=_wfopen(path,L"w,ccs=UTF-8");
+        if(!f) continue;
+        fwprintf(f,L"# wrathic macro v1\n");
+        fwprintf(f,L"name=%s\n",m.name.c_str());
+        fwprintf(f,L"hotkey=%d\n",m.hotkey);
+        fwprintf(f,L"hold=%d\n",m.holdToRun?1:0);
+        fwprintf(f,L"res=%dx%d\n",m.recW,m.recH);
+        for(const Step& s : m.steps) fwprintf(f,L"%d %d %d\n",s.kind,s.a,s.b);
+        fclose(f);
+    }
+}
+
+void advLoadAll(){
+    g_advMacros.clear();
+    std::wstring dir=advDir();
+    for(int i=0;i<ADV_MAX_MACROS;i++){
+        wchar_t path[MAX_PATH];
+        swprintf(path,MAX_PATH,L"%s\\macro%d.wrm",dir.c_str(),i);
+        FILE* f=_wfopen(path,L"r,ccs=UTF-8");
+        if(!f) continue;
+        AdvMacro m;
+        wchar_t line[512];
+        while(fgetws(line,512,f)){
+            if(line[0]==L'#') continue;
+            if(!wcsncmp(line,L"name=",5)){ m.name=line+5; while(!m.name.empty()&&(m.name.back()==L'\n'||m.name.back()==L'\r')) m.name.pop_back(); }
+            else if(!wcsncmp(line,L"hotkey=",7)) m.hotkey=_wtoi(line+7);
+            else if(!wcsncmp(line,L"hold=",5))   m.holdToRun=_wtoi(line+5)!=0;
+            else if(!wcsncmp(line,L"res=",4))    swscanf(line+4,L"%dx%d",&m.recW,&m.recH);
+            else {
+                int k=0,a=0,b=0;
+                if(swscanf(line,L"%d %d %d",&k,&a,&b)==3 && k>=ST_MOVE && k<=ST_LOOP_END)
+                    m.steps.push_back(Step(k,a,b));
+            }
+        }
+        fclose(f);
+        if(m.name.empty()){ wchar_t n[32]; swprintf(n,32,L"Macro %d",i+1); m.name=n; }
+        g_advMacros.push_back(m);
+    }
+    // Always offer one empty slot to record into.
+    if(g_advMacros.empty()){
+        AdvMacro m; m.name=L"Macro 1";
+        g_advMacros.push_back(m);
+    }
+    if(g_advSelected>=(int)g_advMacros.size()) g_advSelected=0;
+}
+
+// Is this key already spoken for? With the basic macro, the triggerbot and up to
+// eight advanced macros all binding keys, a chain of comparisons would eventually
+// miss one - so every caller asks here instead.
+bool advKeyInUse(int vk,int ignoreMacroIdx,std::wstring& whoOut){
+    if(vk==0) return false;
+    if(vk==hotkeyVK.load()){ whoOut=L"the macro hotkey"; return true; }
+    if(triggerbotEnabled.load() && vk==trigKey.load()){ whoOut=L"the triggerbot key"; return true; }
+    for(size_t i=0;i<g_advMacros.size();i++){
+        if((int)i==ignoreMacroIdx) continue;
+        if(g_advMacros[i].hotkey==vk){ whoOut=g_advMacros[i].name; return true; }
+    }
+    return false;
+}
+
+// Watches every advanced macro's bind. One thread for all of them, because eight
+// threads each polling a key would cost more than the engine they drive.
+static DWORD WINAPI advHotkeyThread(LPVOID){
+    std::vector<bool> was(ADV_MAX_MACROS,false);
+    while(appRunning){
+        if(!g_advRecording.load()){
+            for(size_t i=0;i<g_advMacros.size() && i<ADV_MAX_MACROS;i++){
+                int vk=g_advMacros[i].hotkey;
+                if(!vk) continue;
+                bool down=(GetAsyncKeyState(vk)&0x8000)!=0;
+                if(g_advMacros[i].holdToRun){
+                    if(down && !g_advPlaying.load()) advPlay((int)i);
+                    else if(!down && g_advPlayingIdx.load()==(int)i) advStop();
+                } else {
+                    if(down && !was[i]){          // rising edge only
+                        if(g_advPlayingIdx.load()==(int)i) advStop();
+                        else if(!g_advPlaying.load()) advPlay((int)i);
+                    }
+                }
+                was[i]=down;
+            }
+        }
+        Sleep(15);
+    }
+    return 0;
+}
+
+void startAdvancedEngine(){
+    advLoadAll();
+    CreateThread(NULL,0,advHotkeyThread,NULL,0,NULL);
+}
+
 // ===================== PROFILES =====================
 // Named snapshots of everything that makes a setup: speed, keys, mode, hotkey and
 // the whole triggerbot configuration. Three slots, held in the registry alongside
@@ -18500,6 +18932,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     std::thread(focusThread).detach();
     startMacroEngine(); // start high-res timer worker
     startTriggerbotEngine(); // colour watcher; idles cheaply until enabled
+    startAdvancedEngine();   // loads saved macros and watches their binds
     profilesLoad();
     std::thread(macroThread).detach();
     std::thread(hotkeyThread).detach();
