@@ -15570,6 +15570,8 @@ bool g_advancedMode=false;
 float g_modeSwitchPos=0.0f;  // 0 basic, 1 advanced - spring target, not a snap
 float g_modeSwitchVel=0.0f;
 int  g_advScroll=0;          // step list scroll, in rows
+int  g_advSelStep=-1;        // clicked row, -1 = nothing selected
+int  g_advRowH=18;           // recorded by the paint so clicks land on the same rows
 bool g_advBinding=false;     // waiting for a key for the selected macro
 bool g_sliderDragging=false;  // mouse captured for a slider drag
 bool g_kpsEditing=false;
@@ -16666,7 +16668,7 @@ void paintMain(HWND hwnd){
                                                   :L"Nothing recorded yet.\nHit record, do the thing, hit stop.",
                          p+16,ay+62,cw-32,40,T.subtext,hFontSmall,DT_CENTER|DT_WORDBREAK);
             } else {
-                int rowH=18, rows=(listH-40)/rowH;
+                int rowH=g_advRowH, rows=(listH-40)/rowH;
                 // Follow the tail while recording; a list that fills up off-screen is
                 // no more useful than no list at all.
                 if(g_advRecording.load()) g_advScroll=count-rows;
@@ -16698,13 +16700,50 @@ void paintMain(HWND hwnd){
                     COLORREF col = (st.kind==ST_DELAY) ? T.subtext
                                  : (st.kind==ST_LOOP_START||st.kind==ST_LOOP_END) ? T.accent : T.text;
                     int indent=depth*12;
+                    if(i==g_advSelStep && !g_advRecording.load()){
+                        drawRR(hdc,p+16,ay+33+r*rowH,cw-32,rowH,4,T.btn,T.accent,1);
+                        col=T.text;
+                    }
                     drawText(hdc,line,p+20+indent,ay+34+r*rowH,cw-40-indent,rowH,col,hFontSmall,
                              DT_LEFT|DT_VCENTER|DT_SINGLELINE);
                     if(st.kind==ST_LOOP_START) depth++;
                 }
             }
         }
-        mainTotalHeight = ay+listH+40+mainScrollPos;
+        // ---- EDIT BAR ----
+        // Only meaningful with a row selected, and deliberately not shown otherwise -
+        // three dead buttons under the list would just be noise.
+        {
+            int ey=ay+listH+10;
+            const AdvMacro* m2=(g_advSelected<(int)g_advMacros.size())?&g_advMacros[g_advSelected]:NULL;
+            bool have = m2 && g_advSelStep>=0 && g_advSelStep<(int)m2->steps.size() && !g_advRecording.load();
+            if(have){
+                const Step& sel=m2->steps[g_advSelStep];
+                drawCard(hdc,p,ey,cw,66);
+                wchar_t hdr[96];
+                swprintf(hdr,96,L"STEP %d OF %d",g_advSelStep+1,(int)m2->steps.size());
+                drawText(hdc,hdr,p+16,ey+10,200,12,T.subtext,hFontSmall);
+                int bw=(cw-32-18)/4;
+                const wchar_t* lbl[4];
+                // A delay is the one step with a value worth nudging, so the two middle
+                // buttons change meaning rather than sitting greyed out.
+                bool isDelay = (sel.kind==ST_DELAY);
+                lbl[0]=L"\u2191 up"; lbl[1]=isDelay?L"\u2212 10ms":L"\u2193 down";
+                lbl[2]=isDelay?L"+ 10ms":L"duplicate"; lbl[3]=L"delete";
+                for(int b=0;b<4;b++){
+                    int bx=p+16+b*(bw+6);
+                    drawRR(hdc,bx,ey+30,bw,26,13,T.btn,b==3?T.red:T.border,1);
+                    drawText(hdc,lbl[b],bx,ey+30,bw,26,b==3?T.red:T.text,hFontSmall,
+                             DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                }
+                mainTotalHeight = ey+66+40+mainScrollPos;
+            } else {
+                if(!g_advRecording.load())
+                    drawText(hdc,L"tap a step to edit it",p+16,ey+4,cw-32,16,T.subtext,hFontSmall,
+                             DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                mainTotalHeight = ay+listH+40+mainScrollPos;
+            }
+        }
     } else {
 
     int y=l.yHotkey;
@@ -18674,7 +18713,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         if(mx>=sx&&mx<=sx+sw2&&my>=ay+28&&my<=ay+52){
                             playClick();
                             if(g_advRecording.load()) advStopRecording();
-                            g_advSelected=i; g_advScroll=0; g_advBinding=false;
+                            g_advSelected=i; g_advScroll=0; g_advBinding=false; g_advSelStep=-1;
                             InvalidateRect(hwnd,NULL,FALSE);
                             return 0;
                         }
@@ -18752,6 +18791,54 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
                 ay+=76;
 
+                // step rows
+                {
+                    int listH=170;
+                    int rows=(listH-40)/g_advRowH;
+                    AdvMacro* m=(g_advSelected<(int)g_advMacros.size())?&g_advMacros[g_advSelected]:NULL;
+                    if(m && !g_advRecording.load() && mx>=pa+16 && mx<=pa+cwa-16){
+                        for(int r=0;r<rows;r++){
+                            int ry=ay+33+r*g_advRowH;
+                            if(my>=ry && my<=ry+g_advRowH){
+                                int i=g_advScroll+r;
+                                if(i>=0 && i<(int)m->steps.size()){
+                                    playClick();
+                                    g_advSelStep = (g_advSelStep==i) ? -1 : i;  // tap again to deselect
+                                    InvalidateRect(hwnd,NULL,FALSE);
+                                }
+                                return 0;
+                            }
+                        }
+                    }
+                    // edit bar
+                    int ey=ay+listH+10;
+                    if(m && g_advSelStep>=0 && g_advSelStep<(int)m->steps.size() && !g_advRecording.load()
+                       && my>=ey+30 && my<=ey+56){
+                        int bw=(cwa-32-18)/4;
+                        for(int b=0;b<4;b++){
+                            int bx=pa+16+b*(bw+6);
+                            if(mx<bx||mx>bx+bw) continue;
+                            playClick();
+                            bool isDelay=(m->steps[g_advSelStep].kind==ST_DELAY);
+                            if(b==0){
+                                if(g_advSelStep>0){ std::swap(m->steps[g_advSelStep-1],m->steps[g_advSelStep]); g_advSelStep--; }
+                            } else if(b==1){
+                                if(isDelay){ m->steps[g_advSelStep].a=std::max(0,m->steps[g_advSelStep].a-10); }
+                                else if(g_advSelStep<(int)m->steps.size()-1){ std::swap(m->steps[g_advSelStep],m->steps[g_advSelStep+1]); g_advSelStep++; }
+                            } else if(b==2){
+                                if(isDelay) m->steps[g_advSelStep].a+=10;
+                                else m->steps.insert(m->steps.begin()+g_advSelStep+1,m->steps[g_advSelStep]);
+                            } else {
+                                m->steps.erase(m->steps.begin()+g_advSelStep);
+                                if(g_advSelStep>=(int)m->steps.size()) g_advSelStep=(int)m->steps.size()-1;
+                            }
+                            advSaveAll();
+                            InvalidateRect(hwnd,NULL,FALSE);
+                            return 0;
+                        }
+                    }
+                }
+
                 // + loop  /  clear
                 if(my>=ay+6&&my<=ay+26){
                     if(mx>=pa+cwa-16-116&&mx<=pa+cwa-16-60){
@@ -18775,7 +18862,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                             advSaveAll();
                             showToast(L"Steps cleared",T.red);
                         }
-                        g_advScroll=0;
+                        g_advScroll=0; g_advSelStep=-1;
                         InvalidateRect(hwnd,NULL,FALSE);
                         return 0;
                     }
