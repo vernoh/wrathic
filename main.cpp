@@ -14689,11 +14689,12 @@ int benchmarkSystem(){
 
 // Hit-test rectangles for the triggerbot page, filled in while painting so the click
 // handler never has to duplicate the layout arithmetic.
-struct TbLayout { int yEnable,yKey,yColour,yTune; int hueX,hueY,hueW,hueH; int tolX,tolY,tolW; int boxX,boxY,boxW; };
+struct TbLayout { int yEnable,yArm,yKey,yColour,yTune; int hueX,hueY,hueW,hueH; int tolX,tolY,tolW; int boxX,boxY,boxW; int pickX,pickY,pickW,pickH; };
 static TbLayout g_tbLay={};
 bool                g_tbCapturing=false;   // waiting for the user to press a key
 static bool         g_tbHexEditing=false;
 static std::wstring g_tbHexBuf;
+static bool g_tbArmCapturing=false;   // waiting for a key for the arm bind
 
 // Fully saturated hue -> RGB, for the colour strip.
 static void hsvToRgb(float h,float s,float v,int& R,int& G,int& B){
@@ -14727,6 +14728,8 @@ std::atomic<int>  trigTolerance{40};          // 0..255 per-channel distance
 // wide and sampled with a stride instead - 14k samples a pass rather than 130k.
 std::atomic<int>  trigBox{360};               // capture square, px
 std::atomic<int>  trigStride{3};              // sample every Nth pixel
+#define TB_BOX_MIN 16
+#define TB_BOX_MAX 600
 std::atomic<int>  trigDelayMs{0};             // optional reaction delay
 std::atomic<bool> trigHoldMode{false};        // hold while seen, vs a single tap
 // The bind that arms it. Separate from trigKey, which is the key it presses - those
@@ -17010,6 +17013,27 @@ void paintMain(HWND hwnd){
         drawToggle(hdc,p+cw-56,ty+32,triggerbotEnabled.load());
         g_tbLay.yEnable=ty; ty+=78;
 
+        // The bind that arms it, which is a different thing from the key it presses.
+        // Without this the only way to start it was the toggle above, and you cannot
+        // reach that without leaving the game.
+        drawCard(hdc,p,ty,cw,80);
+        drawText(hdc,L"ARM BIND",p+16,ty+10,180,12,T.subtext,hFontSmall);
+        {
+            int ak=trigArmKey.load();
+            drawRR(hdc,p+16,ty+30,86,24,8,T.btn,g_tbArmCapturing?T.accent:T.border,1);
+            drawText(hdc,g_tbArmCapturing?L"press a key":(ak?vkToString(ak).c_str():L"none"),
+                     p+16,ty+30,86,24,ak?T.accent:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            drawText(hdc,trigArmHold.load()?L"Hold":L"Tap",p+cw-112,ty+30,48,24,T.text,
+                     hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+            drawToggle(hdc,p+cw-56,ty+30,trigArmHold.load());
+            bool live = triggerbotEnabled.load() && (ak==0 || g_trigArmed.load());
+            drawText(hdc, ak ? (live?L"Armed - watching":L"Not armed - press your bind")
+                             : L"No bind set, so the toggle above arms it",
+                     p+16,ty+58,cw-32,14, live?T.green:T.subtext, hFontSmall,
+                     DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        }
+        g_tbLay.yArm=ty; ty+=90;
+
         drawCard(hdc,p,ty,cw,66);
         drawText(hdc,L"TRIGGER KEY",p+16,ty+10,180,12,T.subtext,hFontSmall);
         drawRR(hdc,p+16,ty+30,86,24,8,T.btn,T.border,1);
@@ -17029,6 +17053,14 @@ void paintMain(HWND hwnd){
             std::wstring shown = g_tbHexEditing ? (L"#"+g_tbHexBuf+L"_") : std::wstring(hex);
             drawText(hdc,shown.c_str(),p+70,ty+30,110,26,T.text,hFontSmall,
                      DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            // Nobody knows their ball skin's hex. Point at it and click instead.
+            bool picking=g_trigPicking.load();
+            int px2=p+188, pw2=cw-16-188;
+            drawRR(hdc,px2,ty+30,pw2,26,13,picking?T.card:T.btn,picking?T.accent:T.border,1);
+            drawText(hdc,picking?L"click the ball...":L"Pick from screen",
+                     px2,ty+30,pw2,26,picking?T.accent:T.subtext,hFontSmall,
+                     DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            g_tbLay.pickX=px2; g_tbLay.pickY=ty+30; g_tbLay.pickW=pw2; g_tbLay.pickH=26;
         }
         {   int hx=p+16, hy=ty+84, hw2=cw-32, hh=18;
             for(int i=0;i<hw2;i++){
@@ -17053,10 +17085,12 @@ void paintMain(HWND hwnd){
 
             swprintf(tb,64,L"SCAN BOX   %d px",trigBox.load());
             drawText(hdc,tb,p+16,ty+52,220,12,T.subtext,hFontSmall);
-            drawText(hdc,L"size of the square it watches, at screen centre",p+16+112,ty+52,cw-140,12,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+            drawText(hdc,L"square it watches, centred on screen",p+16+112,ty+52,cw-140,12,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
             int bx=p+16, by=ty+72, bw2=cw-32;
             fillRect(hdc,bx,by+3,bw2,3,T.btn);
-            int bfw=(int)((float)(trigBox.load()-2)/126.0f*(float)bw2);
+            // 16..600. The old slider topped out at 128, so the 360 default sat off the
+            // end of its own track and could not be dragged back.
+            int bfw=(int)((float)(trigBox.load()-TB_BOX_MIN)/(float)(TB_BOX_MAX-TB_BOX_MIN)*(float)bw2);
             fillRect(hdc,bx,by+3,bfw,3,T.accent);
             drawDot(hdc,bx+bfw,by+4,6,T.text);
             g_tbLay.boxX=bx; g_tbLay.boxY=by; g_tbLay.boxW=bw2;
@@ -18753,6 +18787,45 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     } else if(now) showToast(L"Triggerbot enabled",T.green);
                     saveSettings(); handled=true;
                 }
+                // arm bind
+                else if(mxT>=pT+16&&mxT<=pT+102&&myT>=g_tbLay.yArm+30&&myT<=g_tbLay.yArm+54){
+                    playClick(); g_tbArmCapturing=true; handled=true;
+                    std::thread([]{
+                        Sleep(300);
+                        while(g_tbArmCapturing){
+                            for(int vk=1;vk<255;vk++){
+                                if(!(GetAsyncKeyState(vk)&0x8000)) continue;
+                                if(vk==VK_ESCAPE){ trigArmKey=0; g_trigArmed=false; showToast(L"Arm bind cleared",T.subtext); }
+                                else if(vk==trigKey.load()){
+                                    showToast(L"That is the key it presses - pick another",T.red);
+                                } else if(vk==hotkeyVK.load()){
+                                    showToast(L"That is the macro hotkey - pick another",T.red);
+                                } else {
+                                    trigArmKey=vk; g_trigArmed=false;
+                                    showSuccessToast((L"Armed with "+vkToString(vk)).c_str());
+                                }
+                                saveSettings();
+                                g_tbArmCapturing=false;
+                                break;
+                            }
+                            Sleep(16);
+                        }
+                        if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+                    }).detach();
+                }
+                // arm hold / tap
+                else if(mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&myT>=g_tbLay.yArm+30&&myT<=g_tbLay.yArm+54){
+                    playToggle(); trigArmHold=!trigArmHold.load(); g_trigArmed=false; saveSettings(); handled=true;
+                }
+                // eyedropper
+                else if(mxT>=g_tbLay.pickX&&mxT<=g_tbLay.pickX+g_tbLay.pickW&&
+                        myT>=g_tbLay.pickY&&myT<=g_tbLay.pickY+g_tbLay.pickH){
+                    playClick();
+                    g_trigPicking=!g_trigPicking.load();
+                    if(g_trigPicking.load())
+                        showToast(L"Click the ball to take its colour",T.accent);
+                    handled=true;
+                }
                 // rebind key
                 else if(mxT>=pT+16&&mxT<=pT+102&&myT>=g_tbLay.yKey+30&&myT<=g_tbLay.yKey+54){
                     playClick(); g_tbCapturing=true;
@@ -18781,7 +18854,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
                 else if(mxT>=g_tbLay.boxX&&mxT<=g_tbLay.boxX+g_tbLay.boxW&&
                         myT>=g_tbLay.boxY-8&&myT<=g_tbLay.boxY+14){
-                    trigBox=std::max(2,std::min(128,2+(int)((float)(mxT-g_tbLay.boxX)/(float)g_tbLay.boxW*126.0f)));
+                    trigBox=std::max(TB_BOX_MIN,std::min(TB_BOX_MAX,TB_BOX_MIN+(int)((float)(mxT-g_tbLay.boxX)/(float)g_tbLay.boxW*(float)(TB_BOX_MAX-TB_BOX_MIN))));
                     saveSettings(); handled=true;
                 }
                 else { g_tbHexEditing=false; }
