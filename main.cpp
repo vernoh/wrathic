@@ -14890,6 +14890,36 @@ std::atomic<int>  g_benchStage{0};      // 0 idle, 1..N testing, used by the UI
 std::atomic<int>  g_benchBest{0};       // measured ceiling
 std::atomic<int>  g_benchRecommend{0};
 std::wstring      g_benchMessage;
+std::wstring      g_benchSpecs;    // shown under the result
+
+// CPU name, cores and RAM. Not used to compute anything - the ceiling is measured,
+// and no lookup table turns a model number into a KPS figure. It is here so the
+// result is comparable between machines and so a bad report can be read without
+// having to ask what someone is running.
+static std::wstring readMachineSpecs(){
+    wchar_t cpu[128]={};
+    HKEY hk;
+    if(RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"HARDWARE\DESCRIPTION\System\CentralProcessor\0",0,KEY_READ,&hk)==ERROR_SUCCESS){
+        DWORD sz=sizeof(cpu), type=REG_SZ;
+        RegQueryValueExW(hk,L"ProcessorNameString",NULL,&type,(LPBYTE)cpu,&sz);
+        RegCloseKey(hk);
+    }
+    // Trim the padding Intel and AMD both leave in that string.
+    std::wstring name(cpu);
+    while(!name.empty()&&iswspace(name.back())) name.pop_back();
+    size_t a=name.find_first_not_of(L' ');
+    if(a!=std::wstring::npos) name=name.substr(a);
+    if(name.empty()) name=L"Unknown CPU";
+
+    SYSTEM_INFO si={}; GetSystemInfo(&si);
+    MEMORYSTATUSEX ms={}; ms.dwLength=sizeof(ms); GlobalMemoryStatusEx(&ms);
+    int gb=(int)((ms.ullTotalPhys+(1ULL<<29))>>30);
+
+    wchar_t out[224];
+    swprintf(out,224,L"%s  ·  %u threads  ·  %d GB",name.c_str(),si.dwNumberOfProcessors,gb);
+    return std::wstring(out);
+}
 
 // Measures without flooding. The previous version ramped real SendInput calls up to
 // 2000/sec against a live game: every one of those still travels the full input
@@ -14967,9 +14997,10 @@ static DWORD WINAPI benchmarkThread(LPVOID){
     // is meant to prevent.
     int rec = std::max(MIN_KPS, std::min(MAX_KPS, (int)(ceiling*0.6)));
 
-    wchar_t line[224];
-    swprintf(line,224,L"Benchmark: send median %.0fus, p90 %.0fus, wait jitter %.0fus -> ceiling ~%d KPS",
-             medianUs,p90Us,jitterUs,ceiling);
+    g_benchSpecs=readMachineSpecs();
+    wchar_t line[320];
+    swprintf(line,320,L"Benchmark on %s: send median %.0fus, p90 %.0fus, jitter %.0fus -> ceiling ~%d KPS",
+             g_benchSpecs.c_str(),medianUs,p90Us,jitterUs,ceiling);
     LOG_INFO(line);
 
     g_benchBest=ceiling;
@@ -17179,6 +17210,7 @@ static int calcUtilsCardH(){
     h+=14+6;                           // header label
     h+=28+6;                           // Optimise / Open Logs
     h+=28+6;                           // Benchmark
+    if(!g_benchSpecs.empty()) h+=16;   // the specs line under it
     if(!cleanRamStatus.empty()){
         // Count real \n-separated segments, each further estimated for
         // word-wrap at ~40 chars/line - the old size()/32 guess ignored
@@ -17394,7 +17426,11 @@ void paintSettingsInto(HDC hdc,int W,int H){
         }
         drawText(hdc,lbl.c_str(),p+14,cx,cw-28,28,busy?T.accent:lerpCol(T.subtext,T.text,bh),
                  hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        if(!busy && !g_benchSpecs.empty())
+            drawText(hdc,g_benchSpecs.c_str(),p+14,cx+28,cw-28,14,T.subtext,hFontSmall,
+                     DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
+    if(!g_benchSpecs.empty()) cx+=16;
     cx+=28+6;
     if(!cleanRamStatus.empty()){
         bool done=cleanRamStatus.find(L"Freed")!=std::wstring::npos;
