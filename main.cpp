@@ -13177,6 +13177,13 @@ ULONG_PTR gdiplusToken=0;
 // reads and writes it, so it has to be visible here.
 bool hasTriggerbot=false;   // licence entitles this user to the triggerbot tab
 extern std::atomic<bool> triggerbotEnabled;
+// The triggerbot lives further down, but hotkeyThread above it watches the arm bind
+// and serves the eyedropper, so these have to be visible up here.
+extern std::atomic<int>  trigArmKey;
+extern std::atomic<bool> trigArmHold;
+extern std::atomic<bool> g_trigArmed;
+extern std::atomic<bool> g_trigPicking;
+extern std::atomic<int>  trigR, trigG, trigB;
 extern std::atomic<int>  trigKey, trigR, trigG, trigB, trigTolerance, trigBox, trigDelayMs;
 extern std::atomic<bool> trigHoldMode;
 
@@ -14294,6 +14301,38 @@ void hotkeyThread(){
         if(!capturingHotkey&&!capturingKey){
             bool focused=robloxFocused.load();
             bool pressed=(GetAsyncKeyState(hotkeyVK.load())&0x8000)!=0;
+            // The arm bind. Tap toggles, hold arms only while held - and the eyedropper
+            // is served here too, since this is already the thread watching for keys.
+            {
+                int ak=trigArmKey.load();
+                if(ak){
+                    static bool armWas=false;
+                    bool ad=(GetAsyncKeyState(ak)&0x8000)!=0;
+                    if(trigArmHold.load()) g_trigArmed=ad;
+                    else if(ad && !armWas) g_trigArmed=!g_trigArmed.load();
+                    armWas=ad;
+                }
+                if(g_trigPicking.load()){
+                    // Take the pixel under the cursor on the next left click. Reading a
+                    // single pixel off the screen DC is cheaper than any capture, and it
+                    // means nobody has to know their skin's hex.
+                    if(GetAsyncKeyState(VK_LBUTTON)&0x8000){
+                        POINT pt; GetCursorPos(&pt);
+                        HDC sdc=GetDC(NULL);
+                        COLORREF c=GetPixel(sdc,pt.x,pt.y);
+                        ReleaseDC(NULL,sdc);
+                        if(c!=CLR_INVALID){
+                            trigR=GetRValue(c); trigG=GetGValue(c); trigB=GetBValue(c);
+                            saveSettings();
+                            wchar_t m[96];
+                            swprintf(m,96,L"Colour picked: %d, %d, %d",GetRValue(c),GetGValue(c),GetBValue(c));
+                            showSuccessToast(m);
+                        }
+                        g_trigPicking=false;
+                        if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+                    }
+                }
+            }
             // The two engines may run together. They interleave on SendInput without
             // trouble; what does not work is sharing a bind, which is refused at the
             // point the bind is set rather than by disabling one here.
@@ -14690,6 +14729,14 @@ std::atomic<int>  trigBox{360};               // capture square, px
 std::atomic<int>  trigStride{3};              // sample every Nth pixel
 std::atomic<int>  trigDelayMs{0};             // optional reaction delay
 std::atomic<bool> trigHoldMode{false};        // hold while seen, vs a single tap
+// The bind that arms it. Separate from trigKey, which is the key it presses - those
+// were conflated before, so the only way to arm the triggerbot was a toggle in the UI
+// and you could not start it without alt-tabbing out of the game.
+std::atomic<int>  trigArmKey{0};              // 0 = unbound, arm from the UI only
+std::atomic<bool> trigArmHold{false};         // hold to keep it armed, vs tap to toggle
+std::atomic<bool> g_trigArmed{false};         // what the bind actually says right now
+// Eyedropper: set from the UI, cleared once a colour has been taken.
+std::atomic<bool> g_trigPicking{false};
 static std::atomic<bool> gTrigThreadRun{false};
 static HANDLE gTrigThread=NULL;
 
@@ -14714,7 +14761,10 @@ static DWORD WINAPI triggerbotThread(LPVOID){
     bool wasDown=false;
 
     while(gTrigThreadRun.load(std::memory_order_relaxed)){
-        if(!triggerbotEnabled.load()){
+        // Enabled is the user's intent; armed is the bind's answer. With no bind set,
+        // enabled alone arms it, which is how it behaved before.
+        bool armed = triggerbotEnabled.load() && (trigArmKey.load()==0 || g_trigArmed.load());
+        if(!armed){
             if(wasDown){ // release if we were holding when it was switched off
                 INPUT up{}; int k=trigKey.load();
                 if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
