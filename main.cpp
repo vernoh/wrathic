@@ -13807,23 +13807,50 @@ static unsigned long long hashStr(const std::wstring& s){
     return h;
 }
 static std::wstring getCPUID(){int i[4]={};__cpuid(i,1);std::wostringstream ss;ss<<std::hex<<i[0]<<i[1]<<i[2]<<i[3];return ss.str();}
+// Picks a MAC that will still be there tomorrow.
+//
+// This used to take the adapter with the lowest Index among anything non-loopback and
+// non-PPP. Two things were wrong with that. Index is assigned by Windows and shifts
+// when adapters appear or disappear - plugging in Ethernet, a phone tethering, a VPN
+// connecting, a driver update - so the fingerprint moved and users were told their key
+// was already active on another machine. And virtual adapters are type ETHERNET, so
+// they were never excluded: on a machine with VMware installed the lowest index is
+// VMnet1, whose address is 00:50:56:C0:00:01 on every VMware installation in
+// existence. So the fingerprint was both unstable and, in part, not unique.
+//
+// Now: skip the known virtual ranges, and choose by lowest MAC value rather than by
+// index, because the value belongs to the hardware and the index belongs to Windows.
+static bool isVirtualMac(const BYTE* a){
+    // VMware host adapters, VirtualBox host-only, Hyper-V/WSL, Docker, Parallels.
+    if(a[0]==0x00&&a[1]==0x50&&a[2]==0x56) return true;   // VMware
+    if(a[0]==0x00&&a[1]==0x0C&&a[2]==0x29) return true;   // VMware
+    if(a[0]==0x00&&a[1]==0x05&&a[2]==0x69) return true;   // VMware
+    if(a[0]==0x0A&&a[1]==0x00&&a[2]==0x27) return true;   // VirtualBox host-only
+    if(a[0]==0x08&&a[1]==0x00&&a[2]==0x27) return true;   // VirtualBox
+    if(a[0]==0x00&&a[1]==0x15&&a[2]==0x5D) return true;   // Hyper-V / WSL
+    if(a[0]==0x00&&a[1]==0x1C&&a[2]==0x42) return true;   // Parallels
+    if(a[0]&0x02) return true;                            // locally administered
+    return false;
+}
 static std::wstring getMAC(){
     IP_ADAPTER_INFO a[32];DWORD b=sizeof(a);
     if(GetAdaptersInfo(a,&b)!=ERROR_SUCCESS)return L"NOMAC";
-    // Find first physical adapter (skip VPN/virtual - they have type IF_TYPE_PPP or loopback)
-    // Use the adapter with smallest index that has a non-zero MAC and is Ethernet/WiFi
-    IP_ADAPTER_INFO* best=nullptr;
+    const BYTE* best=nullptr;
     for(IP_ADAPTER_INFO* p=a;p;p=p->Next){
         bool zeroMac=true;
-        for(int i=0;i<6;i++){if(p->Address[i])zeroMac=false;}
-        if(zeroMac)continue;
-        // Skip PPP/VPN/loopback types
-        if(p->Type==MIB_IF_TYPE_LOOPBACK||p->Type==MIB_IF_TYPE_PPP)continue;
-        if(!best||p->Index<best->Index)best=p;
+        for(int i=0;i<6;i++){ if(p->Address[i]) zeroMac=false; }
+        if(zeroMac) continue;
+        if(p->AddressLength!=6) continue;
+        if(p->Type==MIB_IF_TYPE_LOOPBACK||p->Type==MIB_IF_TYPE_PPP) continue;
+        if(isVirtualMac(p->Address)) continue;
+        if(!best || memcmp(p->Address,best,6)<0) best=p->Address;
     }
-    if(!best)best=a; // fallback
+    // Every adapter looked virtual. Rather than fall back to one of them - which is
+    // shared between machines - contribute nothing and let the other components carry
+    // the fingerprint. A weaker id beats one that collides with a stranger's.
+    if(!best) return L"NOMAC";
     std::wostringstream ss;
-    for(int i=0;i<6;i++)ss<<std::hex<<std::setw(2)<<std::setfill(L'0')<<best->Address[i];
+    for(int i=0;i<6;i++)ss<<std::hex<<std::setw(2)<<std::setfill(L'0')<<best[i];
     return ss.str();
 }
 static std::wstring getVol(){DWORD s=0;GetVolumeInformation(L"C:\\",NULL,0,&s,NULL,NULL,NULL,0);std::wostringstream ss;ss<<std::hex<<s;return ss.str();}
