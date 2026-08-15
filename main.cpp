@@ -14677,7 +14677,7 @@ static void hsvToRgb(float h,float s,float v,int& R,int& G,int& B){
 // reaction time while leaving the CPU alone.
 std::atomic<bool> triggerbotEnabled{false};   // user has switched it on
 std::atomic<bool> triggerbotFiring{false};    // currently holding the hotkey down
-std::atomic<int>  trigKey{VK_LBUTTON};        // key it presses
+std::atomic<int>  trigKey{'F'};               // key it presses - F is parry in Blade Ball
 std::atomic<int>  trigR{255}, trigG{0}, trigB{0};
 std::atomic<int>  trigTolerance{40};          // 0..255 per-channel distance
 std::atomic<int>  trigBox{16};                // capture square, px
