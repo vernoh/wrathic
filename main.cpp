@@ -14678,9 +14678,16 @@ static void hsvToRgb(float h,float s,float v,int& R,int& G,int& B){
 std::atomic<bool> triggerbotEnabled{false};   // user has switched it on
 std::atomic<bool> triggerbotFiring{false};    // currently holding the hotkey down
 std::atomic<int>  trigKey{'F'};               // key it presses - F is parry in Blade Ball
-std::atomic<int>  trigR{255}, trigG{0}, trigB{0};
+// Measured off a live round rather than guessed: the ball and, when it is aimed at
+// you, your character both turn this green. White means it is targeting someone else,
+// so white must not match - which is why the check below rejects greys outright.
+std::atomic<int>  trigR{8}, trigG{134}, trigB{8};
 std::atomic<int>  trigTolerance{40};          // 0..255 per-channel distance
-std::atomic<int>  trigBox{16};                // capture square, px
+// The old 16px box sat at screen centre and almost never contained the ball. The cue
+// covers a large part of the screen once the character turns too, so the window is
+// wide and sampled with a stride instead - 14k samples a pass rather than 130k.
+std::atomic<int>  trigBox{360};               // capture square, px
+std::atomic<int>  trigStride{3};              // sample every Nth pixel
 std::atomic<int>  trigDelayMs{0};             // optional reaction delay
 std::atomic<bool> trigHoldMode{false};        // hold while seen, vs a single tap
 static std::atomic<bool> gTrigThreadRun{false};
@@ -14688,6 +14695,11 @@ static HANDLE gTrigThread=NULL;
 
 // Squared distance in RGB. Comparing squares avoids a sqrt in the inner loop.
 static inline bool colourMatches(int r,int g,int b,int tr,int tg,int tb,int tol){
+    // Reject anything close to grey before comparing. The untargeted ball is white and
+    // the arena is grey, and a plain distance test with a usable tolerance will happily
+    // match both - which would fire constantly and parry nothing.
+    int mx=std::max(r,std::max(g,b)), mn=std::min(r,std::min(g,b));
+    if(mx-mn < 45) return false;
     int dr=r-tr, dg=g-tg, db=b-tb;
     return (dr*dr+dg*dg+db*db) <= (tol*tol*3);
 }
@@ -14739,11 +14751,19 @@ static DWORD WINAPI triggerbotThread(LPVOID){
         const int tr=trigR.load(), tg=trigG.load(), tb=trigB.load(), tol=trigTolerance.load();
         bool hit=false;
         if(bits){
-            const int n=box*box;
-            for(int i=0;i<n;i++){
-                DWORD px=bits[i];
-                int b=(int)(px&0xFF), g=(int)((px>>8)&0xFF), r=(int)((px>>16)&0xFF);
-                if(colourMatches(r,g,b,tr,tg,tb,tol)){ hit=true; break; }
+            // A stride, and a run of matches rather than a single pixel: one stray
+            // green pixel from a nameplate or a particle is not a ball, and firing on
+            // one is how a triggerbot parries at nothing.
+            const int stride=std::max(1,trigStride.load());
+            int matches=0;
+            for(int y=0;y<box && !hit;y+=stride){
+                for(int x=0;x<box;x+=stride){
+                    DWORD px=bits[y*box+x];
+                    int b=(int)(px&0xFF), g=(int)((px>>8)&0xFF), r=(int)((px>>16)&0xFF);
+                    if(colourMatches(r,g,b,tr,tg,tb,tol)){
+                        if(++matches>=12){ hit=true; break; }
+                    }
+                }
             }
         }
 
