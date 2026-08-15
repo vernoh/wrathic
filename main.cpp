@@ -12922,6 +12922,9 @@ static void playChime(){
 #define ID_ADV_LOOP      175
 #define ID_ADV_CLEAR     176
 #define ID_ADV_SLOT_0    160
+// Our own window buttons, since the Windows ones are gone.
+#define ID_WIN_MIN       180
+#define ID_WIN_CLOSE     181
 #define ID_ADD_KEY       103
 #define ID_REMOVE_KEY    104
 #define ID_MODE_TOGGLE   108
@@ -15566,6 +15569,11 @@ bool licCopied = false;
 // Which half of the wrathic tab is showing. Not persisted deliberately - the app
 // should open on the simple thing, and advanced is a place you go rather than a mode
 // you get stuck in.
+// Which of our own titlebar buttons the cursor is over, and how lit it is. Windows
+// draws its caption buttons in its own style with its own colours; keeping them meant
+// the one strip of the window we did not control looked like a different program.
+int   g_capHover=0;
+float g_capMinA=0.0f, g_capCloseA=0.0f;
 bool g_advancedMode=false;
 float g_modeSwitchPos=0.0f;  // 0 basic, 1 advanced - spring target, not a snap
 float g_modeSwitchVel=0.0f;
@@ -16497,6 +16505,32 @@ static void drawOptimiseConfirm(HDC hdc,int W,int H){
     drawText(hdc,confirmLabel,ol.confirmRect.left,ol.confirmRect.top,ol.confirmRect.right-ol.confirmRect.left,34,RGB(255,255,255),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 }
 
+// Minimise and close, drawn in the app's own palette. Close warms to red on hover
+// because it is the one button here you cannot undo.
+static void drawCaptionButtons(HDC hdc,int W){
+    const int BTN=46, H=44;
+    int minX=W-BTN*2, closeX=W-BTN;
+    animateTo(g_capMinA,   g_capHover==ID_WIN_MIN  ?1.0f:0.0f, 0.06f);
+    animateTo(g_capCloseA, g_capHover==ID_WIN_CLOSE?1.0f:0.0f, 0.06f);
+
+    if(g_capMinA>0.01f)   fillRect(hdc,minX,0,BTN,H,lerpCol(T.surface,T.btnHov,g_capMinA));
+    if(g_capCloseA>0.01f) fillRect(hdc,closeX,0,BTN,H,lerpCol(T.surface,RGB(196,42,48),g_capCloseA));
+
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    COLORREF mc=lerpCol(T.subtext,T.text,g_capMinA);
+    Pen pm(Color(255,GetRValue(mc),GetGValue(mc),GetBValue(mc)),1.4f);
+    g.DrawLine(&pm,(REAL)(minX+BTN/2-5),(REAL)(H/2),(REAL)(minX+BTN/2+5),(REAL)(H/2));
+
+    COLORREF cc=lerpCol(T.subtext,RGB(255,255,255),g_capCloseA);
+    Pen pc(Color(255,GetRValue(cc),GetGValue(cc),GetBValue(cc)),1.4f);
+    pc.SetStartCap(LineCapRound); pc.SetEndCap(LineCapRound);
+    REAL cx=(REAL)(closeX+BTN/2), cy=(REAL)(H/2), r=4.5f;
+    g.DrawLine(&pc,cx-r,cy-r,cx+r,cy+r);
+    g.DrawLine(&pc,cx+r,cy-r,cx-r,cy+r);
+}
+
 void paintMain(HWND hwnd){
     // Per-frame card state: draw order keys the hover slots, and the flag is
     // re-derived each frame by drawCard rather than latching on forever.
@@ -16551,7 +16585,9 @@ void paintMain(HWND hwnd){
     drawGlassBand(hdc,0,0,W,44,true);   // header: lit along its lower edge
     if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
     drawText(hdc,L"WRATHIC",gAppIcon?44:16,0,140,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    drawText(hdc,APP_VERSION,W-84,0,70,44,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    // Version sits clear of the buttons now rather than under them.
+    drawText(hdc,APP_VERSION,W-92-70,0,70,44,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    drawCaptionButtons(hdc,W);
 
     // ── MODE SWITCH ──────────────────────────────────────────────────────────
     // Two tabs, because "advanced" is a different job rather than more knobs on the
@@ -16877,6 +16913,7 @@ void paintMain(HWND hwnd){
         drawGlassBand(hdc,0,0,W,44,true);
         if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
         drawText(hdc,L"TRIGGERBOT",gAppIcon?44:16,0,180,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        drawCaptionButtons(hdc,W);
     }
     if(activeTab==1 && !hasTriggerbot){
         // Not entitled: show what it is and how to get it, rather than a dead tab.
@@ -17418,13 +17455,14 @@ void paintSettingsInto(HDC hdc,int W,int H){
         drawSettingsTip(hdc,g_tipX,g_tipY,g_tipText.c_str(),W,H);
     }
 
-    // Settings header bar (drawn on top)
-    fillRect(hdc,0,0,W,48,T.surface);
-    fillRect(hdc,0,47,W,2,T.accent);
-    {HFONT oldF=(HFONT)SelectObject(hdc,hFontBig);
+    // Settings header. Same band as the other tabs rather than a flat fill with an
+    // accent rule under it - the three headers had drifted into three looks.
+    drawGlassBand(hdc,0,0,W,44,true);
+    {HFONT oldF=(HFONT)SelectObject(hdc,hFontMed);
     SetTextColor(hdc,T.text);SetBkMode(hdc,TRANSPARENT);
-    RECT hr={14,0,W-14,44};DrawText(hdc,L"SETTINGS",-1,&hr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    RECT hr={16,0,W-110,44};DrawText(hdc,L"SETTINGS",-1,&hr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     SelectObject(hdc,oldF);}
+    drawCaptionButtons(hdc,W);
 }
 
 // ===================== TOAST SYSTEM =====================
@@ -18182,6 +18220,25 @@ void spawnOverlay(){
 // ===================== MAIN WNDPROC =====================
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
+    case WM_NCCALCSIZE:
+        // Zero the non-client area so the client region covers the whole window and
+        // our own header occupies what used to be the caption.
+        if(wp) return 0;
+        break;
+    case WM_NCHITTEST:{
+        // Let Windows keep doing the edges - resizing, and the corner cursors - then
+        // treat the header as the caption so dragging and double-click-to-maximise
+        // work without reimplementing either.
+        LRESULT ht=DefWindowProc(hwnd,msg,wp,lp);
+        if(ht!=HTCLIENT) return ht;
+        POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd,&pt);
+        RECT rc; GetClientRect(hwnd,&rc);
+        const int BTN=46;
+        if(pt.y<8) return HTTOP;
+        if(pt.y<44 && pt.x < rc.right-BTN*2) return HTCAPTION;
+        return HTCLIENT;
+    }
     case WM_ERASEBKGND:
         return 1; // handled entirely in WM_PAINT double buffer - no fill here
     case WM_MOVING:
@@ -18366,6 +18423,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 if(g_optimiseRunning||g_optimiseDecisionPending) needRepaint=true;
                 if(g_kpsEditing) needRepaint=true;
                 if(g_advRecording.load()) needRepaint=true;   // step list is filling
+                if(g_capMinA>0.002f||g_capCloseA>0.002f||g_capHover) needRepaint=true;
                 if(g_cardAnimActive) needRepaint=true; // card hover fade still settling
                 // Active toasts need continuous repaints too (slide-in/stack
                 // animation, fade in/out) - a single InvalidateRect from
@@ -18412,6 +18470,13 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_MOUSEMOVE:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
         g_lastMousePos.x=mx; g_lastMousePos.y=my;
+        {   RECT rcb; GetClientRect(hwnd,&rcb);
+            const int BTN=46;
+            int was=g_capHover;
+            g_capHover = (my<44 && mx>=rcb.right-BTN*2)
+                       ? (mx>=rcb.right-BTN ? ID_WIN_CLOSE : ID_WIN_MIN) : 0;
+            if(was!=g_capHover) InvalidateRect(hwnd,NULL,FALSE);
+        }
         {TRACKMOUSEEVENT tme={sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};TrackMouseEvent(&tme);}
         if(activeTab==2){
             // Hover test against where the icons were actually drawn last frame,
@@ -18541,6 +18606,17 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_LBUTTONDOWN:{
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
+        {   // Our own minimise and close. WM_NCHITTEST hands this strip back as client
+            // area precisely so these can be hit before anything else looks at it.
+            RECT rcb; GetClientRect(hwnd,&rcb);
+            const int BTN=46;
+            if(my<44 && mx>=rcb.right-BTN*2){
+                playClick();
+                if(mx>=rcb.right-BTN) SendMessage(hwnd,WM_CLOSE,0,0);
+                else ShowWindow(hwnd,SW_MINIMIZE);
+                return 0;
+            }
+        }
         g_pressedId=hitTest(hwnd,mx,my); // which control is being held
         if(g_lockKind!=LOCK_NONE){
             if(!g_lockRedirectUrl.empty()){
@@ -19101,59 +19177,159 @@ void hideSplash(){
 }
 
 // ===================== LICENSE WINDOW =====================
+// The activation window was the last thing still built from raw Win32 controls - a
+// STATIC, an EDIT with a system border and a grey push button - so the first screen
+// anyone ever sees looked nothing like the app behind it. It is drawn now, the same
+// way every other surface is: same header band, same card, same fonts, same accent.
+//
+// The EDIT stays, borderless and sitting inside a drawn field. A licence key gets
+// pasted far more often than typed, and a real edit control brings the caret,
+// selection and Ctrl+V that a hand-rolled text box would have to reimplement badly.
+static bool  g_licHovering=false;
+static float g_licBtnHover=0.0f;
+static bool  g_licBusy=false;
+static std::wstring g_licStatus;
+static COLORREF g_licStatusCol=0;
+
 LRESULT CALLBACK LicenseProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
-    static HWND hwndInput=NULL,hwndBtn=NULL,hwndMsg=NULL;
+    static HWND hwndInput=NULL;
+    const int W=400, CARDX=24, CARDW=W-48;
+    const int FIELDY=150, FIELDH=34;
+    const int BTNY=FIELDY+FIELDH+14, BTNH=36;
+
     switch(msg){
     case WM_CREATE:{
-        HFONT f=CreateFont(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,FONT_NAMES[fontIdx]);
-        HFONT fb=CreateFont(17,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,FONT_NAMES[fontIdx]);
-        HWND l1=CreateWindow(L"STATIC",L"Activate Macro",WS_CHILD|WS_VISIBLE|SS_CENTER,20,52,330,22,hwnd,NULL,NULL,NULL);SendMessage(l1,WM_SETFONT,(WPARAM)fb,TRUE);
-        HWND l2=CreateWindow(L"STATIC",L"Enter the license key received after purchase.",WS_CHILD|WS_VISIBLE|SS_CENTER,20,78,330,16,hwnd,NULL,NULL,NULL);SendMessage(l2,WM_SETFONT,(WPARAM)f,TRUE);
-        hwndInput=CreateWindow(L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_CENTER,20,106,330,26,hwnd,(HMENU)ID_LICENSE_INPUT,NULL,NULL);SendMessage(hwndInput,WM_SETFONT,(WPARAM)f,TRUE);
-        SendMessage(hwndInput,EM_SETCUEBANNER,FALSE,(LPARAM)L"MACRO-XXXX-XXXX-XXXX-XXXX");
-        hwndBtn=CreateWindow(L"BUTTON",L"Activate",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,20,144,330,30,hwnd,(HMENU)ID_LICENSE_BTN,NULL,NULL);SendMessage(hwndBtn,WM_SETFONT,(WPARAM)f,TRUE);
-        hwndMsg=CreateWindow(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_CENTER,20,184,330,18,hwnd,NULL,NULL,NULL);SendMessage(hwndMsg,WM_SETFONT,(WPARAM)f,TRUE);
+        hwndInput=CreateWindow(L"EDIT",L"",WS_CHILD|WS_VISIBLE|ES_CENTER|ES_AUTOHSCROLL,
+                               CARDX+12,FIELDY+9,CARDW-24,FIELDH-16,hwnd,(HMENU)ID_LICENSE_INPUT,NULL,NULL);
+        SendMessage(hwndInput,WM_SETFONT,(WPARAM)(hFontMono?hFontMono:hFontSmall),TRUE);
+        SendMessage(hwndInput,EM_SETCUEBANNER,FALSE,(LPARAM)L"WRTH-XXXX-XXXX-XXXX");
+        SetTimer(hwnd,1,33,NULL);   // drives the starfield and the button hover fade
+        SetFocus(hwndInput);
         break;
     }
-    case WM_CTLCOLORSTATIC:{HDC h=(HDC)wp;SetBkMode(h,TRANSPARENT);SetTextColor(h,T.text);static HBRUSH b=NULL;if(b)DeleteObject(b);b=CreateSolidBrush(T.surface);return(LRESULT)b;}
-    case WM_CTLCOLOREDIT:{HDC h=(HDC)wp;SetTextColor(h,T.text);SetBkColor(h,T.btn);static HBRUSH b=NULL;if(b)DeleteObject(b);b=CreateSolidBrush(T.btn);return(LRESULT)b;}
-    case WM_CTLCOLORBTN:{HDC h=(HDC)wp;SetTextColor(h,T.text);SetBkColor(h,T.btn);static HBRUSH b=NULL;if(b)DeleteObject(b);b=CreateSolidBrush(T.btn);return(LRESULT)b;}
-    case WM_ERASEBKGND:{HDC h=(HDC)wp;RECT r;GetClientRect(hwnd,&r);HBRUSH b=CreateSolidBrush(T.surface);FillRect(h,&r,b);DeleteObject(b);return 1;}
+    case WM_TIMER:
+        // The background drifts here exactly as it does in the app, so the two do not
+        // feel like different programs stitched together.
+        if(themeIdx==5) updateVoidStars();
+        animateTo(g_licBtnHover,g_licHovering?1.0f:0.0f,0.08f);
+        InvalidateRect(hwnd,NULL,FALSE);
+        return 0;
+    case WM_MOUSEMOVE:{
+        int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
+        g_licHovering = (mx>=CARDX&&mx<=CARDX+CARDW&&my>=BTNY&&my<=BTNY+BTNH);
+        TRACKMOUSEEVENT tme={sizeof(tme),TME_LEAVE,hwnd,0}; TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE: g_licHovering=false; return 0;
+    case WM_CTLCOLOREDIT:{
+        // Borderless, on the field colour, so the control disappears into the drawn box.
+        HDC h=(HDC)wp;
+        SetTextColor(h,T.text); SetBkColor(h,T.btn);
+        static HBRUSH b=NULL; if(b)DeleteObject(b); b=CreateSolidBrush(T.btn);
+        return (LRESULT)b;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_LBUTTONDOWN:{
+        int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
+        if(mx>=CARDX&&mx<=CARDX+CARDW&&my>=BTNY&&my<=BTNY+BTNH)
+            SendMessage(hwnd,WM_COMMAND,ID_LICENSE_BTN,0);
+        else if(my<44) { ReleaseCapture(); SendMessage(hwnd,WM_SYSCOMMAND,SC_MOVE|HTCAPTION,0); }
+        return 0;
+    }
     case WM_PAINT:{
-        PAINTSTRUCT ps;HDC hdc=BeginPaint(hwnd,&ps);
-        fillRect(hdc,0,0,370,42,T.bg);
-        SelectObject(hdc,hFontBig);SetTextColor(hdc,T.text);SetBkMode(hdc,TRANSPARENT);
-        RECT tr={14,0,300,42};DrawText(hdc,L"WRATHIC",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        fillRect(hdc,0,41,370,2,T.accent);
-        EndPaint(hwnd,&ps);return 0;
+        PAINTSTRUCT ps; HDC hdc_real=BeginPaint(hwnd,&ps);
+        RECT cr; GetClientRect(hwnd,&cr);
+        int w=cr.right,h=cr.bottom;
+
+        // Double buffered, like every other window here - a half-drawn starfield is
+        // worse than no starfield.
+        HDC hdc=CreateCompatibleDC(hdc_real);
+        HBITMAP bmp=CreateCompatibleBitmap(hdc_real,w,h);
+        HBITMAP ob=(HBITMAP)SelectObject(hdc,bmp);
+
+        fillRect(hdc,0,0,w,h,T.bg);
+        if(themeIdx==5) drawVoidStars(hdc,w,h);
+
+        drawGlassBand(hdc,0,0,w,44,true);
+        if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
+        drawText(hdc,L"WRATHIC",gAppIcon?44:16,0,160,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        drawText(hdc,APP_VERSION,w-84,0,70,44,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+
+        drawCard(hdc,CARDX,68,CARDW,h-68-24);
+        drawText(hdc,L"ACTIVATE",CARDX+16,84,200,14,T.subtext,hFontSmall);
+        drawText(hdc,L"Enter your licence key",CARDX+16,104,CARDW-32,22,T.text,hFontMed,
+                 DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        drawText(hdc,L"It binds to this PC the first time it is used.",
+                 CARDX+16,126,CARDW-32,16,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+
+        drawRR(hdc,CARDX,FIELDY,CARDW,FIELDH,9,T.btn,T.border,1);
+
+        COLORREF bg=lerpCol(T.btn,T.btnHov,g_licBtnHover);
+        drawRR(hdc,CARDX,BTNY,CARDW,BTNH,10,g_licBusy?T.btn:bg,g_licBusy?T.border:T.accent,1);
+        drawText(hdc,g_licBusy?L"Checking...":L"Activate",CARDX,BTNY,CARDW,BTNH,
+                 g_licBusy?T.subtext:T.text,hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+
+        if(!g_licStatus.empty())
+            drawText(hdc,g_licStatus.c_str(),CARDX+8,BTNY+BTNH+8,CARDW-16,34,
+                     g_licStatusCol,hFontSmall,DT_CENTER|DT_WORDBREAK);
+
+        drawText(hdc,L"No key? Get one in the Discord.",CARDX,h-30,CARDW,16,T.subtext,hFontSmall,
+                 DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+
+        BitBlt(hdc_real,0,0,w,h,hdc,0,0,SRCCOPY);
+        SelectObject(hdc,ob); DeleteObject(bmp); DeleteDC(hdc);
+        EndPaint(hwnd,&ps); return 0;
     }
     case WM_COMMAND:{
-        if(LOWORD(wp)==ID_LICENSE_BTN){
-            wchar_t buf[64]={};GetWindowText(hwndInput,buf,64);
+        if(LOWORD(wp)==ID_LICENSE_BTN && !g_licBusy){
+            wchar_t buf[64]={}; GetWindowText(hwndInput,buf,64);
             std::wstring key(buf);
-            if(key.empty()){SetWindowText(hwndMsg,L"Please enter your license key.");break;}
-            SetWindowText(hwndMsg,L"Validating - please wait...");UpdateWindow(hwnd);
+            // Trim: a key copied out of Discord usually arrives with a space on it.
+            while(!key.empty()&&iswspace(key.front())) key.erase(key.begin());
+            while(!key.empty()&&iswspace(key.back()))  key.pop_back();
+            if(key.empty()){
+                g_licStatus=L"Enter your key first."; g_licStatusCol=T.red;
+                InvalidateRect(hwnd,NULL,FALSE); break;
+            }
+            g_licBusy=true; g_licStatus=L"Checking with the server..."; g_licStatusCol=T.subtext;
+            InvalidateRect(hwnd,NULL,FALSE); UpdateWindow(hwnd);
+
             int r=validateLicense(key,machineHWID);
-            if(r==-1)SetWindowText(hwndMsg,L"Network error - check your connection and try again.");
-            else if(r==0)SetWindowText(hwndMsg,L"Invalid key or already used on another machine.");
-            // r==5 must not fall into the success branch below: the server never saw
-            // the key, so saving it would report success on an unvalidated licence.
-            else if(r==5)SetWindowText(hwndMsg,L"This version is out of date - download the latest from GitHub, then activate.");
-            else if(r==3)SetWindowText(hwndMsg,L"This key is already active on another machine.");
-            else{saveLicense(key);savedLicenseKey=key;SetWindowText(hwndMsg,L"Activated successfully!");Sleep(700);DestroyWindow(hwnd);}
+            g_licBusy=false;
+            g_licStatusCol=T.red;
+            if(r==-1)      g_licStatus=L"Could not reach the server. Check your connection and try again.";
+            else if(r==0)  g_licStatus=L"That key is not valid.";
+            // r==5 must not fall into the success branch: the server never saw the key,
+            // so saving it would report success on an unvalidated licence.
+            else if(r==5)  g_licStatus=L"This build is out of date. Download the latest from GitHub, then activate.";
+            else if(r==3)  g_licStatus=L"That key is already active on another PC.";
+            else {
+                saveLicense(key); savedLicenseKey=key;
+                g_licStatus=L"Activated."; g_licStatusCol=T.green;
+                InvalidateRect(hwnd,NULL,FALSE); UpdateWindow(hwnd);
+                Sleep(650); DestroyWindow(hwnd); break;
+            }
+            InvalidateRect(hwnd,NULL,FALSE);
         }
         break;
     }
     case WM_DESTROY:
+        KillTimer(hwnd,1);
         KillTimer(hwnd,TIMER_SETT);
-break;
+        break;
     default:return DefWindowProc(hwnd,msg,wp,lp);
     }return 0;
 }
 
 bool showLicenseWindow(HINSTANCE hInst){
-    WNDCLASS wc={};wc.lpfnWndProc=LicenseProc;wc.hInstance=hInst;wc.lpszClassName=L"Lic4";wc.hCursor=gGlowCursor?gGlowCursor:LoadCursor(NULL,IDC_ARROW);RegisterClass(&wc);
-    HWND hwnd=CreateWindow(L"Lic4",L"Macro \u2014 Activate",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,370,250,NULL,NULL,hInst,NULL);
+    WNDCLASS wc={};wc.lpfnWndProc=LicenseProc;wc.hInstance=hInst;wc.lpszClassName=L"Lic4";
+    wc.hCursor=gGlowCursor?gGlowCursor:LoadCursor(NULL,IDC_ARROW);
+    wc.hbrBackground=NULL;   // WM_ERASEBKGND owns the background
+    RegisterClass(&wc);
+    // The em dash is written as an escape, not a literal: MSVC reads this file in
+    // so a raw em dash here becomes mojibake in the title bar.
+    HWND hwnd=CreateWindow(L"Lic4",L"wrathic - Activate",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,
+                           CW_USEDEFAULT,CW_USEDEFAULT,400,330,NULL,NULL,hInst,NULL);
     BOOL dark=TRUE;DwmSetWindowAttribute(hwnd,(DWORD)20,&dark,sizeof(dark));
     ShowWindow(hwnd,SW_SHOW);UpdateWindow(hwnd);
     MSG msg;
@@ -19275,7 +19451,10 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     RegisterClass(&wc);
 
     HWND hwnd=CreateWindow(L"MApp_91x",L"wrathic",
-        WS_OVERLAPPEDWINDOW,
+        // Caption and thick frame removed. WS_POPUP alone would lose snapping, the
+        // taskbar preview and the drop shadow, so the frame stays and WM_NCCALCSIZE
+        // takes its height to zero instead.
+        WS_POPUP|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,APP_W,APP_H,
         NULL,NULL,hInst,NULL);
     if(hwnd) showTrayIcon(hwnd);   // present for the whole session, added exactly once
