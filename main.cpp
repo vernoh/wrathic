@@ -13183,6 +13183,8 @@ extern std::atomic<int>  trigArmKey;
 extern std::atomic<bool> trigArmHold;
 extern std::atomic<bool> g_trigArmed;
 extern std::atomic<bool> g_trigPicking;
+extern std::atomic<int>  g_advRecKey;
+extern std::atomic<bool> g_advRecording;
 extern std::atomic<int>  trigR, trigG, trigB;
 extern std::atomic<int>  trigKey, trigR, trigG, trigB, trigTolerance, trigBox, trigDelayMs;
 extern std::atomic<bool> trigHoldMode;
@@ -15452,6 +15454,26 @@ bool advKeyInUse(int vk,int ignoreMacroIdx,std::wstring& whoOut){
 static DWORD WINAPI advHotkeyThread(LPVOID){
     std::vector<bool> was(ADV_MAX_MACROS,false);
     while(appRunning){
+        // Start and stop recording from a bind, because recording something in a game
+        // means being in the game, not clicking a button in this window.
+        {
+            int rk=g_advRecKey.load();
+            if(rk){
+                static bool recWas=false;
+                bool rd=(GetAsyncKeyState(rk)&0x8000)!=0;
+                if(rd && !recWas){
+                    if(g_advRecording.load()){
+                        advStopRecording();
+                        advSaveAll();
+                        showSuccessToast(L"Recording saved");
+                    } else if(advStartRecording()){
+                        showToast(L"Recording",T.red);
+                    }
+                    if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+                }
+                recWas=rd;
+            }
+        }
         if(!g_advRecording.load()){
             for(size_t i=0;i<g_advMacros.size() && i<ADV_MAX_MACROS;i++){
                 int vk=g_advMacros[i].hotkey;
@@ -15684,6 +15706,13 @@ float g_modeSwitchVel=0.0f;
 int  g_advScroll=0;          // step list scroll, in rows
 int  g_advSelStep=-1;        // clicked row, -1 = nothing selected
 int  g_advRowH=18;           // recorded by the paint so clicks land on the same rows
+// The four capture switches are set once and then never touched, so they sit folded
+// away rather than taking a third of the panel forever.
+bool g_advCaptureOpen=false;
+// A bind to start and stop recording. Recording something in a game means being in the
+// game, which you cannot be while clicking a button in this window.
+std::atomic<int>  g_advRecKey{0};
+static bool g_advRecKeyCapturing=false;
 bool g_advBinding=false;     // waiting for a key for the selected macro
 bool g_sliderDragging=false;  // mouse captured for a slider drag
 bool g_kpsEditing=false;
@@ -16734,7 +16763,7 @@ void paintMain(HWND hwnd){
         ay+=74;
 
         // ---- RECORD + WHAT TO CAPTURE ----
-        drawCard(hdc,p,ay,cw,132);
+        drawCard(hdc,p,ay,cw,g_advCaptureOpen?158:96);
         bool rec=g_advRecording.load();
         drawText(hdc,rec?L"RECORDING":L"RECORD",p+16,ay+10,140,12,rec?T.red:T.subtext,hFontSmall);
         {
@@ -16744,20 +16773,34 @@ void paintMain(HWND hwnd){
             drawText(hdc,rec?L"Stop recording":L"Start recording",p+16,ay+26,cw-32,28,
                      rec?T.red:lerpCol(T.subtext,T.text,rh),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
-        // Four capture switches. Unticking one stops it being recorded at all, which
-        // is why they sit next to the record button and not in a settings page.
+        // The capture switches, folded. Summarised when closed, because what is being
+        // recorded matters and a collapsed row that says nothing is worse than no row.
         {
             const wchar_t* lbl[4]={L"Mouse movement",L"Mouse clicks",L"Scroll wheel",L"Keystrokes"};
             bool* val[4]={&g_advRecMove,&g_advRecClicks,&g_advRecScroll,&g_advRecKeys};
-            int colW=(cw-32)/2;
-            for(int i=0;i<4;i++){
-                int bx=p+16+(i%2)*colW, by=ay+62+(i/2)*30;
-                drawRR(hdc,bx,by,16,16,4,*val[i]?T.accent:T.btn,*val[i]?T.accent:T.border,1);
-                if(*val[i]) drawText(hdc,L"\u2713",bx,by,16,16,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-                drawText(hdc,lbl[i],bx+22,by,colW-26,16,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            int n=0; for(int i=0;i<4;i++) if(*val[i]) n++;
+            wchar_t sum[96];
+            if(n==4)      wcscpy(sum,L"Recording everything");
+            else if(n==0) wcscpy(sum,L"Recording nothing - tick something");
+            else {
+                std::wstring parts;
+                for(int i=0;i<4;i++) if(*val[i]){ if(!parts.empty()) parts+=L", "; parts+=lbl[i]; }
+                swprintf(sum,96,L"%s",parts.c_str());
+            }
+            drawRR(hdc,p+16,ay+60,cw-32,26,8,T.btn,T.border,1);
+            drawText(hdc,g_advCaptureOpen?L"\u25be":L"\u25b8",p+22,ay+60,16,26,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            drawText(hdc,sum,p+40,ay+60,cw-64,26,n?T.text:T.red,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            if(g_advCaptureOpen){
+                int colW=(cw-32)/2;
+                for(int i=0;i<4;i++){
+                    int bx=p+16+(i%2)*colW, by=ay+94+(i/2)*28;
+                    drawRR(hdc,bx,by,16,16,4,*val[i]?T.accent:T.btn,*val[i]?T.accent:T.border,1);
+                    if(*val[i]) drawText(hdc,L"\u2713",bx,by,16,16,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                    drawText(hdc,lbl[i],bx+22,by,colW-26,16,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+                }
             }
         }
-        ay+=142;
+        ay += g_advCaptureOpen ? 168 : 100;
 
         // ---- BIND + PLAY ----
         drawCard(hdc,p,ay,cw,66);
@@ -16773,6 +16816,12 @@ void paintMain(HWND hwnd){
                    playing?T.green:T.border,1);
             drawText(hdc,playing?L"Stop":L"Play once",p+cw-16-120,ay+28,120,26,
                      playing?T.green:lerpCol(T.subtext,T.text,ph),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            // And the bind that starts recording, next to the one that plays it.
+            int rk=g_advRecKey.load();
+            drawText(hdc,L"record",p+112,ay+34,52,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            drawRR(hdc,p+160,ay+28,72,26,8,T.btn,g_advRecKeyCapturing?T.accent:T.border,1);
+            drawText(hdc,g_advRecKeyCapturing?L"press":(rk?vkToString(rk).c_str():L"none"),
+                     p+160,ay+28,72,26,rk?T.accent:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
         ay+=76;
 
@@ -16815,9 +16864,13 @@ void paintMain(HWND hwnd){
                 if(g_advScroll>count-rows) g_advScroll=count-rows;
                 if(g_advScroll<0) g_advScroll=0;
                 int depth=0;
+                // Elapsed time to the first visible row. Steps store gaps, not absolute
+                // times, so the clock has to be carried forward from the start.
+                int elapsed=0;
                 for(int i=0;i<g_advScroll && i<count;i++){
                     if((*src)[i].kind==ST_LOOP_START) depth++;
                     else if((*src)[i].kind==ST_LOOP_END && depth>0) depth--;
+                    if((*src)[i].kind==ST_DELAY) elapsed+=(*src)[i].a;
                 }
                 for(int r=0;r<rows;r++){
                     int i=g_advScroll+r;
@@ -16844,7 +16897,14 @@ void paintMain(HWND hwnd){
                         drawRR(hdc,p+16,ay+33+r*rowH,cw-32,rowH,4,T.btn,T.accent,1);
                         col=T.text;
                     }
-                    drawText(hdc,line,p+20+indent,ay+34+r*rowH,cw-40-indent,rowH,col,hFontSmall,
+                    // Where this step falls in the recording, so a list of gaps reads as
+                    // a timeline. Monospaced column on the left, dim, out of the way.
+                    wchar_t stamp[16];
+                    swprintf(stamp,16,L"%d.%02d",elapsed/1000,(elapsed%1000)/10);
+                    drawText(hdc,stamp,p+20,ay+34+r*rowH,46,rowH,T.subtext,hFontSmall,
+                             DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+                    if(st.kind==ST_DELAY) elapsed+=st.a;
+                    drawText(hdc,line,p+70+indent,ay+34+r*rowH,cw-90-indent,rowH,col,hFontSmall,
                              DT_LEFT|DT_VCENTER|DT_SINGLELINE);
                     if(st.kind==ST_LOOP_START) depth++;
                 }
@@ -18147,8 +18207,9 @@ static void paintOverlay(HWND hwnd){
         // Status pill left, PULSE right
         {   using namespace Gdiplus;
             bool tb=triggerbotEnabled.load();
-            const wchar_t* lbl = running ? L"LIVE" : (tb ? L"TRIG" : L"IDLE");
-            COLORREF dot = running ? OT.green : (tb ? OT.accent : OT.subtext);
+            bool recording = g_advRecording.load();
+            const wchar_t* lbl = recording ? L"REC" : running ? L"LIVE" : (tb ? L"TRIG" : L"IDLE");
+            COLORREF dot = recording ? OT.red : running ? OT.green : (tb ? OT.accent : OT.subtext);
             Graphics gg(hdc); gg.SetSmoothingMode(SmoothingModeAntiAlias);
             gg.SetPixelOffsetMode(PixelOffsetModeHalf);
             // Pill, then a status dot that breathes while the macro is live. The dot
@@ -18159,10 +18220,13 @@ static void paintOverlay(HWND hwnd){
             Pen pp(Color(running?150:60,GetRValue(dot),GetGValue(dot),GetBValue(dot)),1.0f);
             gg.DrawPath(&pp,&pill);
             REAL dcx=(REAL)pad+8.0f, dcy=(REAL)cy+7.5f;
-            float breathe = running ? (0.6f+0.4f*(float)sin((double)GetTickCount()/320.0)) : 1.0f;
-            if(running){ SolidBrush hb(Color((BYTE)(90*breathe),GetRValue(dot),GetGValue(dot),GetBValue(dot)));
+            // The dot pulses while recording too, and faster - it is the state you most
+            // need to notice you are still in.
+            bool pulsing = running || recording;
+            float breathe = pulsing ? (0.6f+0.4f*(float)sin((double)GetTickCount()/(recording?200.0:320.0))) : 1.0f;
+            if(pulsing){ SolidBrush hb(Color((BYTE)(90*breathe),GetRValue(dot),GetGValue(dot),GetBValue(dot)));
                          gg.FillEllipse(&hb,dcx-5.0f,dcy-5.0f,10.0f,10.0f); }
-            SolidBrush db(Color((BYTE)(running?(BYTE)(160+95*breathe):200),GetRValue(dot),GetGValue(dot),GetBValue(dot)));
+            SolidBrush db(Color((BYTE)(pulsing?(BYTE)(160+95*breathe):200),GetRValue(dot),GetGValue(dot),GetBValue(dot)));
             gg.FillEllipse(&db,dcx-2.5f,dcy-2.5f,5.0f,5.0f);
             drawText(hdc,lbl,pad+14,cy,26,15,dot,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
@@ -18991,12 +19055,18 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     InvalidateRect(hwnd,NULL,FALSE);
                     return 0;
                 }
-                // capture switches
-                {
+                // the fold itself
+                if(mx>=pa+16&&mx<=pa+cwa-16&&my>=ay+60&&my<=ay+86){
+                    playClick();
+                    g_advCaptureOpen=!g_advCaptureOpen;
+                    InvalidateRect(hwnd,NULL,FALSE);
+                    return 0;
+                }
+                if(g_advCaptureOpen){
                     bool* val[4]={&g_advRecMove,&g_advRecClicks,&g_advRecScroll,&g_advRecKeys};
                     int colW=(cwa-32)/2;
                     for(int i=0;i<4;i++){
-                        int bx=pa+16+(i%2)*colW, by=ay+62+(i/2)*30;
+                        int bx=pa+16+(i%2)*colW, by=ay+94+(i/2)*28;
                         if(mx>=bx&&mx<=bx+colW-8&&my>=by&&my<=by+18){
                             playToggle(!*val[i]);
                             *val[i]=!*val[i];
@@ -19005,7 +19075,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         }
                     }
                 }
-                ay+=142;
+                ay += g_advCaptureOpen ? 168 : 100;
 
                 // bind
                 if(mx>=pa+16&&mx<=pa+102&&my>=ay+28&&my<=ay+54){
@@ -19029,6 +19099,30 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                                     showSuccessToast((L"Bound to "+vkToString(vk)).c_str());
                                 }
                                 g_advBinding=false;
+                                break;
+                            }
+                            Sleep(16);
+                        }
+                        if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
+                    }).detach();
+                    return 0;
+                }
+                // record bind
+                if(mx>=pa+160&&mx<=pa+232&&my>=ay+28&&my<=ay+54){
+                    playClick(); g_advRecKeyCapturing=true;
+                    InvalidateRect(hwnd,NULL,FALSE);
+                    std::thread([]{
+                        Sleep(300);
+                        while(g_advRecKeyCapturing){
+                            for(int vk=1;vk<255;vk++){
+                                if(!(GetAsyncKeyState(vk)&0x8000)) continue;
+                                if(vk==VK_ESCAPE){ g_advRecKey=0; showToast(L"Record bind cleared",T.subtext); }
+                                else {
+                                    std::wstring who;
+                                    if(advKeyInUse(vk,-1,who)) showToast((vkToString(vk)+L" is already "+who).c_str(),T.red);
+                                    else { g_advRecKey=vk; showSuccessToast((L"Record on "+vkToString(vk)).c_str()); }
+                                }
+                                g_advRecKeyCapturing=false;
                                 break;
                             }
                             Sleep(16);
@@ -19218,8 +19312,19 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
             break;
         }
         if(activeTab==0 && g_advancedMode){
-            g_advScroll += (GET_WHEEL_DELTA_WPARAM(wp)>0 ? -3 : 3);
-            if(g_advScroll<0) g_advScroll=0;
+            // Over the step list the wheel scrolls the list; anywhere else it scrolls
+            // the page, which is what it does on every other tab.
+            Layout lw=getLayout(hwnd);
+            bool overList = (pt.y > lw.yHotkey+300);
+            if(overList){
+                g_advScroll += (GET_WHEEL_DELTA_WPARAM(wp)>0 ? -3 : 3);
+                if(g_advScroll<0) g_advScroll=0;
+            } else {
+                RECT crw; GetClientRect(hwnd,&crw);
+                int maxS=std::max(0,mainTotalHeight-(int)crw.bottom+DOCK_H);
+                mainScrollPos += (GET_WHEEL_DELTA_WPARAM(wp)>0 ? -40 : 40);
+                mainScrollPos = std::max(0,std::min(mainScrollPos,maxS));
+            }
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
         }
