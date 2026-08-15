@@ -14992,22 +14992,32 @@ static DWORD WINAPI benchmarkThread(LPVOID){
     // hold during the worst moments of a match, not the calmest.
     double perClickUs = p90Us + jitterUs;
     if(perClickUs < 1.0) perClickUs = 1.0;
-    int ceiling = (int)(1000000.0 / perClickUs);
-    ceiling = std::max(MIN_KPS, std::min(MAX_KPS, ceiling));
-    // 60% of the ceiling. The macro is not the only thing that needs the CPU - the
-    // game has to render, and running near the limit is what causes the stalls this
-    // is meant to prevent.
-    int rec = std::max(MIN_KPS, std::min(MAX_KPS, (int)(ceiling*0.6)));
+    int emitCeiling = (int)(1000000.0 / perClickUs);   // what this PC can physically send
+
+    // Honest limits only. Two earlier attempts at a 'recommended' figure were both
+    // wrong: SendInput cost gave ~1700, and a presses-per-frame model gave 825 on a
+    // 165Hz display. The rate that actually works for this user is 300, and neither
+    // model predicts it, because the thing that decides it is not measurable from
+    // here - it is how the game server treats input, how close the opponent is, and
+    // how much risk the player will take.
+    //
+    // So this reports the one number it can stand behind - what the machine can emit -
+    // and starts people somewhere conservative rather than dressing a guess up as a
+    // measurement. Anyone who knows their own rate sets it and ignores this.
+    int ceiling = std::max(MIN_KPS, std::min(MAX_KPS, emitCeiling));
+    const int SAFE_START = 300;
+    int rec = std::max(MIN_KPS, std::min(ceiling, SAFE_START));
+
 
     g_benchSpecs=readMachineSpecs();
     wchar_t line[320];
-    swprintf(line,320,L"Benchmark on %s: send median %.0fus, p90 %.0fus, jitter %.0fus -> ceiling ~%d KPS",
-             g_benchSpecs.c_str(),medianUs,p90Us,jitterUs,ceiling);
+    swprintf(line,320,L"Benchmark on %s: p90 %.0fus + jitter %.0fus -> can emit up to %d KPS. Starting at %d.",
+             g_benchSpecs.c_str(),p90Us,jitterUs,emitCeiling,rec);
     LOG_INFO(line);
 
     g_benchBest=ceiling;
     g_benchRecommend=rec;
-    swprintf(line,224,L"Measured ceiling ~%d KPS. Recommended %d.",ceiling,rec);
+    swprintf(line,224,L"Your PC can emit %d KPS. Suggested start: %d - raise it until it costs you frames.",ceiling,rec);
     g_benchMessage=line;
     LOG_OK(line);
     // Suggest rather than impose - the user knows what they can run at.
