@@ -13183,6 +13183,7 @@ extern std::atomic<int>  trigArmKey;
 extern std::atomic<bool> trigArmHold;
 extern std::atomic<bool> g_trigArmed;
 extern std::atomic<bool> g_trigPicking;
+extern std::atomic<int>  g_trigMatches, g_trigDomR, g_trigDomG, g_trigDomB;
 extern std::atomic<int>  g_advRecKey;
 extern std::atomic<bool> g_advRecording;
 extern std::atomic<int>  trigR, trigG, trigB;
@@ -14342,10 +14343,16 @@ void hotkeyThread(){
                     armWas=ad;
                 }
                 if(g_trigPicking.load()){
-                    // Take the pixel under the cursor on the next left click. Reading a
-                    // single pixel off the screen DC is cheaper than any capture, and it
-                    // means nobody has to know their skin's hex.
-                    if(GetAsyncKeyState(VK_LBUTTON)&0x8000){
+                    // Wait for the button that started this to come back up before
+                    // listening for the next press. Without that, the very click on
+                    // "Pick from screen" is still down on the next pass and the colour
+                    // sampled is the button itself - which is why it kept coming back
+                    // as the dark of the wrathic UI.
+                    static bool armedForPick=false;
+                    bool lb=(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0;
+                    if(!lb) armedForPick=true;
+                    if(armedForPick && lb){
+                        armedForPick=false;
                         POINT pt; GetCursorPos(&pt);
                         HDC sdc=GetDC(NULL);
                         COLORREF c=GetPixel(sdc,pt.x,pt.y);
@@ -14769,6 +14776,11 @@ std::atomic<bool> trigArmHold{false};         // hold to keep it armed, vs tap t
 std::atomic<bool> g_trigArmed{false};         // what the bind actually says right now
 // Eyedropper: set from the UI, cleared once a colour has been taken.
 std::atomic<bool> g_trigPicking{false};
+// What the last scan actually saw. "It does not work" is unanswerable without this -
+// the scanner runs a thousand times a second inside a game and leaves no trace, so
+// these are published for the UI to read.
+std::atomic<int> g_trigMatches{0};                       // pixels matching the target
+std::atomic<int> g_trigDomR{0}, g_trigDomG{0}, g_trigDomB{0}; // most saturated pixel seen
 static std::atomic<bool> gTrigThreadRun{false};
 static HANDLE gTrigThread=NULL;
 
@@ -14838,15 +14850,22 @@ static DWORD WINAPI triggerbotThread(LPVOID){
             // one is how a triggerbot parries at nothing.
             const int stride=std::max(1,trigStride.load());
             int matches=0;
-            for(int y=0;y<box && !hit;y+=stride){
+            int bestSat=-1, bR=0,bG=0,bB=0;
+            for(int y=0;y<box;y+=stride){
                 for(int x=0;x<box;x+=stride){
                     DWORD px=bits[y*box+x];
                     int b=(int)(px&0xFF), g=(int)((px>>8)&0xFF), r=(int)((px>>16)&0xFF);
-                    if(colourMatches(r,g,b,tr,tg,tb,tol)){
-                        if(++matches>=12){ hit=true; break; }
-                    }
+                    // Track the most colourful pixel in the box regardless of whether it
+                    // matches. If the scanner is looking at the wrong place, or the cue
+                    // is not the colour we think, this is what says so.
+                    int mx=std::max(r,std::max(g,b)), mn=std::min(r,std::min(g,b));
+                    if(mx-mn>bestSat){ bestSat=mx-mn; bR=r; bG=g; bB=b; }
+                    if(colourMatches(r,g,b,tr,tg,tb,tol)) matches++;
                 }
             }
+            hit = matches>=12;
+            g_trigMatches=matches;
+            g_trigDomR=bR; g_trigDomG=bG; g_trigDomB=bB;
         }
 
         int k=trigKey.load();
@@ -17223,7 +17242,28 @@ void paintMain(HWND hwnd){
             drawDot(hdc,bx+bfw,by+4,6,T.text);
             g_tbLay.boxX=bx; g_tbLay.boxY=by; g_tbLay.boxW=bw2;
         }
-        g_tbLay.yTune=ty;
+        g_tbLay.yTune=ty; ty+=102;
+
+        // What the scanner is seeing right now. Watch this while the ball changes: if
+        // "brightest" turns your colour and "matching" stays at 0, the tolerance is
+        // too tight. If "brightest" never changes, it is looking in the wrong place.
+        drawCard(hdc,p,ty,cw,86);
+        drawText(hdc,L"WHAT IT SEES",p+16,ty+10,200,12,T.subtext,hFontSmall);
+        {
+            int m=g_trigMatches.load();
+            int dr=g_trigDomR.load(), dg=g_trigDomG.load(), db=g_trigDomB.load();
+            wchar_t ml[64];
+            swprintf(ml,64,L"matching pixels   %d",m);
+            drawText(hdc,ml,p+16,ty+30,cw-32,16,m>=12?T.green:m?T.accent:T.subtext,hFontSmall,
+                     DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            drawText(hdc,L"brightest in box",p+16,ty+52,150,20,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            drawRR(hdc,p+150,ty+52,28,20,6,RGB(dr,dg,db),T.border,1);
+            wchar_t dl[48];
+            swprintf(dl,48,L"#%02X%02X%02X",dr,dg,db);
+            drawText(hdc,dl,p+186,ty+52,120,20,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            drawText(hdc,triggerbotEnabled.load()?L"":L"turn it on to see anything",
+                     p+16,ty+52,cw-32,20,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+        }
     }
 
     if(activeTab==2){
@@ -18664,6 +18704,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 if(g_optimiseRunning||g_optimiseDecisionPending) needRepaint=true;
                 if(g_kpsEditing) needRepaint=true;
                 if(g_advRecording.load()) needRepaint=true;   // step list is filling
+                if(activeTab==1 && triggerbotEnabled.load()) needRepaint=true; // live readout
                 if(g_capMinA>0.002f||g_capCloseA>0.002f||g_capHover) needRepaint=true;
                 if(g_cardAnimActive) needRepaint=true; // card hover fade still settling
                 // Active toasts need continuous repaints too (slide-in/stack
