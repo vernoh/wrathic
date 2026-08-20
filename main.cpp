@@ -47,6 +47,10 @@ namespace Gdiplus { using std::min; using std::max; }
 #pragma comment(lib, "pdh.lib")       // Pdh* counters in resourceThread
 #pragma comment(lib, "srclient.lib")  // SRSetRestorePointW
 #pragma comment(lib, "comdlg32.lib")  // GetOpenFileNameW / GetSaveFileNameW
+#pragma comment(lib, "d3d11.lib")     // Desktop Duplication - see SCREEN CAPTURE
+#pragma comment(lib, "dxgi.lib")
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include "logo_icon.h"
 
 #define APP_VERSION      L"v3.1.2"
@@ -14786,6 +14790,119 @@ static void hsvToRgb(float h,float s,float v,int& R,int& G,int& B){
     R=(int)((r+m)*255.0f); G=(int)((g+m)*255.0f); B=(int)((b+m)*255.0f);
 }
 
+// ===================== SCREEN CAPTURE =====================
+// Desktop Duplication, because the triggerbot has to watch the whole screen and GDI
+// cannot do that fast enough. Reading the screen through BitBlt pulls the desktop back
+// out of the compositor a frame at a time; measured on a 1920x1080 165Hz display, the
+// whole screen took 17.3ms a pass and 6.25ms of CPU, which drops the scan to 58Hz -
+// slower to react than the small box it replaced, which is the opposite of the point.
+//
+// Duplication hands over the frame the GPU has already composited. There is no readback
+// of a surface the CPU never needed, AcquireNextFrame blocks until the desktop actually
+// changes, and the whole screen costs about what a small BitBlt did.
+//
+// It is not always available - a fullscreen-exclusive game, a secured desktop, or a
+// driver that refuses the adapter will all fail it - so every entry point reports
+// failure and the triggerbot falls back to the GDI path underneath.
+struct DupCapture {
+    ID3D11Device*           dev     = nullptr;
+    ID3D11DeviceContext*    ctx     = nullptr;
+    IDXGIOutputDuplication* dup     = nullptr;
+    ID3D11Texture2D*        staging = nullptr;
+    int  w = 0, h = 0;
+    bool ok = false;
+
+    void shutdown(){
+        if(mapped&&ctx&&staging){ ctx->Unmap(staging,0); mapped=false; }
+        if(staging){ staging->Release(); staging=nullptr; }
+        if(dup){ dup->ReleaseFrame(); dup->Release(); dup=nullptr; }
+        if(ctx){ ctx->Release(); ctx=nullptr; }
+        if(dev){ dev->Release(); dev=nullptr; }
+        w=h=0; ok=false;
+    }
+
+    bool init(){
+        shutdown();
+        // The output has to come from the adapter that drives it, or duplication is
+        // refused - which is what happens on a laptop if you take adapter 0 blindly.
+        IDXGIFactory1* fac=nullptr;
+        if(FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),(void**)&fac))) return false;
+        IDXGIAdapter1* ad=nullptr;
+        for(UINT ai=0; fac->EnumAdapters1(ai,&ad)!=DXGI_ERROR_NOT_FOUND; ai++){
+            IDXGIOutput* out0=nullptr;
+            if(ad->EnumOutputs(0,&out0)==S_OK && out0){
+                D3D_FEATURE_LEVEL got;
+                HRESULT hr=D3D11CreateDevice(ad,D3D_DRIVER_TYPE_UNKNOWN,NULL,0,NULL,0,
+                                             D3D11_SDK_VERSION,&dev,&got,&ctx);
+                if(SUCCEEDED(hr)){
+                    IDXGIOutput1* out1=nullptr;
+                    if(SUCCEEDED(out0->QueryInterface(__uuidof(IDXGIOutput1),(void**)&out1)) && out1){
+                        DXGI_OUTPUT_DESC od={};
+                        out0->GetDesc(&od);
+                        w=od.DesktopCoordinates.right-od.DesktopCoordinates.left;
+                        h=od.DesktopCoordinates.bottom-od.DesktopCoordinates.top;
+                        if(SUCCEEDED(out1->DuplicateOutput(dev,&dup)) && dup){
+                            D3D11_TEXTURE2D_DESC td={};
+                            td.Width=w; td.Height=h; td.MipLevels=1; td.ArraySize=1;
+                            td.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+                            td.SampleDesc.Count=1;
+                            td.Usage=D3D11_USAGE_STAGING;
+                            td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+                            if(SUCCEEDED(dev->CreateTexture2D(&td,NULL,&staging)) && staging) ok=true;
+                        }
+                        out1->Release();
+                    }
+                }
+                out0->Release();
+            }
+            ad->Release();
+            if(ok) break;
+            shutdown();
+        }
+        fac->Release();
+        return ok;
+    }
+
+    // Takes the newest desktop frame and maps it for reading. The caller scans the
+    // mapping directly and calls unlock() - there is deliberately no copy into a buffer
+    // of our own. Copying the desktop out first cost an 8MB memcpy per frame, which at
+    // 165Hz measured as most of the triggerbot's CPU time; the scan only ever looks at
+    // every third pixel of every third row, so almost all of that copying was of pixels
+    // nothing would read.
+    //
+    // Returns false when nothing new arrived inside the timeout. That is not an error:
+    // it means the screen has not changed, so the previous scan still stands.
+    bool lock(const BYTE*& base,int& pitch,UINT timeoutMs=8){
+        if(!ok||mapped) return false;
+        DXGI_OUTDUPL_FRAME_INFO fi={};
+        IDXGIResource* res=nullptr;
+        dup->ReleaseFrame();
+        HRESULT hr=dup->AcquireNextFrame(timeoutMs,&fi,&res);
+        if(hr==DXGI_ERROR_WAIT_TIMEOUT){ if(res) res->Release(); return false; }
+        if(FAILED(hr)){
+            // ACCESS_LOST is normal - a resolution change, a game going fullscreen, or
+            // the session locking. Rebuild rather than giving up on duplication.
+            if(res) res->Release();
+            if(hr==DXGI_ERROR_ACCESS_LOST) init();
+            else ok=false;
+            return false;
+        }
+        ID3D11Texture2D* tex=nullptr;
+        if(FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D),(void**)&tex)) || !tex){
+            res->Release(); return false;
+        }
+        ctx->CopyResource(staging,tex);
+        tex->Release(); res->Release();
+
+        D3D11_MAPPED_SUBRESOURCE m={};
+        if(FAILED(ctx->Map(staging,0,D3D11_MAP_READ,0,&m))) return false;
+        base=(const BYTE*)m.pData; pitch=(int)m.RowPitch; mapped=true;
+        return true;
+    }
+    void unlock(){ if(mapped){ ctx->Unmap(staging,0); mapped=false; } }
+    bool mapped=false;
+};
+
 // ===================== TRIGGERBOT =====================
 // Watches a small box at the centre of the screen and fires a key when the target
 // colour appears in it. Mutually exclusive with the click engine - they both drive
@@ -14820,13 +14937,17 @@ std::atomic<int>  trigTolerance{40};          // 0..255 per-channel distance
 //    1280x720  11.4ms/pass   88Hz  3.44ms CPU      <- falls off the cliff
 //    1920x1080 17.3ms/pass   58Hz  6.25ms CPU
 //
-// Past about half a million pixels the copy no longer fits in a frame and the scan
-// rate halves, which costs far more reaction time than the extra area buys. So: half
-// the screen in each direction, capped at the largest size that still fits. Scanning
-// the literal whole screen would have made the triggerbot slower to react, not faster.
+// Past about half a million pixels the copy no longer fits in a frame and the scan rate
+// halves. That is a limit of GDI, not of the idea, which is why the whole screen is
+// captured through Desktop Duplication instead - see SCREEN CAPTURE above. These sizes
+// are only the fallback used when duplication is unavailable, where a centred region is
+// still the fastest thing GDI can do.
 #define TB_CAP_MAX_W 960
 #define TB_CAP_MAX_H 540
-#define TB_STRIDE 2
+// Sampling step. Duplication hands over the full desktop, so the step does the thinning
+// the old scan box used to do by being small: 3 on a 1920x1080 screen is 230k samples a
+// pass, and a ball is far more than 3px across.
+#define TB_STRIDE 3
 std::atomic<int>  trigDelayMs{0};             // optional reaction delay
 std::atomic<bool> trigHoldMode{false};        // hold while seen, vs a single tap
 // The bind that arms it. Separate from trigKey, which is the key it presses - those
@@ -14846,6 +14967,9 @@ std::atomic<int> g_trigDomR{0}, g_trigDomG{0}, g_trigDomB{0}; // most saturated 
 // is actually being matched rather than only what was asked for.
 std::atomic<int> g_trigAvgR{0}, g_trigAvgG{0}, g_trigAvgB{0};
 std::atomic<bool> g_trigAvgValid{false};
+// Whether the whole screen is actually being watched, or only the centre. The two
+// behave differently enough that the UI has to say which one is running.
+std::atomic<bool> g_trigWholeScreen{false};
 // How many matching pixels count as a target, in the downscaled capture, and how long
 // a tap is held for.
 #define TB_MIN_MATCH   14
@@ -14895,6 +15019,14 @@ static DWORD WINAPI triggerbotThread(LPVOID){
 
     int capW=0, capH=0;   // rebuilt only if the display resolution changes
 
+    // Whole-screen capture, with the GDI region as the fallback. Tried once here and
+    // re-tried on ACCESS_LOST inside grab(), so going fullscreen and back recovers.
+    DupCapture dup;
+    bool haveDup=dup.init();
+    LOG_INFO(haveDup ? L"Triggerbot: watching the whole screen (Desktop Duplication)"
+                     : L"Triggerbot: Desktop Duplication unavailable - watching the centre of the screen");
+    g_trigWholeScreen=haveDup;
+
     while(gTrigThreadRun.load(std::memory_order_relaxed)){
         // Enabled is the user's intent; armed is the bind's answer. With no bind set,
         // enabled alone arms it, which is how it behaved before.
@@ -14908,10 +15040,31 @@ static DWORD WINAPI triggerbotThread(LPVOID){
             Sleep(15);
             continue;
         }
+        // ── whole screen, when duplication is working ───────────────────────
+        // One view over whichever capture produced the pixels: a base pointer, a row
+        // pitch in bytes, and a size. Duplication maps its staging texture here and the
+        // GDI fallback points at its DIB.
+        const BYTE* base=NULL;
+        int pitch=0, pw=0, ph=0;
+        bool dupHeld=false;
+        if(haveDup){
+            if(dup.lock(base,pitch)){
+                pw=dup.w; ph=dup.h; dupHeld=true;
+            } else if(!dup.ok){
+                haveDup=false;             // gone for good - drop to GDI
+                g_trigWholeScreen=false;
+                LOG_ERR(L"Triggerbot: lost Desktop Duplication - falling back to the centre of the screen");
+            } else {
+                // Timed out: nothing on screen changed, so there is nothing new to
+                // decide on. Wait rather than re-scanning an identical frame.
+                Sleep(1); continue;
+            }
+        }
+
         int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
         int wantW=std::min(TB_CAP_MAX_W,std::max(64,sw/2));
         int wantH=std::min(TB_CAP_MAX_H,std::max(64,sh/2));
-        if(wantW!=capW||wantH!=capH||!bmp){
+        if(!base && (wantW!=capW||wantH!=capH||!bmp)){
             if(bmp){ SelectObject(mem,oldBmp); DeleteObject(bmp); bmp=NULL; bits=NULL; }
             BITMAPINFO bi={};
             bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
@@ -14923,10 +15076,12 @@ static DWORD WINAPI triggerbotThread(LPVOID){
             bits=(DWORD*)pv; oldBmp=(HBITMAP)SelectObject(mem,bmp);
             capW=wantW; capH=wantH;
         }
-        if(!bits){ Sleep(50); continue; }
-
-        BitBlt(mem,0,0,capW,capH,screen,sw/2-capW/2,sh/2-capH/2,SRCCOPY);
-        GdiFlush();
+        if(!base){
+            if(!bits){ Sleep(50); continue; }
+            BitBlt(mem,0,0,capW,capH,screen,sw/2-capW/2,sh/2-capH/2,SRCCOPY);
+            GdiFlush();
+            base=(const BYTE*)bits; pitch=capW*4; pw=capW; ph=capH;
+        }
 
         const int tr=trigR.load(), tg=trigG.load(), tb=trigB.load(), tol=trigTolerance.load();
         bool hit=false;
@@ -14939,9 +15094,9 @@ static DWORD WINAPI triggerbotThread(LPVOID){
             long long sR=0,sG=0,sB=0;   // running mean of everything that matched
             // Every other pixel in each direction. A ball is tens of pixels across, so
             // a stride of 2 loses nothing and quarters the work.
-            for(int y=0;y<capH;y+=TB_STRIDE){
-                const DWORD* row=bits+(size_t)y*capW;
-                for(int x=0;x<capW;x+=TB_STRIDE){
+            for(int y=0;y<ph;y+=TB_STRIDE){
+                const DWORD* row=(const DWORD*)(base+(size_t)y*pitch);
+                for(int x=0;x<pw;x+=TB_STRIDE){
                     DWORD px=row[x];
                     int b=(int)(px&0xFF), g=(int)((px>>8)&0xFF), r=(int)((px>>16)&0xFF);
                     // Track the most colourful pixel seen regardless of whether it
@@ -14962,6 +15117,7 @@ static DWORD WINAPI triggerbotThread(LPVOID){
                 g_trigAvgValid=true;
             } else g_trigAvgValid=false;
         }
+        if(dupHeld) dup.unlock();
 
         int k=trigKey.load();
         bool wantDown = hit;
@@ -14990,6 +15146,7 @@ static DWORD WINAPI triggerbotThread(LPVOID){
         Sleep(1);
     }
 
+    dup.shutdown();
     if(bmp){ SelectObject(mem,oldBmp); DeleteObject(bmp); }
     DeleteDC(mem);
     ReleaseDC(NULL,screen);
@@ -17285,7 +17442,23 @@ void paintMain(HWND hwnd){
                  p+16,ty+30,cw-90,20,triggerbotEnabled.load()?T.green:T.subtext,
                  hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         drawToggle(hdc,p+cw-56,ty+32,triggerbotEnabled.load());
+        // Say which half of the screen it is watching, because the two behave
+        // differently and there is otherwise no way to tell which one is running.
+        drawText(hdc, triggerbotEnabled.load()
+                        ? (g_trigWholeScreen.load() ? L"whole screen" : L"centre only")
+                        : L"",
+                 p+16,ty+48,cw-90,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         g_tbLay.yEnable=ty; ty+=78;
+
+        // Nothing below here means anything while it is switched off - a column of
+        // dead controls just reads as clutter. The switch above stays, so there is
+        // always a way back.
+        if(!triggerbotEnabled.load()){
+            drawText(hdc,L"Turn it on to set the colour, the bind and the tolerance.",
+                     p+16,ty+8,cw-32,18,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            g_tbLay.yArm=-10000; g_tbLay.yKey=-10000; g_tbLay.yColour=-10000; g_tbLay.yTune=-10000;
+            g_tbLay.tolW=0; g_tbLay.hueW=0; g_tbLay.pickW=0;
+        } else {
 
         // The bind that arms it, which is a different thing from the key it presses.
         // Without this the only way to start it was the toggle above, and you cannot
@@ -17390,9 +17563,8 @@ void paintMain(HWND hwnd){
             wchar_t dl[48];
             swprintf(dl,48,L"#%02X%02X%02X",dr,dg,db);
             drawText(hdc,dl,p+186,ty+52,120,20,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            drawText(hdc,triggerbotEnabled.load()?L"":L"turn it on to see anything",
-                     p+16,ty+52,cw-32,20,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         }
+        }   // end of the enabled-only section
     }
 
     if(activeTab==2){
@@ -19092,6 +19264,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             int mxT=GET_X_LPARAM(lp), myT=GET_Y_LPARAM(lp);
             if(myT < crT.bottom-DOCK_H){
                 bool handled=false;
+                // Everything except the switch itself is inert while it is off, matching
+                // the paint above. Without this the hit tests still ran against layout
+                // slots that were never drawn this frame.
+                if(!triggerbotEnabled.load()){
+                    bool onSwitch = mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&
+                                    myT>=g_tbLay.yEnable+32&&myT<=g_tbLay.yEnable+56;
+                    if(!onSwitch){ g_tbHexEditing=false; return 0; }
+                }
                 // enable / disable
                 if(mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&myT>=g_tbLay.yEnable+32&&myT<=g_tbLay.yEnable+56){
                     playToggle();
