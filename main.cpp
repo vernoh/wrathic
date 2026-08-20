@@ -17752,7 +17752,10 @@ static int calcOvPosCardH(){
 SLayout getSLayout(HWND hwnd){
     RECT cr; GetClientRect(hwnd,&cr);
     SLayout l; l.W=cr.right; l.pad=14; l.cw=l.W-l.pad*2-16;
-    int y = 8 - settScrollPos;
+    // Below the header, not behind it. This started at 8, which put the vouch card
+    // entirely underneath the 44px title bar - so the settings page opened with a card
+    // you could see the bottom edge of and nothing else.
+    int y = HEADER_H + 8 - settScrollPos;
     l.yVouch     = y; y += 48 + GAP;
     l.yRes       = y; y += calcOverlayCardH() + GAP;
     if(kpsOverlayEnabled||resOverlayEnabled) y += calcOvPosCardH() + GAP;
@@ -17785,7 +17788,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     SLayout l = getSLayout(NULL); // reuse getSLayout logic for yVouch etc
     // Recompute with correct W (getSLayout uses hwnd client rect)
     l.W=W; l.pad=14; l.cw=W-l.pad*2-16;
-    int y2 = 8 - settScrollPos;
+    int y2 = HEADER_H + 8 - settScrollPos;   // must match getSLayout above
     l.yVouch     = y2; y2 += 48 + GAP;
     l.yRes       = y2; y2 += calcOverlayCardH() + GAP;
     if(kpsOverlayEnabled||resOverlayEnabled) y2 += calcOvPosCardH() + GAP;
