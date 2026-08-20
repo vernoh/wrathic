@@ -49,7 +49,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #pragma comment(lib, "comdlg32.lib")  // GetOpenFileNameW / GetSaveFileNameW
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.1"
+#define APP_VERSION      L"v3.1.2"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13187,7 +13187,7 @@ extern std::atomic<int>  g_trigMatches, g_trigDomR, g_trigDomG, g_trigDomB;
 extern std::atomic<int>  g_advRecKey;
 extern std::atomic<bool> g_advRecording;
 extern std::atomic<int>  trigR, trigG, trigB;
-extern std::atomic<int>  trigKey, trigR, trigG, trigB, trigTolerance, trigBox, trigDelayMs;
+extern std::atomic<int>  trigKey, trigR, trigG, trigB, trigTolerance, trigDelayMs;
 extern std::atomic<bool> trigHoldMode;
 
 // ===================== REGISTRY STORAGE =====================
@@ -13239,7 +13239,6 @@ void saveSettings() {
     regSetDWORD(L"TrigG",(DWORD)trigG.load());
     regSetDWORD(L"TrigB",(DWORD)trigB.load());
     regSetDWORD(L"TrigTol",(DWORD)trigTolerance.load());
-    regSetDWORD(L"TrigBox",(DWORD)trigBox.load());
     regSetDWORD(L"TrigDelay",(DWORD)trigDelayMs.load());
     regSetDWORD(L"TrigHold",(DWORD)trigHoldMode.load());
     regSetDWORD(L"HotkeyVK",(DWORD)hotkeyVK.load());
@@ -13305,7 +13304,6 @@ void loadSettings() {
     trigG         = (int)regGetDWORD(L"TrigG",0);
     trigB         = (int)regGetDWORD(L"TrigB",0);
     trigTolerance = std::max(0,std::min(255,(int)regGetDWORD(L"TrigTol",40)));
-    trigBox       = std::max(2,std::min(128,(int)regGetDWORD(L"TrigBox",16)));
     trigDelayMs   = std::max(0,std::min(500,(int)regGetDWORD(L"TrigDelay",0)));
     trigHoldMode  = regGetDWORD(L"TrigHold",0)!=0;
     int hk=(int)regGetDWORD(L"HotkeyVK",VK_F8);
@@ -14765,8 +14763,15 @@ int benchmarkSystem(){
 
 // Hit-test rectangles for the triggerbot page, filled in while painting so the click
 // handler never has to duplicate the layout arithmetic.
-struct TbLayout { int yEnable,yArm,yKey,yColour,yTune; int hueX,hueY,hueW,hueH; int tolX,tolY,tolW; int boxX,boxY,boxW; int pickX,pickY,pickW,pickH; };
+struct TbLayout { int yEnable,yArm,yKey,yColour,yTune; int hueX,hueY,hueW,hueH; int tolX,tolY,tolW; int pickX,pickY,pickW,pickH; };
 static TbLayout g_tbLay={};
+// Where along the tolerance track a given x sits. Shared by the click and the drag so
+// the two can never disagree about what a position means.
+static inline int trigTolFromX(int x){
+    if(g_tbLay.tolW<=0) return 0;
+    float f=(float)(x-g_tbLay.tolX)/(float)g_tbLay.tolW;
+    return std::max(0,std::min(255,(int)(f*255.0f+0.5f)));
+}
 bool                g_tbCapturing=false;   // waiting for the user to press a key
 static bool         g_tbHexEditing=false;
 static std::wstring g_tbHexBuf;
@@ -14799,13 +14804,29 @@ std::atomic<int>  trigKey{'F'};               // key it presses - F is parry in 
 // so white must not match - which is why the check below rejects greys outright.
 std::atomic<int>  trigR{8}, trigG{134}, trigB{8};
 std::atomic<int>  trigTolerance{40};          // 0..255 per-channel distance
-// The old 16px box sat at screen centre and almost never contained the ball. The cue
-// covers a large part of the screen once the character turns too, so the window is
-// wide and sampled with a stride instead - 14k samples a pass rather than 130k.
-std::atomic<int>  trigBox{360};               // capture square, px
-std::atomic<int>  trigStride{3};              // sample every Nth pixel
-#define TB_BOX_MIN 16
-#define TB_BOX_MAX 600
+// No scan box any more. It was a setting nobody could tune usefully - too small and the
+// ball was never inside it, too large and it cost frames - and it had a real bug: the
+// thread clamped it to 128 while the default was 360, so the number in the UI was not
+// the number being scanned.
+//
+// What replaces it is a large centred region, sized against a measured budget rather
+// than a guess. Reading from the screen DC blocks until the compositor's next frame,
+// so a capture costs one frame of wall time no matter how small it is - but the CPU
+// cost, and whether it fits inside that one frame at all, scale with the pixel count.
+// Measured on a 1920x1080 165Hz display:
+//
+//     640x360   6.1ms/pass  163Hz  0.31ms CPU
+//     960x540   6.5ms/pass  155Hz  0.94ms CPU      <- still one frame
+//    1280x720  11.4ms/pass   88Hz  3.44ms CPU      <- falls off the cliff
+//    1920x1080 17.3ms/pass   58Hz  6.25ms CPU
+//
+// Past about half a million pixels the copy no longer fits in a frame and the scan
+// rate halves, which costs far more reaction time than the extra area buys. So: half
+// the screen in each direction, capped at the largest size that still fits. Scanning
+// the literal whole screen would have made the triggerbot slower to react, not faster.
+#define TB_CAP_MAX_W 960
+#define TB_CAP_MAX_H 540
+#define TB_STRIDE 2
 std::atomic<int>  trigDelayMs{0};             // optional reaction delay
 std::atomic<bool> trigHoldMode{false};        // hold while seen, vs a single tap
 // The bind that arms it. Separate from trigKey, which is the key it presses - those
@@ -14821,8 +14842,37 @@ std::atomic<bool> g_trigPicking{false};
 // these are published for the UI to read.
 std::atomic<int> g_trigMatches{0};                       // pixels matching the target
 std::atomic<int> g_trigDomR{0}, g_trigDomG{0}, g_trigDomB{0}; // most saturated pixel seen
+// Mean colour of everything the current tolerance accepts, so the swatch can show what
+// is actually being matched rather than only what was asked for.
+std::atomic<int> g_trigAvgR{0}, g_trigAvgG{0}, g_trigAvgB{0};
+std::atomic<bool> g_trigAvgValid{false};
+// How many matching pixels count as a target, in the downscaled capture, and how long
+// a tap is held for.
+#define TB_MIN_MATCH   14
+#define TB_TAP_HOLD_MS 12
 static std::atomic<bool> gTrigThreadRun{false};
 static HANDLE gTrigThread=NULL;
+
+// Presses and releases the trigger key. Keyboard input goes as a SCAN CODE, not a
+// virtual key: Roblox reads the keyboard below the virtual-key layer, so a bare wVk
+// press is accepted by Windows and ignored by the game. Mouse buttons were unaffected
+// and went through their own path, which is exactly why M1 worked and F did not.
+// The click engine has always sent scan codes - this now matches it.
+static void trigSendKey(int k,bool down){
+    INPUT in{};
+    if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
+        in.type=INPUT_MOUSE;
+        if(k==VK_RBUTTON)      in.mi.dwFlags=down?MOUSEEVENTF_RIGHTDOWN:MOUSEEVENTF_RIGHTUP;
+        else if(k==VK_MBUTTON) in.mi.dwFlags=down?MOUSEEVENTF_MIDDLEDOWN:MOUSEEVENTF_MIDDLEUP;
+        else                   in.mi.dwFlags=down?MOUSEEVENTF_LEFTDOWN:MOUSEEVENTF_LEFTUP;
+    } else {
+        UINT sc=MapVirtualKey((UINT)k,MAPVK_VK_TO_VSC);
+        in.type=INPUT_KEYBOARD;
+        in.ki.wScan=(WORD)sc;
+        in.ki.dwFlags=KEYEVENTF_SCANCODE|(down?0:KEYEVENTF_KEYUP);
+    }
+    SendInput(1,&in,sizeof(INPUT));
+}
 
 // Squared distance in RGB. Comparing squares avoids a sqrt in the inner loop.
 static inline bool colourMatches(int r,int g,int b,int tr,int tg,int tb,int tol){
@@ -14841,8 +14891,9 @@ static DWORD WINAPI triggerbotThread(LPVOID){
     HDC mem=CreateCompatibleDC(screen);
     HBITMAP bmp=NULL, oldBmp=NULL;
     DWORD* bits=NULL;
-    int curBox=0;
     bool wasDown=false;
+
+    int capW=0, capH=0;   // rebuilt only if the display resolution changes
 
     while(gTrigThreadRun.load(std::memory_order_relaxed)){
         // Enabled is the user's intent; armed is the bind's answer. With no bind set,
@@ -14851,62 +14902,65 @@ static DWORD WINAPI triggerbotThread(LPVOID){
                      && (trigArmKey.load()==0 || g_trigArmed.load());
         if(!armed){
             if(wasDown){ // release if we were holding when it was switched off
-                INPUT up{}; int k=trigKey.load();
-                if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
-                    up.type=INPUT_MOUSE;
-                    up.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTUP:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEUP:MOUSEEVENTF_LEFTUP;
-                } else { up.type=INPUT_KEYBOARD; up.ki.wVk=(WORD)k; up.ki.dwFlags=KEYEVENTF_KEYUP; }
-                SendInput(1,&up,sizeof(INPUT));
+                trigSendKey(trigKey.load(),false);
                 wasDown=false; triggerbotFiring=false;
             }
             Sleep(15);
             continue;
         }
-
-        int box=std::max(2,std::min(128,trigBox.load()));
-        if(box!=curBox||!bmp){
-            if(bmp){ SelectObject(mem,oldBmp); DeleteObject(bmp); }
+        int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
+        int wantW=std::min(TB_CAP_MAX_W,std::max(64,sw/2));
+        int wantH=std::min(TB_CAP_MAX_H,std::max(64,sh/2));
+        if(wantW!=capW||wantH!=capH||!bmp){
+            if(bmp){ SelectObject(mem,oldBmp); DeleteObject(bmp); bmp=NULL; bits=NULL; }
             BITMAPINFO bi={};
             bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-            bi.bmiHeader.biWidth=box; bi.bmiHeader.biHeight=-box;
+            bi.bmiHeader.biWidth=wantW; bi.bmiHeader.biHeight=-wantH;
             bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
-            void* p=NULL;
-            bmp=CreateDIBSection(screen,&bi,DIB_RGB_COLORS,&p,NULL,0);
+            void* pv=NULL;
+            bmp=CreateDIBSection(screen,&bi,DIB_RGB_COLORS,&pv,NULL,0);
             if(!bmp){ Sleep(50); continue; }
-            bits=(DWORD*)p;
-            oldBmp=(HBITMAP)SelectObject(mem,bmp);
-            curBox=box;
+            bits=(DWORD*)pv; oldBmp=(HBITMAP)SelectObject(mem,bmp);
+            capW=wantW; capH=wantH;
         }
+        if(!bits){ Sleep(50); continue; }
 
-        int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
-        int sx=sw/2-box/2, sy=sh/2-box/2;
-        BitBlt(mem,0,0,box,box,screen,sx,sy,SRCCOPY);
+        BitBlt(mem,0,0,capW,capH,screen,sw/2-capW/2,sh/2-capH/2,SRCCOPY);
         GdiFlush();
 
         const int tr=trigR.load(), tg=trigG.load(), tb=trigB.load(), tol=trigTolerance.load();
         bool hit=false;
-        if(bits){
-            // A stride, and a run of matches rather than a single pixel: one stray
-            // green pixel from a nameplate or a particle is not a ball, and firing on
-            // one is how a triggerbot parries at nothing.
-            const int stride=std::max(1,trigStride.load());
+        {
+            // A run of matches rather than a single pixel: one stray green pixel from a
+            // nameplate or a particle is not a ball, and firing on one is how a
+            // triggerbot parries at nothing.
             int matches=0;
             int bestSat=-1, bR=0,bG=0,bB=0;
-            for(int y=0;y<box;y+=stride){
-                for(int x=0;x<box;x+=stride){
-                    DWORD px=bits[y*box+x];
+            long long sR=0,sG=0,sB=0;   // running mean of everything that matched
+            // Every other pixel in each direction. A ball is tens of pixels across, so
+            // a stride of 2 loses nothing and quarters the work.
+            for(int y=0;y<capH;y+=TB_STRIDE){
+                const DWORD* row=bits+(size_t)y*capW;
+                for(int x=0;x<capW;x+=TB_STRIDE){
+                    DWORD px=row[x];
                     int b=(int)(px&0xFF), g=(int)((px>>8)&0xFF), r=(int)((px>>16)&0xFF);
-                    // Track the most colourful pixel in the box regardless of whether it
-                    // matches. If the scanner is looking at the wrong place, or the cue
-                    // is not the colour we think, this is what says so.
+                    // Track the most colourful pixel seen regardless of whether it
+                    // matches. If the cue is not the colour we think, this says so.
                     int mx=std::max(r,std::max(g,b)), mn=std::min(r,std::min(g,b));
                     if(mx-mn>bestSat){ bestSat=mx-mn; bR=r; bG=g; bB=b; }
-                    if(colourMatches(r,g,b,tr,tg,tb,tol)) matches++;
+                    if(colourMatches(r,g,b,tr,tg,tb,tol)){ matches++; sR+=r; sG+=g; sB+=b; }
                 }
             }
-            hit = matches>=12;
+            hit = matches>=TB_MIN_MATCH;
             g_trigMatches=matches;
             g_trigDomR=bR; g_trigDomG=bG; g_trigDomB=bB;
+            // The average of what the tolerance is currently letting through. Widening
+            // the tolerance drags this away from the target, which is the only way to
+            // see - rather than guess - how much slack has been given.
+            if(matches>0){
+                g_trigAvgR=(int)(sR/matches); g_trigAvgG=(int)(sG/matches); g_trigAvgB=(int)(sB/matches);
+                g_trigAvgValid=true;
+            } else g_trigAvgValid=false;
         }
 
         int k=trigKey.load();
@@ -14914,36 +14968,25 @@ static DWORD WINAPI triggerbotThread(LPVOID){
         if(wantDown && !wasDown){
             int d=trigDelayMs.load();
             if(d>0) Sleep(d);
-            INPUT dn{};
-            if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
-                dn.type=INPUT_MOUSE;
-                dn.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTDOWN:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEDOWN:MOUSEEVENTF_LEFTDOWN;
-            } else { dn.type=INPUT_KEYBOARD; dn.ki.wVk=(WORD)k; }
-            SendInput(1,&dn,sizeof(INPUT));
+            trigSendKey(k,true);
             triggerbotFiring=true;
             if(!trigHoldMode.load()){
-                // Tap mode: release straight away and wait for the colour to clear
-                // before it can fire again, so one target is one press.
-                INPUT up=dn;
-                if(dn.type==INPUT_MOUSE)
-                    up.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTUP:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEUP:MOUSEEVENTF_LEFTUP;
-                else up.ki.dwFlags=KEYEVENTF_KEYUP;
-                SendInput(1,&up,sizeof(INPUT));
+                // Tap mode. The press is held briefly rather than released in the same
+                // breath: the game samples input once a frame, and a press that goes
+                // down and up between two samples is one the game never sees.
+                Sleep(TB_TAP_HOLD_MS);
+                trigSendKey(k,false);
                 triggerbotFiring=false;
             }
             wasDown=true;
         } else if(!wantDown && wasDown){
-            if(trigHoldMode.load()){
-                INPUT up{};
-                if(k==VK_LBUTTON||k==VK_RBUTTON||k==VK_MBUTTON){
-                    up.type=INPUT_MOUSE;
-                    up.mi.dwFlags=(k==VK_RBUTTON)?MOUSEEVENTF_RIGHTUP:(k==VK_MBUTTON)?MOUSEEVENTF_MIDDLEUP:MOUSEEVENTF_LEFTUP;
-                } else { up.type=INPUT_KEYBOARD; up.ki.wVk=(WORD)k; up.ki.dwFlags=KEYEVENTF_KEYUP; }
-                SendInput(1,&up,sizeof(INPUT));
-            }
+            if(trigHoldMode.load()) trigSendKey(k,false);
             triggerbotFiring=false;
             wasDown=false;
         }
+        // The capture above already blocks until the compositor's next frame, so this
+        // loop paces itself at the refresh rate without help. The 1ms is only a yield,
+        // in case a driver ever returns the copy without waiting.
         Sleep(1);
     }
 
@@ -15625,7 +15668,11 @@ struct Profile {
     int  kps=200, hotkey=VK_CONTROL; bool hold=false;
     std::vector<int> keys;
     bool tbEnabled=false, tbHold=false;
-    int  tbKey=VK_LBUTTON, tbR=255, tbG=0, tbB=0, tbTol=40, tbBox=16;
+    int  tbKey=VK_LBUTTON, tbR=255, tbG=0, tbB=0, tbTol=40;
+    // Dead, and kept only so the on-disk profile format does not shift. The scan box
+    // was removed when the triggerbot moved to watching the whole screen; dropping the
+    // column would misalign every field after it in files written by older builds.
+    int  tbBox=0;
 };
 static Profile g_profiles[PROFILE_SLOTS];
 
@@ -15640,7 +15687,7 @@ static Profile profileFromCurrent(const std::wstring& name){
     p.tbEnabled=triggerbotEnabled.load(); p.tbHold=trigHoldMode.load();
     p.tbKey=trigKey.load();
     p.tbR=trigR.load(); p.tbG=trigG.load(); p.tbB=trigB.load();
-    p.tbTol=trigTolerance.load(); p.tbBox=trigBox.load();
+    p.tbTol=trigTolerance.load();   // tbBox is written as a fixed 0, see the struct
     return p;
 }
 
@@ -15664,7 +15711,7 @@ static void profileApply(const Profile& p){
     // surprise that costs someone a match.
     trigHoldMode=p.tbHold; trigKey=p.tbKey;
     trigR=p.tbR; trigG=p.tbG; trigB=p.tbB;
-    trigTolerance=p.tbTol; trigBox=p.tbBox;
+    trigTolerance=p.tbTol;
     saveSettings();
 }
 
@@ -15725,7 +15772,9 @@ static bool profileDecode(const std::wstring& codeIn, Profile& out){
         p.tbG=(int)wcstol(f[6].substr(2,2).c_str(),nullptr,16);
         p.tbB=(int)wcstol(f[6].substr(4,2).c_str(),nullptr,16);
         p.tbTol=std::max(0,std::min(255,std::stoi(f[7])));
-        p.tbBox=std::max(2,std::min(128,std::stoi(f[8])));
+        // Field 8 is the retired scan box. Still parsed so a malformed value in an
+        // old profile is still rejected rather than ignored, but the value goes nowhere.
+        (void)std::stoi(f[8]);
     } catch(...){ return false; } // any malformed field fails the whole import
     out=p;
     return true;
@@ -17271,7 +17320,19 @@ void paintMain(HWND hwnd){
 
         drawCard(hdc,p,ty,cw,120);
         drawText(hdc,L"TARGET COLOUR",p+16,ty+10,200,12,T.subtext,hFontSmall);
-        drawRR(hdc,p+16,ty+30,44,44,10,RGB(trigR.load(),trigG.load(),trigB.load()),T.border,1);
+        // Two halves. The top is the colour that was asked for; the bottom is the mean
+        // of what the current tolerance is actually letting through, so widening the
+        // slider visibly drags the swatch away from the target instead of leaving the
+        // effect of the number to the imagination. They read as one block until the
+        // tolerance is too loose, which is the point.
+        {   int swx=p+16, swy=ty+30;
+            drawRR(hdc,swx,swy,44,44,10,RGB(trigR.load(),trigG.load(),trigB.load()),T.border,1);
+            if(g_trigAvgValid.load()){
+                COLORREF live=RGB(g_trigAvgR.load(),g_trigAvgG.load(),g_trigAvgB.load());
+                fillRect(hdc,swx+4,swy+24,36,16,live);
+                drawText(hdc,L"live",swx,swy+24,40,16,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            }
+        }
         {   wchar_t hex[16];
             swprintf(hex,16,L"#%02X%02X%02X",trigR.load(),trigG.load(),trigB.load());
             drawRR(hdc,p+70,ty+30,110,26,8,T.btn,g_tbHexEditing?T.accent:T.border,1);
@@ -17296,35 +17357,25 @@ void paintMain(HWND hwnd){
         }
         g_tbLay.yColour=ty; ty+=130;
 
-        drawCard(hdc,p,ty,cw,92);
+        drawCard(hdc,p,ty,cw,72);
         {   wchar_t tb[64];
             swprintf(tb,64,L"TOLERANCE   %d",trigTolerance.load());
             drawText(hdc,tb,p+16,ty+10,220,12,T.subtext,hFontSmall);
             drawText(hdc,L"how close a pixel must be to the colour",p+16+112,ty+10,cw-140,12,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+            // The same slider as the speed one on the macro tab, drawn by the same
+            // function - it grows under the hand, keeps the mouse through a drag and
+            // ticks as it moves. It was a bare track before, which looked and behaved
+            // like a different control for no reason.
             int sx=p+16, sy=ty+30, sw2=cw-32;
-            fillRect(hdc,sx,sy+3,sw2,3,T.btn);
-            int fw=(int)((float)trigTolerance.load()/255.0f*(float)sw2);
-            fillRect(hdc,sx,sy+3,fw,3,T.accent);
-            drawDot(hdc,sx+fw,sy+4,6,T.text);
+            drawSlider(hdc,sx,sy,sw2,trigTolerance.load(),0,255);
             g_tbLay.tolX=sx; g_tbLay.tolY=sy; g_tbLay.tolW=sw2;
-
-            swprintf(tb,64,L"SCAN BOX   %d px",trigBox.load());
-            drawText(hdc,tb,p+16,ty+52,220,12,T.subtext,hFontSmall);
-            drawText(hdc,L"square it watches, centred on screen",p+16+112,ty+52,cw-140,12,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-            int bx=p+16, by=ty+72, bw2=cw-32;
-            fillRect(hdc,bx,by+3,bw2,3,T.btn);
-            // 16..600. The old slider topped out at 128, so the 360 default sat off the
-            // end of its own track and could not be dragged back.
-            int bfw=(int)((float)(trigBox.load()-TB_BOX_MIN)/(float)(TB_BOX_MAX-TB_BOX_MIN)*(float)bw2);
-            fillRect(hdc,bx,by+3,bfw,3,T.accent);
-            drawDot(hdc,bx+bfw,by+4,6,T.text);
-            g_tbLay.boxX=bx; g_tbLay.boxY=by; g_tbLay.boxW=bw2;
         }
-        g_tbLay.yTune=ty; ty+=102;
+        g_tbLay.yTune=ty; ty+=82;
 
         // What the scanner is seeing right now. Watch this while the ball changes: if
         // "brightest" turns your colour and "matching" stays at 0, the tolerance is
-        // too tight. If "brightest" never changes, it is looking in the wrong place.
+        // too tight. It watches the whole screen, so "looking in the wrong place" is
+        // no longer one of the answers.
         drawCard(hdc,p,ty,cw,86);
         drawText(hdc,L"WHAT IT SEES",p+16,ty+10,200,12,T.subtext,hFontSmall);
         {
@@ -17332,9 +17383,9 @@ void paintMain(HWND hwnd){
             int dr=g_trigDomR.load(), dg=g_trigDomG.load(), db=g_trigDomB.load();
             wchar_t ml[64];
             swprintf(ml,64,L"matching pixels   %d",m);
-            drawText(hdc,ml,p+16,ty+30,cw-32,16,m>=12?T.green:m?T.accent:T.subtext,hFontSmall,
+            drawText(hdc,ml,p+16,ty+30,cw-32,16,m>=TB_MIN_MATCH?T.green:m?T.accent:T.subtext,hFontSmall,
                      DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            drawText(hdc,L"brightest in box",p+16,ty+52,150,20,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            drawText(hdc,L"brightest on screen",p+16,ty+52,150,20,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             drawRR(hdc,p+150,ty+52,28,20,6,RGB(dr,dg,db),T.border,1);
             wchar_t dl[48];
             swprintf(dl,48,L"#%02X%02X%02X",dr,dg,db);
@@ -18859,6 +18910,16 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             int sh=settingsHitTest(hwnd,mx,my);
             if(sh!=g_settHoverId){ setSettHover(sh); InvalidateRect(hwnd,NULL,FALSE); }
         }
+        if(activeTab==1 && g_sliderDragging && (wp&MK_LBUTTON)){
+            // Same gesture, same detent tick, same rate limit as the speed slider.
+            int nt=trigTolFromX(mx);
+            if(nt!=trigTolerance.load()){
+                static DWORD lastTolTick=0;
+                DWORD nowT=GetTickCount();
+                if(nowT-lastTolTick>40){ playTick(); lastTolTick=nowT; }
+                trigTolerance=nt; InvalidateRect(hwnd,NULL,FALSE);
+            }
+        }
         if(activeTab==0){
             bool draggingSlider=g_sliderDragging&&(wp&MK_LBUTTON);
             if(draggingSlider){
@@ -19102,16 +19163,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     int r2,g2,b2; hsvToRgb(h,1.0f,1.0f,r2,g2,b2);
                     trigR=r2; trigG=g2; trigB=b2; playClick(); saveSettings(); handled=true;
                 }
-                // tolerance / scan box sliders
+                // Tolerance. Takes the mouse for the whole gesture, the same way the
+                // speed slider does - without capture, sliding a few pixels off the
+                // track vertically ended the drag mid-move.
                 else if(mxT>=g_tbLay.tolX&&mxT<=g_tbLay.tolX+g_tbLay.tolW&&
                         myT>=g_tbLay.tolY-8&&myT<=g_tbLay.tolY+14){
-                    trigTolerance=std::max(0,std::min(255,(int)((float)(mxT-g_tbLay.tolX)/(float)g_tbLay.tolW*255.0f)));
-                    saveSettings(); handled=true;
-                }
-                else if(mxT>=g_tbLay.boxX&&mxT<=g_tbLay.boxX+g_tbLay.boxW&&
-                        myT>=g_tbLay.boxY-8&&myT<=g_tbLay.boxY+14){
-                    trigBox=std::max(TB_BOX_MIN,std::min(TB_BOX_MAX,TB_BOX_MIN+(int)((float)(mxT-g_tbLay.boxX)/(float)g_tbLay.boxW*(float)(TB_BOX_MAX-TB_BOX_MIN))));
-                    saveSettings(); handled=true;
+                    g_sliderDragging=true; SetCapture(hwnd);
+                    trigTolerance=trigTolFromX(mxT);
+                    playClick(); handled=true;
                 }
                 else { g_tbHexEditing=false; }
                 if(handled){ InvalidateRect(hwnd,NULL,FALSE); return 0; }
