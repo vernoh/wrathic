@@ -13481,7 +13481,14 @@ std::wstring latestVersion = L"";
 // on top of the normal (blurred) UI, and the KPS/resource overlay window
 // is force-hidden while any lock is active - see spawnOverlay/updateOverlay.
 enum LockKind { LOCK_NONE=0, LOCK_UPDATE=1, LOCK_LICENSE=2 };
-LockKind g_lockKind = LOCK_NONE;
+// Written by the licence poll on its own thread, read by the paint and by both bind
+// threads. It is the gate that has to hold the moment a key is revoked mid-session,
+// so it is atomic rather than a plain enum shared across threads. Comparisons and
+// assignments below read unchanged - std::atomic converts implicitly.
+std::atomic<LockKind> g_lockKind{LOCK_NONE};
+// Trial expiry as a UTC epoch, 0 when this key is not a trial. The server is the
+// authority; the old day counter only ever described the offline trial.
+std::atomic<long long> g_trialExpiryUtc{0};
 std::wstring g_lockTitle;
 std::wstring g_lockSubtitle;
 std::wstring g_lockButtonText;   // empty = no button rendered
@@ -13904,6 +13911,26 @@ std::string githubGet(const char* path){
 void saveLicense(const std::wstring& k){ regSetString(L"LicenseKey",k); }
 std::wstring loadLicense(){ return regGetString(L"LicenseKey",L""); }
 
+// "2026-08-21T14:30:00" (or with a fractional part, or a trailing Z) to a UTC epoch.
+// Postgres hands back a few shapes depending on the column type, so only the leading
+// six fields are read and anything after the seconds is ignored.
+static long long isoToEpochUtc(const std::string& iso){
+    int Y=0,M=0,D=0,h=0,m=0,sec=0;
+    if(sscanf_s(iso.c_str(),"%d-%d-%dT%d:%d:%d",&Y,&M,&D,&h,&m,&sec)<3) return 0;
+    SYSTEMTIME st={};
+    st.wYear=(WORD)Y; st.wMonth=(WORD)M; st.wDay=(WORD)D;
+    st.wHour=(WORD)h; st.wMinute=(WORD)m; st.wSecond=(WORD)sec;
+    FILETIME ft;
+    if(!SystemTimeToFileTime(&st,&ft)) return 0;
+    ULARGE_INTEGER u; u.LowPart=ft.dwLowDateTime; u.HighPart=ft.dwHighDateTime;
+    return (long long)(u.QuadPart/10000000ULL) - 11644473600LL;   // FILETIME epoch -> Unix
+}
+static long long nowEpochUtc(){
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u; u.LowPart=ft.dwLowDateTime; u.HighPart=ft.dwHighDateTime;
+    return (long long)(u.QuadPart/10000000ULL) - 11644473600LL;
+}
+
 // Returns: -1=network error, 0=invalid, 1=valid+match, 2=valid+just activated,
 //          3=hwid mismatch, 4=trial expired, 5=client key rejected (build out of date)
 int validateLicense(const std::wstring& key, const std::wstring& hwid) {
@@ -13929,13 +13956,14 @@ int validateLicense(const std::wstring& key, const std::wstring& hwid) {
         if(ep!=std::string::npos){
             ep+=14;
             std::string exStr=resp.substr(ep,resp.find("\"",ep)-ep);
+            g_trialExpiryUtc = isoToEpochUtc(exStr);
             SYSTEMTIME st;GetSystemTime(&st);
             char now[32];
             snprintf(now,sizeof(now),"%04d-%02d-%02dT%02d:%02d:%02dZ",
                 st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
             if(std::string(now)>exStr){LOG_ERR(L"Trial expired - purchase a license");return 4;}
         }
-    }
+    } else g_trialExpiryUtc = 0;   // a bought licence never shows a countdown
 
     bool noHWID=resp.find("\"hwid\":null")!=std::string::npos;
     bool match =resp.find("\"hwid\":\""+wtos(hwid)+"\"")!=std::string::npos;
@@ -14328,6 +14356,18 @@ void captureThread(bool isHotkey){
 void hotkeyThread(){
     bool was=false, wasRunning=false;
     while(appRunning){
+        // A revoked key, an expired trial or a required update has to stop the product
+        // working, and that means the binds - not just the running flag. Clearing
+        // macroRunning at the point of revocation was never enough on its own: the
+        // next press of the bind simply turned it back on, so a revoked licence
+        // carried on clicking for as long as the window stayed open.
+        if(g_lockKind!=LOCK_NONE){
+            if(macroRunning.load()) macroRunning=false;
+            if(g_trigArmed.load())  g_trigArmed=false;
+            was=false; wasRunning=false;
+            Sleep(100);
+            continue;
+        }
         if(!capturingHotkey&&!capturingKey){
             bool focused=robloxFocused.load();
             bool pressed=(GetAsyncKeyState(hotkeyVK.load())&0x8000)!=0;
@@ -14807,7 +14847,8 @@ static DWORD WINAPI triggerbotThread(LPVOID){
     while(gTrigThreadRun.load(std::memory_order_relaxed)){
         // Enabled is the user's intent; armed is the bind's answer. With no bind set,
         // enabled alone arms it, which is how it behaved before.
-        bool armed = triggerbotEnabled.load() && (trigArmKey.load()==0 || g_trigArmed.load());
+        bool armed = g_lockKind==LOCK_NONE && triggerbotEnabled.load()
+                     && (trigArmKey.load()==0 || g_trigArmed.load());
         if(!armed){
             if(wasDown){ // release if we were holding when it was switched off
                 INPUT up{}; int k=trigKey.load();
@@ -14948,7 +14989,7 @@ static std::wstring readMachineSpecs(){
     wchar_t cpu[128]={};
     HKEY hk;
     if(RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-        L"HARDWARE\DESCRIPTION\System\CentralProcessor\0",0,KEY_READ,&hk)==ERROR_SUCCESS){
+        L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",0,KEY_READ,&hk)==ERROR_SUCCESS){
         DWORD sz=sizeof(cpu), type=REG_SZ;
         RegQueryValueExW(hk,L"ProcessorNameString",NULL,&type,(LPBYTE)cpu,&sz);
         RegCloseKey(hk);
@@ -15002,10 +15043,10 @@ static DWORD WINAPI benchmarkThread(LPVOID){
     }
     if(costs.empty()){ timeEndPeriod(1); g_benchRunning=false; g_benchStage=0; return 0; }
 
-    // Median, not mean: a single scheduling hiccup in 180 samples would drag a mean
-    // far enough to change the recommendation.
+    // p90, not mean: a single scheduling hiccup in 180 samples would drag a mean far
+    // enough to change the recommendation, and the ceiling should describe a bad send
+    // rather than an average one.
     std::sort(costs.begin(),costs.end());
-    double medianUs=costs[costs.size()/2];
     double p90Us   =costs[(size_t)(costs.size()*0.90)];
 
     // ── Stage 2: how precisely can the wait loop hit an interval ─────────────
@@ -15510,6 +15551,16 @@ bool advKeyInUse(int vk,int ignoreMacroIdx,std::wstring& whoOut){
 static DWORD WINAPI advHotkeyThread(LPVOID){
     std::vector<bool> was(ADV_MAX_MACROS,false);
     while(appRunning){
+        // Locked means locked. Stop anything already running and ignore every bind,
+        // including the record bind - see hotkeyThread for why clearing the flag on
+        // its own was not sufficient.
+        if(g_lockKind!=LOCK_NONE){
+            if(g_advRecording.load()) advStopRecording();
+            if(g_advPlaying.load())   advStop();
+            for(size_t i=0;i<was.size();i++) was[i]=false;
+            Sleep(100);
+            continue;
+        }
         // Start and stop recording from a bind, because recording something in a game
         // means being in the game, not clicking a button in this window.
         {
@@ -16718,6 +16769,33 @@ static void drawCaptionButtons(HDC hdc,int W){
     REAL cx=(REAL)(closeX+BTN/2), cy=(REAL)(H/2), r=4.5f;
     g.DrawLine(&pc,cx-r,cy-r,cx+r,cy+r);
     g.DrawLine(&pc,cx+r,cy-r,cx-r,cy+r);
+
+    // Trial countdown. Every tab draws this row, so putting the clock here is what
+    // makes it visible at all times - a day-long trial is short enough that hours
+    // and minutes matter, which the settings card's "1 day(s) remaining" never said.
+    long long exp=g_trialExpiryUtc.load();
+    if(exp){
+        long long left=exp-nowEpochUtc();
+        wchar_t tb[48];
+        COLORREF fg=T.accent;
+        if(left<=0){ wcscpy(tb,L"Trial expired"); fg=T.red; }
+        else{
+            long long mins=left/60, hrs=mins/60, days=hrs/24;
+            if(days>0)      swprintf(tb,48,L"Trial \u00b7 %lldd %lldh",days,hrs%24);
+            else if(hrs>0)  swprintf(tb,48,L"Trial \u00b7 %lldh %lldm",hrs,mins%60);
+            else            swprintf(tb,48,L"Trial \u00b7 %lldm",mins);
+            if(left<3600) fg=T.red;          // last hour reads as urgent
+        }
+        SIZE ts={};
+        HGDIOBJ oldF=SelectObject(hdc,hFontSmall);
+        GetTextExtentPoint32W(hdc,tb,(int)wcslen(tb),&ts);
+        SelectObject(hdc,oldF);
+        int pw=ts.cx+20, px=190, py=(H-20)/2;
+        if(px+pw < minX-8){                  // never draw under the caption buttons
+            drawRR(hdc,px,py,pw,20,10,T.btn,fg,1);
+            drawText(hdc,tb,px,py,pw,20,fg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+    }
 }
 
 void paintMain(HWND hwnd){
