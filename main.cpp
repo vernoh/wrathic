@@ -16029,6 +16029,9 @@ int  g_advScroll=0;          // step list scroll, in rows
 // How far the list can actually scroll, recorded by the paint. The wheel handler needs
 // it to know when the list has run out and the page should take over.
 int  g_advScrollMax=0;
+// Where the step list actually ended up, so the wheel handler can tell whether the
+// pointer is over it without recomputing the page geometry.
+int  g_advListTop=0, g_advListH=0;
 int  g_advSelStep=-1;        // clicked row, -1 = nothing selected
 int  g_advRowH=18;           // recorded by the paint so clicks land on the same rows
 // The four capture switches are set once and then never touched, so they sit folded
@@ -16600,7 +16603,12 @@ Layout getLayout(HWND hwnd){
     l.yKeys        =l.yMode   +68;
     l.yKps         =l.yKeys   +102;
     l.yVouch       =l.yKps    +102;
-    mainTotalHeight=l.yVouch+54+mainScrollPos; // last card + padding
+    // Deliberately does NOT set mainTotalHeight any more. It used to, and that made a
+    // geometry helper quietly overwrite the scroll extent of whichever tab was open -
+    // including from inside the wheel handler, which calls this to find the step list.
+    // The advanced page therefore measured itself against the basic page's height,
+    // came out with nothing to scroll, and refused to move. Each tab now states its
+    // own height where it is painted.
     return l;
 }
 
@@ -17179,6 +17187,7 @@ void paintMain(HWND hwnd){
 
         // ---- STEPS ----
         int listH=170;
+        g_advListTop=ay; g_advListH=listH;
         drawCard(hdc,p,ay,cw,listH);
         {
             // While recording, show the capture buffer rather than the saved macro, so
@@ -17422,6 +17431,7 @@ void paintMain(HWND hwnd){
         px+=pw+pg;
     }
 
+        mainTotalHeight=l.yVouch+54+mainScrollPos; // last card + padding
     } // end of the basic panel
     } // end activeTab==0
 
@@ -17434,7 +17444,7 @@ void paintMain(HWND hwnd){
     }
     if(activeTab==1 && !hasTriggerbot){
         // Not entitled: show what it is and how to get it, rather than a dead tab.
-        int ty=70;
+        int ty=70-mainScrollPos;
         drawCard(hdc,p,ty,cw,150);
         drawText(hdc,L"TRIGGERBOT",p+16,ty+12,200,12,T.subtext,hFontSmall);
         drawText(hdc,L"Not included in your licence",p+16,ty+34,cw-32,20,T.text,hFontMed,
@@ -17448,7 +17458,10 @@ void paintMain(HWND hwnd){
         g_tbLay.yEnable=ty+106; // reuse as the upgrade button's Y for hit testing
     }
     if(activeTab==1 && hasTriggerbot){
-        int ty=70;
+        // Was a hard 70, so the page ignored the scroll position entirely - the wheel
+        // moved mainScrollPos and nothing on screen moved, which is why the tab could
+        // not be scrolled no matter how far the content ran past the bottom.
+        int ty=70-mainScrollPos;
         drawCard(hdc,p,ty,cw,68);
         drawText(hdc,L"TRIGGERBOT",p+16,ty+10,180,12,T.subtext,hFontSmall);
         drawText(hdc,triggerbotEnabled.load()?L"Watching for colour":L"Disabled",
@@ -17579,7 +17592,9 @@ void paintMain(HWND hwnd){
             swprintf(dl,48,L"#%02X%02X%02X",dr,dg,db);
             drawText(hdc,dl,p+186,ty+52,120,20,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         }
+        ty+=96;
         }   // end of the enabled-only section
+        mainTotalHeight=ty+mainScrollPos+24;
     }
 
     if(activeTab==2){
@@ -19392,6 +19407,10 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             int idx=(mx-inset)/seg;
             idx=std::max(0,std::min(2,idx));
             playClick();
+            // Tabs 0 and 1 share mainScrollPos but are different heights, so carrying a
+            // position across leaves the new tab scrolled to somewhere that only made
+            // sense on the old one - or past its end entirely.
+            if(idx!=activeTab) mainScrollPos=0;
             activeTab=idx;
             if(idx==2){ settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; SetTimer(hwnd,TIMER_SETT,500,NULL); }
             else KillTimer(hwnd,TIMER_SETT);
@@ -19735,22 +19754,25 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         if(activeTab==0 && g_advancedMode){
             // Over the step list the wheel scrolls the list; anywhere else it scrolls
             // the page, which is what it does on every other tab.
-            Layout lw=getLayout(hwnd);
             bool up = GET_WHEEL_DELTA_WPARAM(wp)>0;
             // The list takes the wheel until it reaches its end, and then gives it back
             // to the page. Without the handing-back the list swallowed every scroll, so
             // the edit bar underneath it could never be brought into view - which is
             // why a step could be selected but not edited.
             bool listExhausted = up ? (g_advScroll<=0) : (g_advScroll>=g_advScrollMax);
-            bool overList = (pt.y > lw.yHotkey+300) && !listExhausted;
+            // The list's own rectangle, recorded by the paint - not re-derived here.
+            bool overList = (pt.y > g_advListTop && pt.y < g_advListTop+g_advListH) && !listExhausted;
             if(overList){
                 g_advScroll += (up ? -3 : 3);
                 if(g_advScroll<0) g_advScroll=0;
                 if(g_advScroll>g_advScrollMax) g_advScroll=g_advScrollMax;
             } else {
                 RECT crw; GetClientRect(hwnd,&crw);
-                int maxS=std::max(0,mainTotalHeight-(int)crw.bottom+DOCK_H);
-                mainScrollPos += (GET_WHEEL_DELTA_WPARAM(wp)>0 ? -40 : 40);
+                // The dock floats over the bottom of the page, so the content has to be
+                // allowed past the client edge by its height or the last card can never
+                // be cleared of it.
+                int maxS=std::max(0,mainTotalHeight-(int)crw.bottom+DOCK_H+16);
+                mainScrollPos += (up ? -40 : 40);
                 mainScrollPos = std::max(0,std::min(mainScrollPos,maxS));
             }
             InvalidateRect(hwnd,NULL,FALSE);
@@ -19773,8 +19795,9 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         } else {
             RECT cr5;GetClientRect(hwnd,&cr5);
             int delta=GET_WHEEL_DELTA_WPARAM(wp)>0?-40:40;
-            int contentH6=mainTotalHeight-mainScrollPos;
-int maxS=std::max(0,(int)contentH6-(int)cr5.bottom);
+            // Same limit as the advanced page above. This one did not account for the
+            // floating dock, so the bottom card stayed under it.
+            int maxS=std::max(0,mainTotalHeight-(int)cr5.bottom+DOCK_H+16);
             mainScrollPos=std::max(0,std::min(mainScrollPos+delta,maxS));
             // Update scrollbar thumb position
             SCROLLINFO si={};si.cbSize=sizeof(si);si.fMask=SIF_POS;
