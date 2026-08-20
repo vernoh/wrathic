@@ -15120,7 +15120,16 @@ static DWORD WINAPI triggerbotThread(LPVOID){
         if(dupHeld) dup.unlock();
 
         int k=trigKey.load();
-        bool wantDown = hit;
+        // Scanning carries on whatever is in front, so the readout on the tab stays
+        // live while the colour is being tuned - but nothing is pressed unless Roblox
+        // is the window that would receive it.
+        //
+        // Without this the triggerbot pressed its key into whatever happened to be
+        // focused, and with M1 as the trigger key that is a synthetic left click at the
+        // cursor. Clicking the enable toggle armed it, it matched something on screen
+        // immediately, and the click it sent landed back on the toggle and turned it
+        // off again - which is exactly what 'it turns itself back off' was.
+        bool wantDown = hit && robloxFocused.load();
         if(wantDown && !wasDown){
             int d=trigDelayMs.load();
             if(d>0) Sleep(d);
@@ -16017,6 +16026,9 @@ bool g_advancedMode=false;
 float g_modeSwitchPos=0.0f;  // 0 basic, 1 advanced - spring target, not a snap
 float g_modeSwitchVel=0.0f;
 int  g_advScroll=0;          // step list scroll, in rows
+// How far the list can actually scroll, recorded by the paint. The wheel handler needs
+// it to know when the list has run out and the page should take over.
+int  g_advScrollMax=0;
 int  g_advSelStep=-1;        // clicked row, -1 = nothing selected
 int  g_advRowH=18;           // recorded by the paint so clicks land on the same rows
 // The four capture switches are set once and then never touched, so they sit folded
@@ -17203,6 +17215,7 @@ void paintMain(HWND hwnd){
                 if(g_advRecording.load()) g_advScroll=count-rows;
                 if(g_advScroll>count-rows) g_advScroll=count-rows;
                 if(g_advScroll<0) g_advScroll=0;
+                g_advScrollMax=std::max(0,count-rows);
                 int depth=0;
                 // Elapsed time to the first visible row. Steps store gaps, not absolute
                 // times, so the clock has to be carried forward from the start.
@@ -17474,9 +17487,11 @@ void paintMain(HWND hwnd){
                      hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
             drawToggle(hdc,p+cw-56,ty+30,trigArmHold.load());
             bool live = triggerbotEnabled.load() && (ak==0 || g_trigArmed.load());
-            drawText(hdc, ak ? (live?L"Armed - watching":L"Not armed - press your bind")
-                             : L"No bind set, so the toggle above arms it",
-                     p+16,ty+58,cw-32,14, live?T.green:T.subtext, hFontSmall,
+            bool inGame = robloxFocused.load();
+            drawText(hdc, !inGame ? L"Waiting for Roblox - it only fires while the game is in front"
+                                  : (ak ? (live?L"Armed - watching":L"Not armed - press your bind")
+                                        : L"No bind set, so the toggle above arms it"),
+                     p+16,ty+58,cw-32,14, (live&&inGame)?T.green:T.subtext, hFontSmall,
                      DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         }
         g_tbLay.yArm=ty; ty+=90;
@@ -18821,6 +18836,17 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(pt.y<44 && pt.x < rc.right-BTN*2) return HTCAPTION;
         return HTCLIENT;
     }
+    case WM_SETCURSOR:{
+        // The header reports HTCAPTION so dragging and double-click-to-maximise keep
+        // working, but that also tells Windows the area is non-client - and for
+        // non-client hit codes DefWindowProc sets the system arrow, ignoring the
+        // class cursor entirely. That is why the dot turned into an arrow over the
+        // title and the window buttons. Claim those codes and keep our own cursor;
+        // the resize edges are left alone so they still get their proper arrows.
+        WORD ht=LOWORD(lp);
+        if(gGlowCursor && (ht==HTCLIENT||ht==HTCAPTION)){ SetCursor(gGlowCursor); return TRUE; }
+        break;
+    }
     case WM_ERASEBKGND:
         return 1; // handled entirely in WM_PAINT double buffer - no fill here
     case WM_MOVING:
@@ -19710,10 +19736,17 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
             // Over the step list the wheel scrolls the list; anywhere else it scrolls
             // the page, which is what it does on every other tab.
             Layout lw=getLayout(hwnd);
-            bool overList = (pt.y > lw.yHotkey+300);
+            bool up = GET_WHEEL_DELTA_WPARAM(wp)>0;
+            // The list takes the wheel until it reaches its end, and then gives it back
+            // to the page. Without the handing-back the list swallowed every scroll, so
+            // the edit bar underneath it could never be brought into view - which is
+            // why a step could be selected but not edited.
+            bool listExhausted = up ? (g_advScroll<=0) : (g_advScroll>=g_advScrollMax);
+            bool overList = (pt.y > lw.yHotkey+300) && !listExhausted;
             if(overList){
-                g_advScroll += (GET_WHEEL_DELTA_WPARAM(wp)>0 ? -3 : 3);
+                g_advScroll += (up ? -3 : 3);
                 if(g_advScroll<0) g_advScroll=0;
+                if(g_advScroll>g_advScrollMax) g_advScroll=g_advScrollMax;
             } else {
                 RECT crw; GetClientRect(hwnd,&crw);
                 int maxS=std::max(0,mainTotalHeight-(int)crw.bottom+DOCK_H);
