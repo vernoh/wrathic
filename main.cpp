@@ -16973,6 +16973,14 @@ static void drawOptimiseConfirm(HDC hdc,int W,int H){
 
 // Minimise and close, drawn in the app's own palette. Close warms to red on hover
 // because it is the one button here you cannot undo.
+// The header, drawn as the last thing on the frame rather than the first thing on each
+// tab. Painted first it was simply the bottom of the stack, so anything scrolled up
+// past y=44 was drawn straight over the top of it - the title and the window buttons
+// disappeared under the cards. It owns the top 44px of every tab, so it goes last and
+// covers whatever ran underneath.
+#define HEADER_H 44
+static void drawAppHeader(HDC hdc,int W);
+
 static void drawCaptionButtons(HDC hdc,int W){
     const int BTN=46, H=44;
     int minX=W-BTN*2, closeX=W-BTN;
@@ -17022,6 +17030,21 @@ static void drawCaptionButtons(HDC hdc,int W){
             drawText(hdc,tb,px,py,pw,20,fg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
     }
+}
+
+// Title per tab, and the caption buttons. The three headers had each drifted into
+// their own version of the same thing; this is the only one now.
+static void drawAppHeader(HDC hdc,int W){
+    drawGlassBand(hdc,0,0,W,HEADER_H,true);   // lit along its lower edge
+    if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
+    const wchar_t* title = activeTab==1 ? L"TRIGGERBOT"
+                         : activeTab==2 ? L"SETTINGS" : L"WRATHIC";
+    drawText(hdc,title,gAppIcon?44:16,0,180,HEADER_H,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    // Version sits clear of the buttons rather than under them, and only on the tab
+    // whose title is short enough to leave room.
+    if(activeTab==0)
+        drawText(hdc,APP_VERSION,W-92-70,0,70,HEADER_H,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    drawCaptionButtons(hdc,W);
 }
 
 void paintMain(HWND hwnd){
@@ -17074,13 +17097,8 @@ void paintMain(HWND hwnd){
     // card samples this for its frosted interior.
 
     if(activeTab==0){
-    // â”€â”€ TITLE BAR (macro tab) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    drawGlassBand(hdc,0,0,W,44,true);   // header: lit along its lower edge
-    if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
-    drawText(hdc,L"WRATHIC",gAppIcon?44:16,0,140,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    // Version sits clear of the buttons now rather than under them.
-    drawText(hdc,APP_VERSION,W-92-70,0,70,44,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-    drawCaptionButtons(hdc,W);
+    // The title bar is no longer drawn here - see drawAppHeader, called at the end of
+    // the frame so scrolled content cannot cover it.
 
     // ── MODE SWITCH ──────────────────────────────────────────────────────────
     // Two tabs, because "advanced" is a different job rather than more knobs on the
@@ -17436,12 +17454,6 @@ void paintMain(HWND hwnd){
     } // end activeTab==0
 
     // â”€â”€ SETTINGS TAB CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if(activeTab==1){
-        drawGlassBand(hdc,0,0,W,44,true);
-        if(gAppIcon) DrawIconEx(hdc,14,11,gAppIcon,22,22,0,NULL,DI_NORMAL);
-        drawText(hdc,L"TRIGGERBOT",gAppIcon?44:16,0,180,44,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        drawCaptionButtons(hdc,W);
-    }
     if(activeTab==1 && !hasTriggerbot){
         // Not entitled: show what it is and how to get it, rather than a dead tab.
         int ty=70-mainScrollPos;
@@ -17642,6 +17654,11 @@ void paintMain(HWND hwnd){
         drawText(hdc,L"tap to read",tx+10,ty,tw-closeW-20,th,T.bg,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         drawText(hdc,L"\u2715",tx+tw-closeW,ty,closeW,th,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
+
+    // Last, so no amount of scrolling can put a card over the title or the window
+    // buttons. Only the lock and the modal go above it, which is correct - both are
+    // meant to cover the whole window.
+    drawAppHeader(hdc,W);
 
     if(g_lockKind!=LOCK_NONE) drawLockOverlay(hdc,W,H);
     else if(g_optimiseConfirmOpen) drawOptimiseConfirm(hdc,W,H);
@@ -18063,14 +18080,6 @@ void paintSettingsInto(HDC hdc,int W,int H){
         drawSettingsTip(hdc,g_tipX,g_tipY,g_tipText.c_str(),W,H);
     }
 
-    // Settings header. Same band as the other tabs rather than a flat fill with an
-    // accent rule under it - the three headers had drifted into three looks.
-    drawGlassBand(hdc,0,0,W,44,true);
-    {HFONT oldF=(HFONT)SelectObject(hdc,hFontMed);
-    SetTextColor(hdc,T.text);SetBkMode(hdc,TRANSPARENT);
-    RECT hr={16,0,W-110,44};DrawText(hdc,L"SETTINGS",-1,&hr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    SelectObject(hdc,oldF);}
-    drawCaptionButtons(hdc,W);
 }
 
 // ===================== TOAST SYSTEM =====================
@@ -19244,12 +19253,17 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // area precisely so these can be hit before anything else looks at it.
             RECT rcb; GetClientRect(hwnd,&rcb);
             const int BTN=46;
-            if(my<44 && mx>=rcb.right-BTN*2){
+            if(my<HEADER_H && mx>=rcb.right-BTN*2){
                 playClick();
                 if(mx>=rcb.right-BTN) SendMessage(hwnd,WM_CLOSE,0,0);
                 else ShowWindow(hwnd,SW_MINIMIZE);
                 return 0;
             }
+            // The header covers the page, so it has to swallow the click too. Content
+            // scrolled up underneath it is not visible and must not be reachable - a
+            // control hidden behind the title bar that still responds is worse than one
+            // that is simply gone.
+            if(my<HEADER_H) return 0;
         }
         g_pressedId=hitTest(hwnd,mx,my); // which control is being held
         if(g_lockKind!=LOCK_NONE){
