@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.4"
+#define APP_VERSION      L"v3.1.5"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13226,6 +13226,7 @@ static int     g_tipSpotCount=0;
 #define ID_TIP_PROFILES    6
 #define ID_TIP_OVPOS       7
 #define ID_TIP_MODE        8
+#define ID_TIP_MACROS      9
 static const wchar_t* tipTextFor(int id){
     switch(id){
         case ID_TIP_RES_OVERLAY: return L"CPU, RAM, GPU and disk, over your game";
@@ -13236,6 +13237,7 @@ static const wchar_t* tipTextFor(int id){
         case ID_TIP_PROFILES:    return L"Tap an empty slot to save what you have set now. Tap a saved one to load it. Right-click clears it.";
         case ID_TIP_OVPOS:       return L"Pick a corner, or drag the overlay itself in-game. The lit cell is where it is now.";
         case ID_TIP_MODE:        return L"M1 costs less CPU but holds the rate less steadily than a keyboard key";
+        case ID_TIP_MACROS:      return L"Tap a macro to work on it, + to make a new one. Import reads TGMacro .tgm and AutoHotkey .ahk files.";
         default: return L"";
     }
 }
@@ -14472,6 +14474,10 @@ void hotkeyThread(){
                             showSuccessToast(m);
                         }
                         g_trigPicking=false;
+                        // Back to a normal window - being permanently on top is not
+                        // something to leave behind after a one-off action.
+                        if(hwndMain) SetWindowPos(hwndMain,HWND_NOTOPMOST,0,0,0,0,
+                                                  SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
                         if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
                     }
                 }
@@ -15461,6 +15467,10 @@ struct AdvMacro {
 
 #define ADV_MAX_MACROS 8
 static std::vector<AdvMacro> g_advMacros;
+// Renaming happens in place on the chip rather than in a dialog - it is one short
+// string and a modal for it would be heavier than the thing it edits.
+static bool         g_advRenaming=false;
+static std::wstring g_advRenameBuf;
 static int  g_advSelected = 0;
 
 // Recording state. The hook callbacks run on the UI thread's message loop, so they
@@ -15762,6 +15772,320 @@ static std::wstring advDir(){
     std::wstring d = gDataDir.empty() ? L"macros" : (gDataDir + L"\\macros");
     CreateDirectoryW(d.c_str(), NULL);
     return d;
+}
+
+// Forward declarations - the importer is placed before the state and helpers it
+// touches so that it sits next to advSaveAll, which is what it calls to persist.
+bool advKeyInUse(int vk,int ignoreMacroIdx,std::wstring& whoOut);
+void advSaveAll();
+extern int g_advSelStep;
+extern int g_advScroll;
+
+// ===================== IMPORT =====================
+// Bringing a macro over from somewhere else is the difference between trying wrathic
+// and not bothering, so two formats are read: TGMacro's .tgm projects and AutoHotkey
+// .ahk scripts.
+//
+// Neither is read completely, and neither pretends to be. Anything not understood is
+// counted and reported rather than dropped in silence - a macro that imports "cleanly"
+// and then behaves differently is worse than one that says which four lines it could
+// not read.
+
+// Minimal JSON scraping, matching how the licence responses are parsed elsewhere in
+// this file: find the key, take what follows. No dependency, and the shapes here are
+// fixed enough not to need a real parser.
+static bool jsonInt(const std::string& src,size_t from,size_t to,const char* key,int& out){
+    std::string k=std::string("\"")+key+"\"";
+    size_t p=src.find(k,from);
+    if(p==std::string::npos||p>=to) return false;
+    p=src.find(':',p+k.size());
+    if(p==std::string::npos||p>=to) return false;
+    p++;
+    while(p<to&&(src[p]==' '||src[p]=='\t')) p++;
+    bool neg=(p<to&&src[p]=='-'); if(neg) p++;
+    if(p>=to||!isdigit((unsigned char)src[p])) return false;
+    int v=0;
+    while(p<to&&isdigit((unsigned char)src[p])){ v=v*10+(src[p]-'0'); p++; }
+    out=neg?-v:v;
+    return true;
+}
+static bool jsonStr(const std::string& src,size_t from,size_t to,const char* key,std::string& out){
+    std::string k=std::string("\"")+key+"\"";
+    size_t p=src.find(k,from);
+    if(p==std::string::npos||p>=to) return false;
+    p=src.find(':',p+k.size());
+    if(p==std::string::npos||p>=to) return false;
+    p=src.find('"',p);
+    if(p==std::string::npos||p>=to) return false;
+    size_t e=src.find('"',p+1);
+    if(e==std::string::npos||e>to) return false;
+    out=src.substr(p+1,e-p-1);
+    return true;
+}
+
+// TGMacro .tgm. Verified against a real export:
+//   ActionType 1 = mouse button   (Key is a Windows VK: 1 left, 2 right, 4 middle)
+//   ActionType 2 = keyboard key   (Key is a Windows VK)
+//   ActionType 3 = an explicit delay, where present
+// MacroSettings.InputLimit is a cap in inputs per second, which is where the gap
+// between actions comes from - a file with no explicit delays is not instantaneous,
+// it is paced by that number.
+static bool importTGM(const std::wstring& path,AdvMacro& out,int& unknownCount){
+    FILE* f=_wfopen(path.c_str(),L"rb");
+    if(!f) return false;
+    std::string js;
+    char buf[4096]; size_t n;
+    while((n=fread(buf,1,sizeof(buf),f))>0) js.append(buf,n);
+    fclose(f);
+    if(js.find("TGMacro")==std::string::npos && js.find("\"Macros\"")==std::string::npos) return false;
+
+    size_t mp=js.find("\"Macros\"");
+    if(mp==std::string::npos) return false;
+
+    // Only the first macro in the project. A .tgm can hold several; the rest are
+    // reported rather than silently merged into one.
+    int gapMs=8;
+    { int lim=0;
+      if(jsonInt(js,mp,js.size(),"InputLimit",lim) && lim>0)
+          gapMs=std::max(1,1000/lim); }
+
+    std::string nm;
+    if(jsonStr(js,mp,js.size(),"MacroName",nm) && !nm.empty()){
+        out.name.assign(nm.begin(),nm.end());
+    } else out.name=L"Imported";
+
+    int tk=0;
+    if(jsonInt(js,mp,js.size(),"TriggerKey",tk) && tk>0 && tk<255) out.hotkey=tk;
+    // TriggerType 1 with TriggerMethod 3 is TGMacro's hold-to-repeat. Anything else
+    // is treated as a tap, which is the safer of the two to guess wrong.
+    { int tt=0,tm=0;
+      jsonInt(js,mp,js.size(),"TriggerType",tt);
+      jsonInt(js,mp,js.size(),"TriggerMethod",tm);
+      out.holdToRun=(tt==1&&tm==3); }
+
+    size_t ap=js.find("\"Actions\"",mp);
+    if(ap==std::string::npos) return false;
+    size_t pos=js.find('[',ap);
+    if(pos==std::string::npos) return false;
+
+    unknownCount=0;
+    bool first=true;
+    while(true){
+        size_t ob=js.find('{',pos);
+        if(ob==std::string::npos) break;
+        size_t cb=js.find('}',ob);
+        if(cb==std::string::npos) break;
+        // Stop at the end of this Actions array rather than running into the next macro.
+        size_t endArr=js.find(']',pos);
+        if(endArr!=std::string::npos && ob>endArr) break;
+
+        int at=0,key=0;
+        jsonInt(js,ob,cb,"ActionType",at);
+        jsonInt(js,ob,cb,"Key",key);
+
+        if(!first) out.steps.push_back(Step(ST_DELAY,gapMs,0));
+        first=false;
+
+        if(at==2 && key>0 && key<255){
+            out.steps.push_back(Step(ST_KEY,key,1));
+            out.steps.push_back(Step(ST_DELAY,12,0));
+            out.steps.push_back(Step(ST_KEY,key,0));
+        } else if(at==1){
+            int btn = (key==2)?1 : (key==4)?2 : 0;
+            out.steps.push_back(Step(ST_CLICK,btn,1));
+            out.steps.push_back(Step(ST_DELAY,12,0));
+            out.steps.push_back(Step(ST_CLICK,btn,0));
+        } else if(at==3){
+            int ms=0;
+            if(!jsonInt(js,ob,cb,"Delay",ms)) jsonInt(js,ob,cb,"Time",ms);
+            out.steps.push_back(Step(ST_DELAY,std::max(1,ms),0));
+        } else {
+            unknownCount++;
+        }
+        pos=cb+1;
+        if(endArr!=std::string::npos && pos>endArr) break;
+    }
+    return !out.steps.empty();
+}
+
+// AutoHotkey. A general .ahk is a programming language and is not going to be read by
+// anything short of an interpreter, so this handles the subset that macros are actually
+// written in: Send/SendInput key sequences, Click, Sleep, and a plain hotkey label.
+// Everything else increments the unknown count and is left out.
+static int ahkKeyToVk(std::string k){
+    for(auto& c:k) c=(char)toupper((unsigned char)c);
+    if(k.size()==1){
+        char c=k[0];
+        if(c>='A'&&c<='Z') return c;
+        if(c>='0'&&c<='9') return c;
+        if(c==' ') return VK_SPACE;
+    }
+    if(k=="SPACE") return VK_SPACE;
+    if(k=="ENTER"||k=="RETURN") return VK_RETURN;
+    if(k=="TAB") return VK_TAB;
+    if(k=="ESC"||k=="ESCAPE") return VK_ESCAPE;
+    if(k=="SHIFT") return VK_SHIFT;
+    if(k=="CTRL"||k=="CONTROL") return VK_CONTROL;
+    if(k=="ALT") return VK_MENU;
+    if(k=="BACKSPACE"||k=="BS") return VK_BACK;
+    if(k=="DEL"||k=="DELETE") return VK_DELETE;
+    if(k=="UP") return VK_UP;
+    if(k=="DOWN") return VK_DOWN;
+    if(k=="LEFT") return VK_LEFT;
+    if(k=="RIGHT") return VK_RIGHT;
+    if(k.size()>=2&&k[0]=='F'){ int n=atoi(k.c_str()+1); if(n>=1&&n<=12) return VK_F1+n-1; }
+    return 0;
+}
+static bool importAHK(const std::wstring& path,AdvMacro& out,int& unknownCount){
+    FILE* f=_wfopen(path.c_str(),L"rb");
+    if(!f) return false;
+    std::string all;
+    char buf[4096]; size_t n;
+    while((n=fread(buf,1,sizeof(buf),f))>0) all.append(buf,n);
+    fclose(f);
+    if(all.empty()) return false;
+
+    unknownCount=0;
+    out.name=L"Imported";
+    std::string line;
+    std::istringstream ss(all);
+    while(std::getline(ss,line)){
+        // Trim, and drop comments.
+        size_t b=line.find_first_not_of(" \t\r\n");
+        if(b==std::string::npos) continue;
+        line=line.substr(b);
+        while(!line.empty()&&(line.back()=='\r'||line.back()=='\n'||line.back()==' ')) line.pop_back();
+        if(line.empty()||line[0]==';') continue;
+
+        std::string low=line;
+        for(auto& c:low) c=(char)tolower((unsigned char)c);
+
+        if(low.rfind("sleep",0)==0){
+            size_t p=line.find_first_of("0123456789");
+            if(p!=std::string::npos) out.steps.push_back(Step(ST_DELAY,std::max(1,atoi(line.c_str()+p)),0));
+            continue;
+        }
+        if(low.rfind("click",0)==0){
+            int btn=0;
+            if(low.find("right")!=std::string::npos)  btn=1;
+            if(low.find("middle")!=std::string::npos) btn=2;
+            out.steps.push_back(Step(ST_CLICK,btn,1));
+            out.steps.push_back(Step(ST_DELAY,12,0));
+            out.steps.push_back(Step(ST_CLICK,btn,0));
+            continue;
+        }
+        if(low.rfind("send",0)==0){
+            size_t p=line.find_first_of(" \t");
+            if(p==std::string::npos){ unknownCount++; continue; }
+            std::string body=line.substr(p+1);
+            // {Key down} / {Key up} / {Key} / bare characters.
+            for(size_t i=0;i<body.size();){
+                if(body[i]=='{'){
+                    size_t e=body.find('}',i);
+                    if(e==std::string::npos){ unknownCount++; break; }
+                    std::string tok=body.substr(i+1,e-i-1);
+                    std::string low2=tok; for(auto& c:low2) c=(char)tolower((unsigned char)c);
+                    int updown=-1;
+                    size_t sp=low2.rfind(" down");
+                    if(sp!=std::string::npos&&sp+5==low2.size()){ updown=1; tok=tok.substr(0,sp); }
+                    else { sp=low2.rfind(" up");
+                           if(sp!=std::string::npos&&sp+3==low2.size()){ updown=0; tok=tok.substr(0,sp); } }
+                    int vk=ahkKeyToVk(tok);
+                    if(!vk) unknownCount++;
+                    else if(updown==1) out.steps.push_back(Step(ST_KEY,vk,1));
+                    else if(updown==0) out.steps.push_back(Step(ST_KEY,vk,0));
+                    else {
+                        out.steps.push_back(Step(ST_KEY,vk,1));
+                        out.steps.push_back(Step(ST_DELAY,12,0));
+                        out.steps.push_back(Step(ST_KEY,vk,0));
+                    }
+                    i=e+1;
+                } else {
+                    int vk=ahkKeyToVk(std::string(1,body[i]));
+                    if(vk){
+                        out.steps.push_back(Step(ST_KEY,vk,1));
+                        out.steps.push_back(Step(ST_DELAY,12,0));
+                        out.steps.push_back(Step(ST_KEY,vk,0));
+                    }
+                    i++;
+                }
+            }
+            continue;
+        }
+        // A hotkey label such as  ^!g::  - take the last plain letter as the bind.
+        size_t cc=line.find("::");
+        if(cc!=std::string::npos&&cc>0){
+            std::string k=line.substr(0,cc);
+            while(!k.empty()&&(k[0]=='^'||k[0]=='!'||k[0]=='+'||k[0]=='#')) k.erase(k.begin());
+            int vk=ahkKeyToVk(k);
+            if(vk) out.hotkey=vk;
+            continue;
+        }
+        unknownCount++;
+    }
+    return !out.steps.empty();
+}
+
+// One dialog for both. The filter leads with "any supported" so nobody has to know
+// which of the two their file is.
+static bool advImportDialog(HWND owner){
+    if(g_advMacros.size()>=ADV_MAX_MACROS){
+        showToast(L"No free macro slots",T.red);
+        return false;
+    }
+    wchar_t file[MAX_PATH]={};
+    OPENFILENAMEW ofn={};
+    ofn.lStructSize=sizeof(ofn);
+    ofn.hwndOwner=owner;
+    ofn.lpstrFilter=L"Macros (*.tgm;*.ahk)\0*.tgm;*.ahk\0TGMacro (*.tgm)\0*.tgm\0AutoHotkey (*.ahk)\0*.ahk\0All files\0*.*\0";
+    ofn.lpstrFile=file;
+    ofn.nMaxFile=MAX_PATH;
+    ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+    if(!GetOpenFileNameW(&ofn)) return false;
+
+    std::wstring p=file;
+    std::wstring ext;
+    size_t dot=p.rfind(L'.');
+    if(dot!=std::wstring::npos){ ext=p.substr(dot); for(auto& c:ext) c=(wchar_t)towlower(c); }
+
+    AdvMacro m;
+    int unknown=0;
+    bool ok=false;
+    if(ext==L".ahk") ok=importAHK(p,m,unknown);
+    else             ok=importTGM(p,m,unknown);
+    // A .tgm that will not parse as one is worth trying as a script before giving up,
+    // and the other way round - people rename files.
+    if(!ok){ AdvMacro m2; int u2=0;
+             if(ext==L".ahk") ok=importTGM(p,m2,u2); else ok=importAHK(p,m2,u2);
+             if(ok){ m=m2; unknown=u2; } }
+
+    if(!ok){ showToast(L"Could not read that file",T.red); return false; }
+
+    if(m.name.empty()||m.name==L"Imported"){
+        size_t sl=p.find_last_of(L"\\/");
+        std::wstring base=(sl==std::wstring::npos)?p:p.substr(sl+1);
+        size_t d2=base.rfind(L'.');
+        if(d2!=std::wstring::npos) base=base.substr(0,d2);
+        if(!base.empty()) m.name=base;
+    }
+    // Imported macros carry no resolution, so playback must not try to scale them.
+    m.recW=0; m.recH=0;
+
+    // A bind that is already doing something else is dropped rather than allowed to
+    // fight over it - the macro still imports, it just arrives unbound.
+    { std::wstring who; if(m.hotkey && advKeyInUse(m.hotkey,-1,who)) m.hotkey=0; }
+
+    g_advMacros.push_back(m);
+    g_advSelected=(int)g_advMacros.size()-1;
+    g_advSelStep=-1; g_advScroll=0;
+    advSaveAll();
+
+    wchar_t msg[160];
+    if(unknown>0) swprintf(msg,160,L"Imported %s - %d step(s), %d line(s) not understood",
+                           m.name.c_str(),(int)m.steps.size(),unknown);
+    else          swprintf(msg,160,L"Imported %s - %d step(s)",m.name.c_str(),(int)m.steps.size());
+    showSuccessToast(msg);
+    return true;
 }
 
 void advSaveAll(){
@@ -17242,24 +17566,44 @@ void paintMain(HWND hwnd){
         int ay=l.yHotkey;
 
         // ---- SLOTS ----
-        drawCard(hdc,p,ay,cw,64);
-        drawText(hdc,L"MACRO",p+16,ay+10,120,12,T.subtext,hFontSmall);
+        drawCard(hdc,p,ay,cw,96);
+        drawText(hdc,L"MACROS",p+16,ay+10,120,12,T.subtext,hFontSmall);
+        drawTipIcon(hdc,p+16+58,ay+9,ID_TIP_MACROS,T.subtext);
         {
-            int n=(int)g_advMacros.size(); if(n<1) n=1;
-            int shown=n>4?4:n;
-            int sw2=(cw-32-(shown-1)*6)/shown;
-            for(int i=0;i<shown;i++){
-                int sx=p+16+i*(sw2+6);
-                bool sel=(i==g_advSelected);
-                drawRR(hdc,sx,ay+28,sw2,24,8,sel?T.card:T.btn,sel?T.accent:T.border,1);
-                wchar_t nm[32];
-                if(i<(int)g_advMacros.size()) swprintf(nm,32,L"%s",g_advMacros[i].name.c_str());
-                else swprintf(nm,32,L"Slot %d",i+1);
-                drawText(hdc,nm,sx,ay+28,sw2,24,sel?T.text:T.subtext,hFontSmall,
+            // Every macro that exists, up to the slot limit, plus a "+" to make another.
+            // The old row drew a fixed four and had no way to add, rename or remove one.
+            int n=(int)g_advMacros.size();
+            int cells=std::min(ADV_MAX_MACROS,n+1);   // +1 is the add button
+            int perRow=4;
+            int sw2=(cw-32-(perRow-1)*6)/perRow;
+            for(int i=0;i<cells;i++){
+                int col=i%perRow, row=i/perRow;
+                int sx=p+16+col*(sw2+6), sy2=ay+28+row*30;
+                if(i<n){
+                    bool sel=(i==g_advSelected);
+                    drawRR(hdc,sx,sy2,sw2,24,8,sel?T.card:T.btn,sel?T.accent:T.border,1);
+                    std::wstring nm=g_advMacros[i].name;
+                    if(sel && g_advRenaming) nm=g_advRenameBuf+((GetTickCount()/500)%2?L"_":L"");
+                    drawText(hdc,nm.c_str(),sx+2,sy2,sw2-4,24,sel?T.text:T.subtext,hFontSmall,
+                             DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+                } else {
+                    drawRR(hdc,sx,sy2,sw2,24,8,T.btn,T.border,1);
+                    drawText(hdc,L"+",sx,sy2,sw2,24,T.subtext,hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                }
+            }
+            // Actions on the selected one, plus import. Import is here because bringing
+            // a macro in from elsewhere is the same job as making one.
+            int by2=ay+68, bw2=(cw-32-12)/3;
+            const wchar_t* al[3]={L"Rename",L"Delete",L"Import"};
+            for(int i=0;i<3;i++){
+                int bx=p+16+i*(bw2+6);
+                bool dis=(i<2 && g_advMacros.empty());
+                drawRR(hdc,bx,by2,bw2,22,11,T.btn,i==1&&!dis?T.red:T.border,1);
+                drawText(hdc,al[i],bx,by2,bw2,22,dis?T.border:(i==1?T.red:T.subtext),hFontSmall,
                          DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             }
         }
-        ay+=74;
+        ay+=106;
 
         // ---- RECORD + WHAT TO CAPTURE ----
         drawCard(hdc,p,ay,cw,g_advCaptureOpen?158:96);
@@ -17661,10 +18005,11 @@ void paintMain(HWND hwnd){
         // tolerance is too loose, which is the point.
         {   int swx=p+16, swy=ty+30;
             drawRR(hdc,swx,swy,44,44,10,RGB(trigR.load(),trigG.load(),trigB.load()),T.border,1);
+            // The lower band still shows what is actually being matched; the word
+            // "live" over the top of it was labelling something the colour already says.
             if(g_trigAvgValid.load()){
                 COLORREF live=RGB(g_trigAvgR.load(),g_trigAvgG.load(),g_trigAvgB.load());
-                fillRect(hdc,swx+4,swy+24,36,16,live);
-                drawText(hdc,L"live",swx,swy+24,40,16,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                fillRect(hdc,swx+4,swy+26,36,14,live);
             }
         }
         {   wchar_t hex[16];
@@ -17693,26 +18038,10 @@ void paintMain(HWND hwnd){
 
         g_tbLay.yTune=-10000; g_tbLay.tolW=0;
 
-        // What the scanner is seeing right now. Watch this while the ball changes: if
-        // "brightest" turns your colour and "matching" stays at 0, the tolerance is
-        // too tight. It watches the whole screen, so "looking in the wrong place" is
-        // no longer one of the answers.
-        drawCard(hdc,p,ty,cw,86);
-        drawText(hdc,L"WHAT IT SEES",p+16,ty+10,200,12,T.subtext,hFontSmall);
-        {
-            int m=g_trigMatches.load();
-            int dr=g_trigDomR.load(), dg=g_trigDomG.load(), db=g_trigDomB.load();
-            wchar_t ml[64];
-            swprintf(ml,64,L"matching pixels   %d",m);
-            drawText(hdc,ml,p+16,ty+30,cw-32,16,m>=TB_MIN_MATCH?T.green:m?T.accent:T.subtext,hFontSmall,
-                     DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            drawText(hdc,L"brightest on screen",p+16,ty+52,150,20,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            drawRR(hdc,p+150,ty+52,28,20,6,RGB(dr,dg,db),T.border,1);
-            wchar_t dl[48];
-            swprintf(dl,48,L"#%02X%02X%02X",dr,dg,db);
-            drawText(hdc,dl,p+186,ty+52,120,20,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        }
-        ty+=96;
+        // The scanner readout that used to sit here has gone. It existed to answer
+        // "why is this not firing" while the colour match was still unreliable; with
+        // the whole screen watched and the colour typed exactly, it was a panel of
+        // numbers with nothing left to diagnose.
         }   // end of the enabled-only section
         mainTotalHeight=ty+mainScrollPos+24;
     }
@@ -19381,6 +19710,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         break;
     }
     case WM_CHAR:{
+        if(g_advRenaming){
+            wchar_t c=(wchar_t)wp;
+            if(c>=L' ' && g_advRenameBuf.size()<20){
+                g_advRenameBuf+=c;
+                InvalidateRect(hwnd,NULL,FALSE);
+            }
+            return 0;
+        }
         // The hex field was drawn, and clicking it set an editing flag, but nothing
         // ever fed it a character - so it looked like a text box and behaved like a
         // label. Six hex digits, applied on the sixth or on Enter.
@@ -19410,6 +19747,25 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_KEYDOWN:{
+        if(g_advRenaming){
+            if(wp==VK_BACK){
+                if(!g_advRenameBuf.empty()) g_advRenameBuf.pop_back();
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            if(wp==VK_RETURN){
+                if(!g_advRenameBuf.empty() && g_advSelected<(int)g_advMacros.size()){
+                    g_advMacros[g_advSelected].name=g_advRenameBuf;
+                    advSaveAll();
+                }
+                g_advRenaming=false;
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            if(wp==VK_ESCAPE){
+                g_advRenaming=false;
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            return 0;
+        }
         if(g_tbHexEditing){
             if(wp==VK_BACK){
                 if(!g_tbHexBuf.empty()) g_tbHexBuf.pop_back();
@@ -19618,8 +19974,16 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         myT>=g_tbLay.pickY&&myT<=g_tbLay.pickY+g_tbLay.pickH){
                     playClick();
                     g_trigPicking=!g_trigPicking.load();
-                    if(g_trigPicking.load())
+                    if(g_trigPicking.load()){
+                        // Held above everything until a colour is taken. Picking means
+                        // looking at another window, and the moment wrathic drops behind
+                        // one, the click that chooses the colour also raises whatever it
+                        // landed on - so the pick reads a window that just moved.
+                        SetWindowPos(hwnd,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
                         showToast(L"Click the ball to take its colour",T.accent);
+                    } else {
+                        SetWindowPos(hwnd,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                    }
                     handled=true;
                 }
                 // rebind key
@@ -19719,23 +20083,73 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             if(g_advancedMode){
                 int ay=la.yHotkey;
 
-                // slot chips
+                // slot chips, the add button, and the three actions under them
                 {
-                    int n=(int)g_advMacros.size(); if(n<1) n=1;
-                    int shown=n>4?4:n;
-                    int sw2=(cwa-32-(shown-1)*6)/shown;
-                    for(int i=0;i<shown;i++){
-                        int sx=pa+16+i*(sw2+6);
-                        if(mx>=sx&&mx<=sx+sw2&&my>=ay+28&&my<=ay+52){
+                    int n=(int)g_advMacros.size();
+                    int cells=std::min(ADV_MAX_MACROS,n+1);
+                    int perRow=4;
+                    int sw2=(cwa-32-(perRow-1)*6)/perRow;
+                    for(int i=0;i<cells;i++){
+                        int col=i%perRow, row=i/perRow;
+                        int sx=pa+16+col*(sw2+6), sy2=ay+28+row*30;
+                        if(mx>=sx&&mx<=sx+sw2&&my>=sy2&&my<=sy2+24){
                             playClick();
                             if(g_advRecording.load()) advStopRecording();
-                            g_advSelected=i; g_advScroll=0; g_advBinding=false; g_advSelStep=-1;
+                            if(i<n){
+                                g_advSelected=i;
+                            } else {
+                                // A new, empty macro, named for its position so it has
+                                // something to be called before it is recorded into.
+                                AdvMacro nm;
+                                wchar_t nb[32]; swprintf(nb,32,L"Macro %d",n+1);
+                                nm.name=nb;
+                                g_advMacros.push_back(nm);
+                                g_advSelected=n;
+                                advSaveAll();
+                            }
+                            g_advScroll=0; g_advBinding=false; g_advSelStep=-1;
+                            g_advRenaming=false;
+                            InvalidateRect(hwnd,NULL,FALSE);
+                            return 0;
+                        }
+                    }
+                    int by2=ay+68, bw2=(cwa-32-12)/3;
+                    for(int i=0;i<3;i++){
+                        int bx=pa+16+i*(bw2+6);
+                        if(mx>=bx&&mx<=bx+bw2&&my>=by2&&my<=by2+22){
+                            if(i<2 && g_advMacros.empty()) return 0;   // nothing to act on
+                            playClick();
+                            if(i==0){
+                                g_advRenaming=true;
+                                g_advRenameBuf=g_advMacros[g_advSelected].name;
+                                SetFocus(hwnd);
+                            } else if(i==1){
+                                if(g_advRecording.load()) advStopRecording();
+                                if(g_advPlayingIdx.load()==g_advSelected) advStop();
+                                g_advMacros.erase(g_advMacros.begin()+g_advSelected);
+                                if(g_advSelected>=(int)g_advMacros.size())
+                                    g_advSelected=std::max(0,(int)g_advMacros.size()-1);
+                                g_advSelStep=-1; g_advScroll=0;
+                                // The files are written by index, so a deletion has to
+                                // clear the tail or the removed macro comes back on the
+                                // next load from the file that is now one past the end.
+                                { std::wstring dir=advDir();
+                                  for(int k=(int)g_advMacros.size();k<ADV_MAX_MACROS;k++){
+                                      wchar_t pth[MAX_PATH];
+                                      swprintf(pth,MAX_PATH,L"%s\\macro%d.wrm",dir.c_str(),k);
+                                      _wremove(pth);
+                                  } }
+                                advSaveAll();
+                                showToast(L"Macro deleted",T.subtext);
+                            } else {
+                                advImportDialog(hwnd);
+                            }
                             InvalidateRect(hwnd,NULL,FALSE);
                             return 0;
                         }
                     }
                 }
-                ay+=74;
+                ay+=106;
 
                 // record / stop
                 if(mx>=pa+16&&mx<=pa+cwa-16&&my>=ay+26&&my<=ay+54){
