@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.2"
+#define APP_VERSION      L"v3.1.3"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -92,6 +92,17 @@ static std::string xorDecrypt(const unsigned char* data, int len){
 #define APP_W         420
 #define APP_H         600
 #define DOCK_H        52  // bottom tab dock height
+#define DOCK_W        58  // left rail width, in landscape
+// Landscape puts the tab dock down the left instead of along the bottom, which gives
+// the page its full height back - useful on a short window, and on a wide one the
+// bottom strip was mostly empty anyway.
+//
+// Everything that used to say DOCK_H asks one of these two instead, so neither layout
+// has to know which one is active: in landscape the bottom reserve is zero and the
+// left reserve is the rail, and in portrait it is the other way round.
+extern bool g_landscape;
+static inline int dockBottom(){ return g_landscape ? 0 : DOCK_H; }
+static inline int dockLeft()  { return g_landscape ? DOCK_W : 0; }
 
 // ===================== PATH HELPERS =====================
 // Must be defined before anything that uses file I/O
@@ -12997,6 +13008,7 @@ int overlayX=0, overlayY=80; // saved overlay position
 int settScrollPos=0;
 int settTotalHeight=0;
 int activeTab=0;         // 0=Macro, 1=Settings
+bool g_landscape=false;  // tab dock down the left rather than along the bottom
 bool settingsDirty=true;  // force repaint of settings when true
 float tabAnim=0.0f;      // 0.0=Macro, 1.0=Settings (animated)
 int mainScrollPos=0;
@@ -13160,11 +13172,20 @@ struct TipSpot { int id, x, y; };
 static TipSpot g_tipSpots[8]={};
 static int     g_tipSpotCount=0;
 // Text belongs with the id, not with a position.
+// Every '?' on the settings page points here. Numbered ids were fine while there were
+// three; they are named now so a new tip cannot quietly reuse someone else's number.
+#define ID_TIP_RES_OVERLAY 1
+#define ID_TIP_KPS_OVERLAY 2
+#define ID_TIP_SCOPE       3
+#define ID_TIP_LANDSCAPE   4
+#define ID_TIP_RPC         5
 static const wchar_t* tipTextFor(int id){
     switch(id){
-        case 1: return L"Shows CPU, RAM, GPU and disk bars over your game";
-        case 2: return L"Shows a KPS counter floating over your game";
-        case 3: return L"ON = whole system, OFF = just wrathic";
+        case ID_TIP_RES_OVERLAY: return L"CPU, RAM, GPU and disk, over your game";
+        case ID_TIP_KPS_OVERLAY: return L"Live click rate, over your game";
+        case ID_TIP_SCOPE:       return L"ON = whole system, OFF = just wrathic";
+        case ID_TIP_LANDSCAPE:   return L"Tabs down the left instead of along the bottom, so the page gets the full height";
+        case ID_TIP_RPC:         return L"Shows wrathic on your Discord profile while it is open";
         default: return L"";
     }
 }
@@ -13239,10 +13260,10 @@ void saveSettings() {
     regSetDWORD(L"HasTriggerbot",(DWORD)hasTriggerbot);
     regSetDWORD(L"TrigEnabled",(DWORD)triggerbotEnabled.load());
     regSetDWORD(L"TrigKey",(DWORD)trigKey.load());
+    regSetDWORD(L"Landscape",(DWORD)(g_landscape?1:0));
     regSetDWORD(L"TrigR",(DWORD)trigR.load());
     regSetDWORD(L"TrigG",(DWORD)trigG.load());
     regSetDWORD(L"TrigB",(DWORD)trigB.load());
-    regSetDWORD(L"TrigTol",(DWORD)trigTolerance.load());
     regSetDWORD(L"TrigDelay",(DWORD)trigDelayMs.load());
     regSetDWORD(L"TrigHold",(DWORD)trigHoldMode.load());
     regSetDWORD(L"HotkeyVK",(DWORD)hotkeyVK.load());
@@ -13304,10 +13325,10 @@ void loadSettings() {
     hasTriggerbot     = regGetDWORD(L"HasTriggerbot",0)!=0;
     triggerbotEnabled = regGetDWORD(L"TrigEnabled",0)!=0;
     trigKey       = (int)regGetDWORD(L"TrigKey",VK_LBUTTON);
+    g_landscape   = regGetDWORD(L"Landscape",0)!=0;
     trigR         = (int)regGetDWORD(L"TrigR",255);
     trigG         = (int)regGetDWORD(L"TrigG",0);
     trigB         = (int)regGetDWORD(L"TrigB",0);
-    trigTolerance = std::max(0,std::min(255,(int)regGetDWORD(L"TrigTol",40)));
     trigDelayMs   = std::max(0,std::min(500,(int)regGetDWORD(L"TrigDelay",0)));
     trigHoldMode  = regGetDWORD(L"TrigHold",0)!=0;
     int hk=(int)regGetDWORD(L"HotkeyVK",VK_F8);
@@ -14769,16 +14790,20 @@ int benchmarkSystem(){
 // handler never has to duplicate the layout arithmetic.
 struct TbLayout { int yEnable,yArm,yKey,yColour,yTune; int hueX,hueY,hueW,hueH; int tolX,tolY,tolW; int pickX,pickY,pickW,pickH; };
 static TbLayout g_tbLay={};
-// Where along the tolerance track a given x sits. Shared by the click and the drag so
-// the two can never disagree about what a position means.
-static inline int trigTolFromX(int x){
-    if(g_tbLay.tolW<=0) return 0;
-    float f=(float)(x-g_tbLay.tolX)/(float)g_tbLay.tolW;
-    return std::max(0,std::min(255,(int)(f*255.0f+0.5f)));
-}
 bool                g_tbCapturing=false;   // waiting for the user to press a key
 static bool         g_tbHexEditing=false;
 static std::wstring g_tbHexBuf;
+// Commits whatever has been typed. Anything short of six digits is left alone rather
+// than half-applied, so a mistyped colour never silently becomes a different one.
+static void applyTrigHex(){
+    if(g_tbHexBuf.size()==6){
+        int v=(int)wcstol(g_tbHexBuf.c_str(),nullptr,16);
+        trigR=(v>>16)&0xFF; trigG=(v>>8)&0xFF; trigB=v&0xFF;
+        saveSettings();
+    }
+    g_tbHexEditing=false;
+    g_tbHexBuf.clear();
+}
 static bool g_tbArmCapturing=false;   // waiting for a key for the arm bind
 
 // Fully saturated hue -> RGB, for the colour strip.
@@ -14920,7 +14945,13 @@ std::atomic<int>  trigKey{'F'};               // key it presses - F is parry in 
 // you, your character both turn this green. White means it is targeting someone else,
 // so white must not match - which is why the check below rejects greys outright.
 std::atomic<int>  trigR{8}, trigG{134}, trigB{8};
-std::atomic<int>  trigTolerance{40};          // 0..255 per-channel distance
+// Fixed, not a setting. Typing the exact hex is the accurate way to say which colour
+// to look for, and a tolerance slider on top of that only gives you a second thing to
+// get wrong - widen it and it fires on the wrong colour, narrow it and it fires on
+// nothing. This is enough slack to absorb the compression and lighting variance around
+// a colour that is otherwise exactly right.
+#define TRIG_TOLERANCE 15
+std::atomic<int>  trigTolerance{TRIG_TOLERANCE};
 // No scan box any more. It was a setting nobody could tune usefully - too small and the
 // ball was never inside it, too large and it cost frames - and it had a real bug: the
 // thread clamped it to 128 while the default was 360, so the number in the UI was not
@@ -15853,7 +15884,7 @@ static Profile profileFromCurrent(const std::wstring& name){
     p.tbEnabled=triggerbotEnabled.load(); p.tbHold=trigHoldMode.load();
     p.tbKey=trigKey.load();
     p.tbR=trigR.load(); p.tbG=trigG.load(); p.tbB=trigB.load();
-    p.tbTol=trigTolerance.load();   // tbBox is written as a fixed 0, see the struct
+    p.tbTol=TRIG_TOLERANCE;   // fixed; tbTol and tbBox are kept only for the file format
     return p;
 }
 
@@ -15877,7 +15908,8 @@ static void profileApply(const Profile& p){
     // surprise that costs someone a match.
     trigHoldMode=p.tbHold; trigKey=p.tbKey;
     trigR=p.tbR; trigG=p.tbG; trigB=p.tbB;
-    trigTolerance=p.tbTol;
+    // Tolerance is fixed now, so a profile written when it was adjustable must not
+    // drag an old value back in. The field stays in the file for format compatibility.
     saveSettings();
 }
 
@@ -16594,7 +16626,11 @@ void drawSlider(HDC hdc,int x,int y,int w,int val,int minV,int maxV){
 struct Layout{int W,pad,cw,yHotkey,yMode,yKeys,yKps,yVouch;};
 Layout getLayout(HWND hwnd){
     RECT cr;GetClientRect(hwnd,&cr);
-    Layout l;l.W=cr.right;l.pad=14;l.cw=l.W-l.pad*2;
+    Layout l;l.W=cr.right;
+    // In landscape the rail eats the left edge, so the page starts past it. Written as
+    // "pad then width" rather than "pad on both sides" because the two are no longer
+    // the same number.
+    l.pad=14+dockLeft(); l.cw=l.W-l.pad-14;
     int off=-mainScrollPos; // scroll offset
     // Below the mode switch, which sits below the 44px header. The switch used to be
     // drawn at yHotkey-40, which put it straight through the wrathic wordmark.
@@ -17028,6 +17064,42 @@ static void drawCaptionButtons(HDC hdc,int W){
         if(px+pw < minX-8){                  // never draw under the caption buttons
             drawRR(hdc,px,py,pw,20,10,T.btn,fg,1);
             drawText(hdc,tb,px,py,pw,20,fg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+    }
+}
+
+// The three tabs as glyphs rather than words: a bolt for the macro, a crosshair for
+// the triggerbot, sliders for settings. Drawn rather than shipped as bitmaps so they
+// take the theme's colour and stay sharp at any DPI.
+static void drawTabIcon(HDC hdc,int tab,int cx,int cy,COLORREF col){
+    using namespace Gdiplus;
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    Color c(255,GetRValue(col),GetGValue(col),GetBValue(col));
+    SolidBrush br(c);
+    Pen pen(c,1.8f);
+    pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
+    REAL x=(REAL)cx, y=(REAL)cy;
+    if(tab==0){
+        // Bolt. The macro is the thing that fires fast.
+        PointF pts[6]={ PointF(x+1.5f,y-8), PointF(x-5,y+1), PointF(x-0.5f,y+1),
+                        PointF(x-1.5f,y+8), PointF(x+5,y-1), PointF(x+0.5f,y-1) };
+        g.FillPolygon(&br,pts,6);
+    } else if(tab==1){
+        // Crosshair: a ring with four ticks, gapped so the ring stays readable.
+        g.DrawEllipse(&pen,x-5.5f,y-5.5f,11.0f,11.0f);
+        g.DrawLine(&pen,x,y-8.5f,x,y-6.5f);
+        g.DrawLine(&pen,x,y+6.5f,x,y+8.5f);
+        g.DrawLine(&pen,x-8.5f,y,x-6.5f,y);
+        g.DrawLine(&pen,x+6.5f,y,x+8.5f,y);
+        g.FillEllipse(&br,x-1.3f,y-1.3f,2.6f,2.6f);
+    } else {
+        // Three sliders, knobs staggered - a gear at this size turns into a blob.
+        const REAL ys[3]={y-5,y,y+5};
+        const REAL kx[3]={x+2,x-3,x+3};
+        for(int i=0;i<3;i++){
+            g.DrawLine(&pen,x-7,ys[i],x+7,ys[i]);
+            g.FillEllipse(&br,kx[i]-2.0f,ys[i]-2.0f,4.0f,4.0f);
         }
     }
 }
@@ -17570,20 +17642,7 @@ void paintMain(HWND hwnd){
         }
         g_tbLay.yColour=ty; ty+=130;
 
-        drawCard(hdc,p,ty,cw,72);
-        {   wchar_t tb[64];
-            swprintf(tb,64,L"TOLERANCE   %d",trigTolerance.load());
-            drawText(hdc,tb,p+16,ty+10,220,12,T.subtext,hFontSmall);
-            drawText(hdc,L"how close a pixel must be to the colour",p+16+112,ty+10,cw-140,12,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-            // The same slider as the speed one on the macro tab, drawn by the same
-            // function - it grows under the hand, keeps the mouse through a drag and
-            // ticks as it moves. It was a bare track before, which looked and behaved
-            // like a different control for no reason.
-            int sx=p+16, sy=ty+30, sw2=cw-32;
-            drawSlider(hdc,sx,sy,sw2,trigTolerance.load(),0,255);
-            g_tbLay.tolX=sx; g_tbLay.tolY=sy; g_tbLay.tolW=sw2;
-        }
-        g_tbLay.yTune=ty; ty+=82;
+        g_tbLay.yTune=-10000; g_tbLay.tolW=0;
 
         // What the scanner is seeing right now. Watch this while the ball changes: if
         // "brightest" turns your colour and "matching" stays at 0, the tolerance is
@@ -17610,14 +17669,32 @@ void paintMain(HWND hwnd){
     }
 
     if(activeTab==2){
-        paintSettingsInto(hdc,W,H-DOCK_H);
+        paintSettingsInto(hdc,W,H-dockBottom());
     }
 
     // â”€â”€ TOASTS (drawn before the dock so they slide up from behind it) â”€â”€
     drawToasts(hdc,W,H);
 
     // â”€â”€ BOTTOM DOCK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    {int dy=H-DOCK_H;
+    if(g_landscape){
+        // A vertical pill down the left, floating clear of the edges the same way the
+        // bottom one does. Icons only - there is no room for words at this width, and
+        // the selected tab is named in the header anyway.
+        const int inset=8, pillW=DOCK_W-16;
+        int px=inset, py=HEADER_H+10, ph=H-HEADER_H-20;
+        drawGlassPill(hdc,px,py,pillW,ph,pillW/2);
+        const int N=3;
+        int segH=ph/N;
+        float selY=(float)py + g_tabPos*(float)segH;
+        drawSelBubble(hdc,px+3,(int)(selY+3),pillW-6,segH-6,(pillW-6)/2);
+        for(int i=0;i<N;i++){
+            float on=1.0f-std::min(1.0f,fabsf(tabAnim-(float)i));
+            COLORREF c=lerpCol(T.subtext,T.text,on);
+            int cx=px+pillW/2, cy=py+segH*i+segH/2;
+            drawTabIcon(hdc,i,cx,cy,c);
+        }
+    }
+    else {int dy=H-DOCK_H;
     // A floating pill rather than a band welded to the window edge: the dock is
     // inset on all sides and fully rounded, with the selected tab riding inside it
     // as its own rounded bubble that slides between positions.
@@ -17626,7 +17703,6 @@ void paintMain(HWND hwnd){
         int px=inset, py=dy+6, pw=W-inset*2;
         drawGlassPill(hdc,px,py,pw,pillH,pillH/2);
         const int N=3;
-        const wchar_t* labels[N]={L"wrathic",L"triggerbot",L"Settings"};
         int segW=pw/N;
         // The selection bubble follows tabAnim continuously, so switching tabs
         // slides it rather than snapping between cells.
@@ -17634,9 +17710,7 @@ void paintMain(HWND hwnd){
         drawSelBubble(hdc,(int)(selX+3),py+3,segW-6,pillH-6,(pillH-6)/2);
         for(int i=0;i<N;i++){
             float on=1.0f-std::min(1.0f,fabsf(tabAnim-(float)i));
-            drawText(hdc,labels[i],px+segW*i,py,segW,pillH,
-                     lerpCol(T.subtext,T.text,on),hFontSmall,
-                     DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            drawTabIcon(hdc,i,px+segW*i+segW/2,py+pillH/2,lerpCol(T.subtext,T.text,on));
         }
     }}
 
@@ -17644,7 +17718,7 @@ void paintMain(HWND hwnd){
 
     // Version toast - only in main app window, shown once per version
     if(g_versionToast){
-        int tw=W-28, th=34, tx=14, ty=H-DOCK_H-8-th;
+        int tw=W-28-dockLeft(), th=34, tx=14+dockLeft(), ty=H-dockBottom()-8-th;
         drawRR(hdc,tx,ty,tw,th,8,T.accent,T.accent,0);
         int closeW=28;
         drawText(hdc,L"\u2728  What\u2019s new in " APP_VERSION,tx+10,ty,tw-closeW-10,th,T.bg,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -17736,7 +17810,8 @@ static int calcApplicationCardH(){
     h+=14+6;                           // header
     h+=24+4;                           // UI Sounds
     h+=24+4;                           // Discord Rich Presence
-    h+=24+6;                           // Minimise to Tray
+    h+=24+4;                           // Minimise to Tray
+    h+=24+6;                           // Side dock
     h+=8;
     return h;
 }
@@ -17749,33 +17824,39 @@ static int calcOvPosCardH(){
     return grid+8+20+8;
 }
 
-SLayout getSLayout(HWND hwnd){
-    RECT cr; GetClientRect(hwnd,&cr);
-    SLayout l; l.W=cr.right; l.pad=14; l.cw=l.W-l.pad*2-16;
-    // Below the header, not behind it. This started at 8, which put the vouch card
-    // entirely underneath the 44px title bar - so the settings page opened with a card
-    // you could see the bottom edge of and nothing else.
+// The single source of the settings page's geometry. It used to exist twice - here and
+// again inside paintSettingsInto, which needed a different width - and the two copies
+// each accumulated the card positions independently. Any change to the order or to the
+// top margin had to be made in both, and making it in one was a silent misalignment
+// between what was drawn and what was clickable. There is one now, and it takes the
+// width as an argument so the second copy has no reason to exist.
+//
+// Card order is priority order: the licence key and how long is left on it first,
+// because those are what people open this page to look at; the vouch nag last,
+// because it is the only card here that asks for something rather than showing it.
+SLayout getSLayoutW(int W){
+    SLayout l; l.W=W; l.pad=14+dockLeft(); l.cw=l.W-l.pad-14-16;
+    // Below the header, not behind it.
     int y = HEADER_H + 8 - settScrollPos;
-    l.yVouch     = y; y += 48 + GAP;
+    l.yLic       = y; y += (licCopied?62:48) + GAP;
+    l.yTrial     = y; if(trialMode) y += 52 + GAP;
+    l.yUpdate    = y; y += 58 + GAP;
+    l.yProfiles  = y; y += PROFILE_CARD_H + GAP;
     l.yRes       = y; y += calcOverlayCardH() + GAP;
     if(kpsOverlayEnabled||resOverlayEnabled) y += calcOvPosCardH() + GAP;
-    l.yAutoLaunch= y; y += calcUtilsCardH() + GAP;     // utilities card
-    l.yProfiles  = y; y += PROFILE_CARD_H + GAP;      // profiles card
-    // Appearance card (yFont = card top)
-    l.yFont      = y; y += calcAppearanceCardH() + GAP;
-    l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22; // font row start
-    if(fontDropOpen) {} // height already in calcAppearanceCardH
-    l.yTheme     = -1; // embedded in appearance card, not separate
-    // Application card (yMinimise = card top)
-    l.yMinimise  = y; y += calcApplicationCardH() + GAP;
-    // Update card
-    l.yUpdate    = y; y += 58 + GAP;
-    // License card
-    l.yLic       = y; y += (licCopied?62:48) + GAP;
-    l.yChangelog = -1; // in Application card
-    l.yTrial     = y; if(trialMode) y += 52 + GAP;
+    l.yFont      = y; y += calcAppearanceCardH() + GAP;   // appearance card top
+    l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22;            // font row start
+    l.yTheme     = -1;                                    // embedded in appearance
+    l.yMinimise  = y; y += calcApplicationCardH() + GAP;  // application card top
+    l.yAutoLaunch= y; y += calcUtilsCardH() + GAP;        // utilities card
+    l.yVouch     = y; y += 48 + GAP;
+    l.yChangelog = -1;                                    // in Application card
     settTotalHeight = y + settScrollPos + 8;
     return l;
+}
+SLayout getSLayout(HWND hwnd){
+    RECT cr; GetClientRect(hwnd,&cr);
+    return getSLayoutW(cr.right);
 }
 
 // Forward declarations for tooltip helpers (defined later)
@@ -17785,23 +17866,8 @@ static bool drawTipIcon(HDC hdc, int x, int y, int id, COLORREF col);
 // ===================== PAINT SETTINGS =====================
 
 void paintSettingsInto(HDC hdc,int W,int H){
-    SLayout l = getSLayout(NULL); // reuse getSLayout logic for yVouch etc
-    // Recompute with correct W (getSLayout uses hwnd client rect)
-    l.W=W; l.pad=14; l.cw=W-l.pad*2-16;
-    int y2 = HEADER_H + 8 - settScrollPos;   // must match getSLayout above
-    l.yVouch     = y2; y2 += 48 + GAP;
-    l.yRes       = y2; y2 += calcOverlayCardH() + GAP;
-    if(kpsOverlayEnabled||resOverlayEnabled) y2 += calcOvPosCardH() + GAP;
-    l.yAutoLaunch= y2; y2 += calcUtilsCardH() + GAP;
-    l.yProfiles  = y2; y2 += PROFILE_CARD_H + GAP;
-    l.yFont      = y2; y2 += calcAppearanceCardH() + GAP;
-    l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22;
-    l.yTheme     = -1; // embedded in appearance card
-    l.yMinimise  = y2; y2 += calcApplicationCardH() + GAP;
-    l.yUpdate    = y2; y2 += 58 + GAP;
-    l.yLic       = y2; y2 += (licCopied?62:48) + GAP;
-    l.yTrial     = y2; if(trialMode) y2 += 52 + GAP;
-    settTotalHeight = y2 + settScrollPos + 8;
+    // Same geometry the click handler uses, from the same function.
+    SLayout l = getSLayoutW(W);
     int p=l.pad, cw=l.cw;
 
 
@@ -17829,11 +17895,11 @@ void paintSettingsInto(HDC hdc,int W,int H){
     cx+=20+6;
 
     // KPS Overlay
-    drawTipIcon(hdc,p+14,cx+5,1,T.subtext);
+    drawTipIcon(hdc,p+14,cx+5,ID_TIP_RES_OVERLAY,T.subtext);
     drawText(hdc,L"KPS Overlay",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-46,cx,kpsOverlayEnabled); cx+=24+4;
     // Resource Overlay
-    drawTipIcon(hdc,p+14,cx+5,2,T.subtext);
+    drawTipIcon(hdc,p+14,cx+5,ID_TIP_KPS_OVERLAY,T.subtext);
     drawText(hdc,L"Resource Overlay",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-46,cx,resOverlayEnabled); cx+=24+4;
 
@@ -17854,7 +17920,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     }
 
     // Sys/Macro Stats
-    drawTipIcon(hdc,p+14,cx+5,3,T.subtext);
+    drawTipIcon(hdc,p+14,cx+5,ID_TIP_SCOPE,T.subtext);
     drawText(hdc,L"Sys / Macro Stats",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-46,cx,overlaySysStats); cx+=24+8;
     (void)cx;
@@ -18032,13 +18098,17 @@ void paintSettingsInto(HDC hdc,int W,int H){
     y=l.yMinimise+sfadeY;
     drawCard(hdc,p,y,cw,calcApplicationCardH());
     {int cx=y+10;
-    drawText(hdc,L"APPLICATION",p+14,cx,150,14,T.subtext,hFontSmall); cx+=14+6;
-    drawText(hdc,L"UI Sounds",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"APP",p+14,cx,150,14,T.subtext,hFontSmall); cx+=14+6;
+    drawText(hdc,L"Sounds",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-48,cx,uiSoundsEnabled); cx+=24+4;
-    drawText(hdc,L"Discord Rich Presence",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"Discord status",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawTipIcon(hdc,p+14+92,cx+5,ID_TIP_RPC,T.subtext);
     drawToggle(hdc,p+cw-48,cx,discordRpcEnabled); cx+=24+4;
-    drawText(hdc,L"Minimise to Tray",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"Hide to tray",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-48,cx,minimiseToTray); cx+=24+4;
+    drawText(hdc,L"Side dock",p+14,cx,cw-70,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawTipIcon(hdc,p+14+70,cx+5,ID_TIP_LANDSCAPE,T.subtext);
+    drawToggle(hdc,p+cw-48,cx,g_landscape); cx+=24+4;
     (void)cx;}
 
     // â”€â”€ UPDATE CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -18165,7 +18235,7 @@ void drawToasts(HDC hdc, int W, int H) {
     // full width at 40px tall read as a dialog appearing every time you nudged a
     // slider.
     int th = 30, tw = W - 88, tx = 44;
-    int restBottom = H - DOCK_H - 16; // clears the floating dock pill, which sits 6px off the bottom
+    int restBottom = H - dockBottom() - 16; // clears the floating dock pill, which sits 6px off the bottom
 
     for (int i = 0; i < n; i++) {
         auto& t = g_toasts[i];
@@ -18515,6 +18585,14 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();discordRpcEnabled=!discordRpcEnabled;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
       cx+=24+4;
       if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){playClick();minimiseToTray=!minimiseToTray;saveSettings();InvalidateRect(hwnd,NULL,FALSE);}
+      cx+=24+4;
+      if(mx>=p+cw-48&&mx<=p+cw-4&&my>=cx&&my<=cx+24){
+          playToggle(); g_landscape=!g_landscape; saveSettings();
+          // Every page measures itself against the dock, so a stale scroll position
+          // from the other orientation would leave the page part-way off screen.
+          mainScrollPos=0; settScrollPos=0;
+          InvalidateRect(hwnd,NULL,TRUE);
+      }
     }
 
     // â”€â”€ UPDATE CARD (l.yUpdate) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -19135,16 +19213,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             int sh=settingsHitTest(hwnd,mx,my);
             if(sh!=g_settHoverId){ setSettHover(sh); InvalidateRect(hwnd,NULL,FALSE); }
         }
-        if(activeTab==1 && g_sliderDragging && (wp&MK_LBUTTON)){
-            // Same gesture, same detent tick, same rate limit as the speed slider.
-            int nt=trigTolFromX(mx);
-            if(nt!=trigTolerance.load()){
-                static DWORD lastTolTick=0;
-                DWORD nowT=GetTickCount();
-                if(nowT-lastTolTick>40){ playTick(); lastTolTick=nowT; }
-                trigTolerance=nt; InvalidateRect(hwnd,NULL,FALSE);
-            }
-        }
         if(activeTab==0){
             bool draggingSlider=g_sliderDragging&&(wp&MK_LBUTTON);
             if(draggingSlider){
@@ -19185,6 +19253,21 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         break;
     }
     case WM_CHAR:{
+        // The hex field was drawn, and clicking it set an editing flag, but nothing
+        // ever fed it a character - so it looked like a text box and behaved like a
+        // label. Six hex digits, applied on the sixth or on Enter.
+        if(g_tbHexEditing){
+            wchar_t c=(wchar_t)wp;
+            if(c>=L'a'&&c<=L'f') c=(wchar_t)(c-32);          // accept lower case
+            bool isHex=(c>=L'0'&&c<=L'9')||(c>=L'A'&&c<=L'F');
+            if(c==L'#'){ /* ignore a leading hash - the field already shows one */ }
+            else if(isHex && g_tbHexBuf.size()<6){
+                g_tbHexBuf+=c;
+                if(g_tbHexBuf.size()==6) applyTrigHex();
+            }
+            InvalidateRect(hwnd,NULL,FALSE);
+            return 0;
+        }
         if(g_kpsEditing && wp>=L'0' && wp<=L'9' && g_kpsEditBuffer.size()<5){
             g_kpsEditBuffer+=(wchar_t)wp;
             InvalidateRect(hwnd,NULL,FALSE);
@@ -19199,6 +19282,36 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_KEYDOWN:{
+        if(g_tbHexEditing){
+            if(wp==VK_BACK){
+                if(!g_tbHexBuf.empty()) g_tbHexBuf.pop_back();
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            if(wp==VK_RETURN){ applyTrigHex(); InvalidateRect(hwnd,NULL,FALSE); return 0; }
+            if(wp==VK_ESCAPE){
+                g_tbHexEditing=false; g_tbHexBuf.clear();
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            if(wp==L'V' && (GetKeyState(VK_CONTROL)&0x8000)){
+                // Colours get copied out of other tools far more often than they get
+                // typed, so paste has to work.
+                if(OpenClipboard(hwnd)){
+                    HANDLE h=GetClipboardData(CF_UNICODETEXT);
+                    if(h){ const wchar_t* t=(const wchar_t*)GlobalLock(h);
+                        if(t){ g_tbHexBuf.clear();
+                            for(const wchar_t* q=t; *q && g_tbHexBuf.size()<6; q++){
+                                wchar_t c=*q; if(c>=L'a'&&c<=L'f') c=(wchar_t)(c-32);
+                                if((c>=L'0'&&c<=L'9')||(c>=L'A'&&c<=L'F')) g_tbHexBuf+=c;
+                            }
+                            GlobalUnlock(h);
+                            if(g_tbHexBuf.size()==6) applyTrigHex();
+                        }
+                    }
+                    CloseClipboard();
+                }
+                InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+        }
         if(g_pasteEditing){
             if(wp==VK_BACK){
                 if(!g_pasteBuffer.empty()){ g_pasteBuffer.pop_back(); pasteRevalidate(); }
@@ -19246,7 +19359,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // Settings only, and only the profile slots - see settingsHandleRightClick.
         if(activeTab==2 && g_lockKind==LOCK_NONE && !g_optimiseConfirmOpen){
             RECT crR; GetClientRect(hwnd,&crR);
-            settingsHandleRightClick(hwnd,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),crR.right,crR.bottom-DOCK_H);
+            settingsHandleRightClick(hwnd,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),crR.right,crR.bottom-dockBottom());
         }
         return 0;
     }
@@ -19320,7 +19433,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             RECT crT; GetClientRect(hwnd,&crT);
             int pT=14, cwT=crT.right-pT*2;
             int mxT=GET_X_LPARAM(lp), myT=GET_Y_LPARAM(lp);
-            if(myT < crT.bottom-DOCK_H){
+            if(myT < crT.bottom-dockBottom()){
                 bool handled=false;
                 // Everything except the switch itself is inert while it is off, matching
                 // the paint above. Without this the hit tests still ran against layout
@@ -19392,7 +19505,9 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
                 // hex field
                 else if(mxT>=pT+70&&mxT<=pT+180&&myT>=g_tbLay.yColour+30&&myT<=g_tbLay.yColour+56){
-                    playClick(); g_tbHexEditing=true; g_tbHexBuf.clear(); handled=true;
+                    playClick(); g_tbHexEditing=true; g_tbHexBuf.clear();
+                    SetFocus(hwnd);   // without focus the keystrokes go nowhere
+                    handled=true;
                 }
                 // hue strip
                 else if(mxT>=g_tbLay.hueX&&mxT<=g_tbLay.hueX+g_tbLay.hueW&&
@@ -19401,27 +19516,24 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     int r2,g2,b2; hsvToRgb(h,1.0f,1.0f,r2,g2,b2);
                     trigR=r2; trigG=g2; trigB=b2; playClick(); saveSettings(); handled=true;
                 }
-                // Tolerance. Takes the mouse for the whole gesture, the same way the
-                // speed slider does - without capture, sliding a few pixels off the
-                // track vertically ended the drag mid-move.
-                else if(mxT>=g_tbLay.tolX&&mxT<=g_tbLay.tolX+g_tbLay.tolW&&
-                        myT>=g_tbLay.tolY-8&&myT<=g_tbLay.tolY+14){
-                    g_sliderDragging=true; SetCapture(hwnd);
-                    trigTolerance=trigTolFromX(mxT);
-                    playClick(); handled=true;
-                }
                 else { g_tbHexEditing=false; }
                 if(handled){ InvalidateRect(hwnd,NULL,FALSE); return 0; }
             }
         }
 
         {RECT cr10;GetClientRect(hwnd,&cr10);
-        int dockY=cr10.bottom-DOCK_H;
-        // Dock tab bar always handled first
-        if(my>=dockY){
-            // Three equal segments inside the dock pill: wrathic | triggerbot | Settings
+        bool onDock; int idx=0;
+        if(g_landscape){
+            onDock = (mx < DOCK_W);
+            int py=HEADER_H+10, ph=cr10.bottom-HEADER_H-20, seg=std::max(1,ph/3);
+            idx=(my-py)/seg;
+        } else {
+            onDock = (my >= cr10.bottom-DOCK_H);
             int inset=10, pw=cr10.right-inset*2, seg=std::max(1,pw/3);
-            int idx=(mx-inset)/seg;
+            idx=(mx-inset)/seg;
+        }
+        // Dock tab bar always handled first
+        if(onDock){
             idx=std::max(0,std::min(2,idx));
             playClick();
             // Tabs 0 and 1 share mainScrollPos but are different heights, so carrying a
@@ -19440,7 +19552,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // returned before this code ever ran. Now positioned above the
         // dock (matches the render fix) so it's actually clickable.
         if(g_versionToast){
-            int tw2=cr10.right-28, th2=34, tx2=14, ty2=cr10.bottom-DOCK_H-8-th2;
+            int tw2=cr10.right-28-dockLeft(), th2=34, tx2=14+dockLeft(), ty2=cr10.bottom-dockBottom()-8-th2;
             bool inToast=mx>=tx2&&mx<=tx2+tw2&&my>=ty2&&my<=ty2+th2;
             if(inToast){
                 playClick();
@@ -19459,7 +19571,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         }
         // Settings tab: absolute hard block - nothing below runs
         if(activeTab==2){
-            settingsHandleClick(hwnd,mx,my,cr10.right,dockY);
+            settingsHandleClick(hwnd,mx,my,cr10.right,cr10.bottom-dockBottom());
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
         }}
@@ -19761,7 +19873,7 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         if(activeTab==2){
             int delta2=GET_WHEEL_DELTA_WPARAM(wp)>0?-80:80;
             RECT cr9;GetClientRect(hwnd,&cr9);
-            int maxS9=std::max(0,(int)settTotalHeight-(int)(cr9.bottom-DOCK_H)+48);
+            int maxS9=std::max(0,(int)settTotalHeight-(int)(cr9.bottom-dockBottom())+48);
             settScrollPos=std::max(0,std::min(settScrollPos+delta2,maxS9));
 
             settingsDirty=true;
@@ -19788,7 +19900,7 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
                 // The dock floats over the bottom of the page, so the content has to be
                 // allowed past the client edge by its height or the last card can never
                 // be cleared of it.
-                int maxS=std::max(0,mainTotalHeight-(int)crw.bottom+DOCK_H+16);
+                int maxS=std::max(0,mainTotalHeight-(int)crw.bottom+dockBottom()+16);
                 mainScrollPos += (up ? -40 : 40);
                 mainScrollPos = std::max(0,std::min(mainScrollPos,maxS));
             }
@@ -19814,7 +19926,7 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
             int delta=GET_WHEEL_DELTA_WPARAM(wp)>0?-40:40;
             // Same limit as the advanced page above. This one did not account for the
             // floating dock, so the bottom card stayed under it.
-            int maxS=std::max(0,mainTotalHeight-(int)cr5.bottom+DOCK_H+16);
+            int maxS=std::max(0,mainTotalHeight-(int)cr5.bottom+dockBottom()+16);
             mainScrollPos=std::max(0,std::min(mainScrollPos+delta,maxS));
             // Update scrollbar thumb position
             SCROLLINFO si={};si.cbSize=sizeof(si);si.fMask=SIF_POS;
