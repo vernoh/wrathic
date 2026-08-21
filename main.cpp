@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.5"
+#define APP_VERSION      L"v3.1.6"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -16991,7 +16991,7 @@ void drawSlider(HDC hdc,int x,int y,int w,int val,int minV,int maxV){
 }
 
 // ===================== LAYOUT =====================
-struct Layout{int W,pad,cw,yHotkey,yMode,yKeys,yKps,yVouch;};
+struct Layout{int W,pad,cw,yHotkey,yMode,yKeys,yKps,yVouch,yProfiles;};
 Layout getLayout(HWND hwnd){
     RECT cr;GetClientRect(hwnd,&cr);
     Layout l;l.W=cr.right;
@@ -17006,7 +17006,8 @@ Layout getLayout(HWND hwnd){
     l.yMode        =l.yHotkey +68;
     l.yKeys        =l.yMode   +68;
     l.yKps         =l.yKeys   +102;
-    l.yVouch       =l.yKps    +102;
+    l.yProfiles    =l.yKps    +102;
+    l.yVouch       =l.yProfiles+PROFILE_CARD_H+8;
     // Deliberately does NOT set mainTotalHeight any more. It used to, and that made a
     // geometry helper quietly overwrite the scroll extent of whichever tab was open -
     // including from inside the wheel handler, which calls this to find the step list.
@@ -17032,6 +17033,18 @@ int hitTest(HWND hwnd,int mx,int my){
         if(mx>=px&&mx<=px+pw&&my>=l.yKps+56&&my<=l.yKps+78)return 500+i;
         px+=pw+pg;
     }
+    { int py=l.yProfiles, slotW=(l.cw-28-12)/3;
+      for(int i=0;i<PROFILE_SLOTS;i++){
+          int sx=p+14+i*(slotW+6);
+          if(mx>=sx&&mx<=sx+slotW&&my>=py+30&&my<=py+66) return ID_PROFILE_0+i;
+      }
+      if(mx>=p+14&&mx<=p+l.cw-14&&my>=py+70 &&my<=py+96 ) return ID_PROFILE_COPY;
+      if(mx>=p+14&&mx<=p+l.cw-14&&my>=py+102&&my<=py+128) return ID_PROFILE_PASTE;
+      { int ay=py+152, aw=(l.cw-28-12)/3;
+        for(int i=0;i<PROFILE_SLOTS;i++){
+            int sx=p+14+i*(aw+6);
+            if(mx>=sx&&mx<=sx+aw&&my>=ay&&my<=ay+24) return ID_PROFILE_ASSIGN_0+i;
+        } } }
     if(mx>=p+l.cw-110&&mx<=p+l.cw-6&&my>=l.yVouch+9&&my<=l.yVouch+35) return ID_VOUCH_BTN;
     if(my>=l.yVouch&&my<=l.yVouch+44&&mx>=p&&mx<=p+l.cw) return ID_SETTINGS_BTN; // vouch card row
     return 0;
@@ -17492,6 +17505,77 @@ static void drawAppHeader(HDC hdc,int W){
     drawCaptionButtons(hdc,W);
 }
 
+// ===== PROFILES CARD =====
+// Lives on the macro page rather than in settings. Saving a slot is something you do
+// straight after setting a speed, and having to cross to another tab to do it meant
+// picking a number, leaving the page, and hoping you remembered what it was. The KPS
+// slider is directly above this now, so the value being saved is on screen while you
+// save it.
+void drawProfilesCard(HDC hdc,int p,int y,int cw){
+animateTo(g_profCopiedAlpha, g_profCopied?1.0f:0.0f, 0.12f);
+animateTo(g_settHoverAlpha, g_settHoverId?1.0f:0.0f, 0.07f);
+drawCard(hdc,p,y,cw,PROFILE_CARD_H);
+drawText(hdc,L"PROFILES",p+14,y+10,200,14,T.subtext,hFontSmall);
+// The three rules for the slots used to be spelled out under them on a line of
+// their own. They are the same three rules on every slot and you only need them
+// once, so they moved behind a '?'.
+drawTipIcon(hdc,p+14+64,y+9,ID_TIP_PROFILES,T.subtext);
+{
+    int rowY=y+30, slotW=(cw-28-12)/3;
+    for(int i=0;i<PROFILE_SLOTS;i++){
+        int sx=p+14+i*(slotW+6);
+        const Profile& pr=g_profiles[i];
+        float hv=getSettHover(ID_PROFILE_0+i);
+        drawRR(hdc,sx,rowY,slotW,36,9,lerpCol(T.btn,T.btnHov,hv),pr.used?T.accent:T.border,1);
+        wchar_t lbl[48];
+        if(pr.used) swprintf(lbl,48,L"%s",pr.name.c_str());
+        else        swprintf(lbl,48,L"Slot %d",i+1);
+        drawText(hdc,lbl,sx,rowY+3,slotW,17,pr.used?T.text:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        wchar_t sub[48];
+        if(pr.used) swprintf(sub,48,L"%d KPS",pr.kps); else wcscpy(sub,L"empty");
+        drawText(hdc,sub,sx,rowY+18,slotW,15,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+
+    // Copy: same green tick + fade the license key copy uses, so the two feel like
+    // the same action.
+    float ca=g_profCopiedAlpha;
+    float ce=getSettHover(ID_PROFILE_COPY);
+    COLORREF cBg=lerpCol(lerpCol(T.btn,T.btnHov,ce),RGB(20,60,30),ca);
+    drawRR(hdc,p+14,y+70,cw-28,26,13,cBg,lerpCol(T.border,T.green,ca),1);
+    drawText(hdc,ca>0.5f?L"\u2713  Copied":L"\u29c9  Copy my setup",
+             p+14,y+70,cw-28,26,lerpCol(lerpCol(T.subtext,T.text,ce),T.green,ca),
+             hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+
+    // Paste box. Typing is allowed but Ctrl+V is the point of it.
+    int by=y+102;
+    bool empty=g_pasteBuffer.empty();
+    COLORREF pbBorder = g_pasteEditing ? (empty?T.accent:(g_pasteValid?T.green:T.red))
+                                       : (empty?T.border:(g_pasteValid?T.green:T.red));
+    drawRR(hdc,p+14,by,cw-28,26,8,T.btn,pbBorder,1);
+    std::wstring disp;
+    if(empty && !g_pasteEditing) disp=L"Paste a code";
+    else {
+        disp=g_pasteBuffer;
+        if(g_pasteEditing && ((GetTickCount()/500)%2)==0) disp+=L"_";
+    }
+    drawText(hdc,disp.c_str(),p+22,by,cw-44,26,
+             (empty&&!g_pasteEditing)?T.subtext:T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+
+    // Assign row. Disabled until the buffer decodes - a code either parses or it
+    // does not, and there is no reason to let someone overwrite a slot with junk.
+    int ay=by+32, aw=(cw-28-12)/3;
+    for(int i=0;i<PROFILE_SLOTS;i++){
+        int sx=p+14+i*(aw+6);
+        float hv=g_pasteValid?getSettHover(ID_PROFILE_ASSIGN_0+i):0.0f;
+        drawRR(hdc,sx,ay,aw,24,12,g_pasteValid?lerpCol(T.btn,T.btnHov,hv):T.card,
+               g_pasteValid?T.border:T.border,1);
+        wchar_t t[32]; swprintf(t,32,L"\u2192 %d",i+1);
+        drawText(hdc,t,sx,ay,aw,24,g_pasteValid?lerpCol(T.subtext,T.text,hv):T.border,
+                 hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+}
+}
+
 void paintMain(HWND hwnd){
     // Per-frame card state: draw order keys the hover slots, and the flag is
     // re-derived each frame by drawCard rather than latching on forever.
@@ -17915,6 +17999,7 @@ void paintMain(HWND hwnd){
     }
 
         mainTotalHeight=l.yVouch+54+mainScrollPos; // last card + padding
+        drawProfilesCard(hdc,p,l.yProfiles,cw);
     } // end of the basic panel
     } // end activeTab==0
 
@@ -18221,8 +18306,9 @@ SLayout getSLayoutW(int W){
     SLayout l; l.W=W; l.pad=14+dockLeft(); l.cw=l.W-l.pad-14-16;
     // Below the header and below the page tabs, not behind either.
     int y = HEADER_H + 8 + SETT_TABS_H - settScrollPos;
-    l.yLic=l.yTrial=l.yUpdate=l.yProfiles=l.yRes=l.yFont=l.yMinimise=
+    l.yLic=l.yTrial=l.yUpdate=l.yRes=l.yFont=l.yMinimise=
         l.yAutoLaunch=l.yVouch=SETT_OFFPAGE;
+    l.yProfiles=SETT_OFFPAGE;   // drawn on the macro page now, never here
     if(g_settPage==0){
         l.yLic     = y; y += (licCopied?62:48) + GAP;
         l.yTrial   = y; if(trialMode) y += 52 + GAP;
@@ -18232,7 +18318,6 @@ SLayout getSLayoutW(int W){
         l.yRes     = y; y += calcOverlayCardH() + GAP;
         if(kpsOverlayEnabled||resOverlayEnabled) y += calcOvPosCardH() + GAP;
     } else {
-        l.yProfiles  = y; y += PROFILE_CARD_H + GAP;
         l.yFont      = y; y += calcAppearanceCardH() + GAP;
         l.yMinimise  = y; y += calcApplicationCardH() + GAP;
         l.yAutoLaunch= y; y += calcUtilsCardH() + GAP;
@@ -18398,70 +18483,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
         RECT sr={p+14,cx,p+14+cw-28,cx+lines*16+8}; DrawText(hdc,cleanRamStatus.c_str(),-1,&sr,DT_LEFT|DT_TOP|DT_WORDBREAK);
     }(void)cx;}
 
-    // ===== PROFILES CARD =====
-    y=l.yProfiles+sfadeY;
-    animateTo(g_profCopiedAlpha, g_profCopied?1.0f:0.0f, 0.12f);
-    animateTo(g_settHoverAlpha, g_settHoverId?1.0f:0.0f, 0.07f);
-    drawCard(hdc,p,y,cw,PROFILE_CARD_H);
-    drawText(hdc,L"PROFILES",p+14,y+10,200,14,T.subtext,hFontSmall);
-    // The three rules for the slots used to be spelled out under them on a line of
-    // their own. They are the same three rules on every slot and you only need them
-    // once, so they moved behind a '?'.
-    drawTipIcon(hdc,p+14+64,y+9,ID_TIP_PROFILES,T.subtext);
-    {
-        int rowY=y+30, slotW=(cw-28-12)/3;
-        for(int i=0;i<PROFILE_SLOTS;i++){
-            int sx=p+14+i*(slotW+6);
-            const Profile& pr=g_profiles[i];
-            float hv=getSettHover(ID_PROFILE_0+i);
-            drawRR(hdc,sx,rowY,slotW,36,9,lerpCol(T.btn,T.btnHov,hv),pr.used?T.accent:T.border,1);
-            wchar_t lbl[48];
-            if(pr.used) swprintf(lbl,48,L"%s",pr.name.c_str());
-            else        swprintf(lbl,48,L"Slot %d",i+1);
-            drawText(hdc,lbl,sx,rowY+3,slotW,17,pr.used?T.text:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            wchar_t sub[48];
-            if(pr.used) swprintf(sub,48,L"%d KPS",pr.kps); else wcscpy(sub,L"empty");
-            drawText(hdc,sub,sx,rowY+18,slotW,15,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        }
-
-        // Copy: same green tick + fade the license key copy uses, so the two feel like
-        // the same action.
-        float ca=g_profCopiedAlpha;
-        float ce=getSettHover(ID_PROFILE_COPY);
-        COLORREF cBg=lerpCol(lerpCol(T.btn,T.btnHov,ce),RGB(20,60,30),ca);
-        drawRR(hdc,p+14,y+70,cw-28,26,13,cBg,lerpCol(T.border,T.green,ca),1);
-        drawText(hdc,ca>0.5f?L"\u2713  Copied":L"\u29c9  Copy my setup",
-                 p+14,y+70,cw-28,26,lerpCol(lerpCol(T.subtext,T.text,ce),T.green,ca),
-                 hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-
-        // Paste box. Typing is allowed but Ctrl+V is the point of it.
-        int by=y+102;
-        bool empty=g_pasteBuffer.empty();
-        COLORREF pbBorder = g_pasteEditing ? (empty?T.accent:(g_pasteValid?T.green:T.red))
-                                           : (empty?T.border:(g_pasteValid?T.green:T.red));
-        drawRR(hdc,p+14,by,cw-28,26,8,T.btn,pbBorder,1);
-        std::wstring disp;
-        if(empty && !g_pasteEditing) disp=L"Paste a code";
-        else {
-            disp=g_pasteBuffer;
-            if(g_pasteEditing && ((GetTickCount()/500)%2)==0) disp+=L"_";
-        }
-        drawText(hdc,disp.c_str(),p+22,by,cw-44,26,
-                 (empty&&!g_pasteEditing)?T.subtext:T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-
-        // Assign row. Disabled until the buffer decodes - a code either parses or it
-        // does not, and there is no reason to let someone overwrite a slot with junk.
-        int ay=by+32, aw=(cw-28-12)/3;
-        for(int i=0;i<PROFILE_SLOTS;i++){
-            int sx=p+14+i*(aw+6);
-            float hv=g_pasteValid?getSettHover(ID_PROFILE_ASSIGN_0+i):0.0f;
-            drawRR(hdc,sx,ay,aw,24,12,g_pasteValid?lerpCol(T.btn,T.btnHov,hv):T.card,
-                   g_pasteValid?T.border:T.border,1);
-            wchar_t t[32]; swprintf(t,32,L"\u2192 %d",i+1);
-            drawText(hdc,t,sx,ay,aw,24,g_pasteValid?lerpCol(T.subtext,T.text,hv):T.border,
-                     hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        }
-    }
+    // Profiles moved to the macro page - see drawProfilesCard.
 
 
     // â”€â”€ APPEARANCE CARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -18739,18 +18761,6 @@ int settingsHitTest(HWND hwnd, int mx, int my){
     if(activeTab!=2) return 0;
     SLayout l = getSLayout(hwnd);
     int p=l.pad, cw=l.cw;
-    int py=l.yProfiles, slotW=(cw-28-12)/3;
-    for(int i=0;i<PROFILE_SLOTS;i++){
-        int sx=p+14+i*(slotW+6);
-        if(mx>=sx&&mx<=sx+slotW&&my>=py+30&&my<=py+66) return ID_PROFILE_0+i;
-    }
-    if(mx>=p+14&&mx<=p+cw-14&&my>=py+70 &&my<=py+96 ) return ID_PROFILE_COPY;
-    if(mx>=p+14&&mx<=p+cw-14&&my>=py+102&&my<=py+128) return ID_PROFILE_PASTE;
-    { int ay=py+152, aw=(cw-28-12)/3;
-      for(int i=0;i<PROFILE_SLOTS;i++){
-          int sx=p+14+i*(aw+6);
-          if(mx>=sx&&mx<=sx+aw&&my>=ay&&my<=ay+24) return ID_PROFILE_ASSIGN_0+i;
-      } }
     { int cx=l.yAutoLaunch+10+14+6+28+6;   // utilities card: past header and the first row
       if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+28) return ID_BENCHMARK; }
     return 0;
@@ -18761,10 +18771,90 @@ int settingsHitTest(HWND hwnd, int mx, int my){
 // message, so the hint was a lie.
 void settingsHandleRightClick(HWND hwnd, int mx, int my, int W, int H) {
     (void)W; (void)H;
-    if(activeTab!=2) return;
-    SLayout l = getSLayout(hwnd);
-    int p=l.pad, cw=l.cw;
-    int py=l.yProfiles, slotW=(cw-28-12)/3, rowY=py+30;
+    // Nothing on the settings page takes a right-click any more; profiles moved.
+    (void)hwnd; (void)mx; (void)my;
+}
+
+// Every click the profiles card takes. Split out of settingsHandleClick so the macro
+// page can own it - the geometry is passed in rather than read from a layout, which is
+// what let the card move without the two disagreeing about where its buttons are.
+void profilesHandleClick(HWND hwnd,int mx,int my,int p,int py,int cw){
+    int slotW=(cw-28-12)/3, rowY=py+30;
+    {
+      for(int i=0;i<PROFILE_SLOTS;i++){
+          int sx=p+14+i*(slotW+6);
+          if(mx>=sx&&mx<=sx+slotW&&my>=rowY&&my<=rowY+36){
+              if(g_profiles[i].used){
+                  profileApply(g_profiles[i]);
+                  playToggle(true);
+                  showSuccessToast((L"Loaded " + g_profiles[i].name).c_str());
+              } else {
+                  wchar_t nm[24]; swprintf(nm,24,L"Profile %d",i+1);
+                  g_profiles[i]=profileFromCurrent(nm);
+                  profilesSave();
+                  playToggle(true);
+                  showSuccessToast(L"Saved this setup");
+              }
+              InvalidateRect(hwnd,NULL,FALSE);
+              return;
+          }
+      }
+      // Copy: put the code on the clipboard so it can be pasted into Discord.
+      if(mx>=p+14&&mx<=p+cw-14&&my>=py+70&&my<=py+96){
+          playClick();
+          std::wstring code=profileEncode(profileFromCurrent(L"Current"));
+          if(OpenClipboard(hwnd)){
+              EmptyClipboard();
+              size_t bytes=(code.size()+1)*sizeof(wchar_t);
+              HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,bytes);
+              if(h){ memcpy(GlobalLock(h),code.c_str(),bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); }
+              CloseClipboard();
+              // Same tick-and-fade as the license key, on the same 2s timer.
+              g_profCopied=true; SetTimer(hwnd,20,2000,NULL);
+          } else showToast(L"Could not open the clipboard",T.red);
+          InvalidateRect(hwnd,NULL,FALSE);
+          return;
+      }
+      // The paste box. Clicking it takes keyboard focus; Ctrl+V fills it. It is also
+      // filled straight from the clipboard on click when it is empty, because that is
+      // what everyone tries first.
+      if(mx>=p+14&&mx<=p+cw-14&&my>=py+102&&my<=py+128){
+          playClick();
+          g_pasteEditing=true; g_kpsEditing=false;
+          if(g_pasteBuffer.empty()) pasteFromClipboard(hwnd);
+          InvalidateRect(hwnd,NULL,FALSE);
+          return;
+      }
+      // Assign the pasted code to a slot. Inert until it decodes.
+      { int ay=py+152, aw=(cw-28-12)/3;
+        for(int i=0;i<PROFILE_SLOTS;i++){
+            int sx=p+14+i*(aw+6);
+            if(mx>=sx&&mx<=sx+aw&&my>=ay&&my<=ay+24){
+                if(!g_pasteValid){ showToast(L"Paste a valid share code first",T.red); InvalidateRect(hwnd,NULL,FALSE); return; }
+                Profile imported;
+                if(profileDecode(g_pasteBuffer,imported)){
+                    wchar_t nm[24]; swprintf(nm,24,L"Shared %d",i+1);
+                    imported.name=nm; imported.used=true;
+                    g_profiles[i]=imported;
+                    profilesSave();
+                    playToggle(true);
+                    wchar_t m[48]; swprintf(m,48,L"Saved to slot %d",i+1);
+                    showSuccessToast(m);
+                    g_pasteBuffer.clear(); g_pasteValid=false; g_pasteEditing=false;
+                }
+                InvalidateRect(hwnd,NULL,FALSE);
+                return;
+            }
+        }
+      }
+      // Clicking anywhere else in the card drops focus out of the box.
+      if(my>=py&&my<=py+PROFILE_CARD_H) g_pasteEditing=false;
+    }
+}
+
+// Right-click clears a slot. Same split, same reason.
+void profilesHandleRightClick(HWND hwnd,int mx,int my,int p,int py,int cw){
+    int slotW=(cw-28-12)/3, rowY=py+30;
     for(int i=0;i<PROFILE_SLOTS;i++){
         int sx=p+14+i*(slotW+6);
         if(mx>=sx&&mx<=sx+slotW&&my>=rowY&&my<=rowY+36){
@@ -18897,77 +18987,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
         // Fine-adjust removed â€” drag overlay directly to reposition
     }
 
-    // ===== PROFILES CARD clicks =====
-    { int py=l.yProfiles, slotW=(cw-28-12)/3, rowY=py+30;
-      for(int i=0;i<PROFILE_SLOTS;i++){
-          int sx=p+14+i*(slotW+6);
-          if(mx>=sx&&mx<=sx+slotW&&my>=rowY&&my<=rowY+36){
-              if(g_profiles[i].used){
-                  profileApply(g_profiles[i]);
-                  playToggle(true);
-                  showSuccessToast((L"Loaded " + g_profiles[i].name).c_str());
-              } else {
-                  wchar_t nm[24]; swprintf(nm,24,L"Profile %d",i+1);
-                  g_profiles[i]=profileFromCurrent(nm);
-                  profilesSave();
-                  playToggle(true);
-                  showSuccessToast(L"Saved this setup");
-              }
-              InvalidateRect(hwnd,NULL,FALSE);
-              return;
-          }
-      }
-      // Copy: put the code on the clipboard so it can be pasted into Discord.
-      if(mx>=p+14&&mx<=p+cw-14&&my>=py+70&&my<=py+96){
-          playClick();
-          std::wstring code=profileEncode(profileFromCurrent(L"Current"));
-          if(OpenClipboard(hwnd)){
-              EmptyClipboard();
-              size_t bytes=(code.size()+1)*sizeof(wchar_t);
-              HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,bytes);
-              if(h){ memcpy(GlobalLock(h),code.c_str(),bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); }
-              CloseClipboard();
-              // Same tick-and-fade as the license key, on the same 2s timer.
-              g_profCopied=true; SetTimer(hwnd,20,2000,NULL);
-          } else showToast(L"Could not open the clipboard",T.red);
-          InvalidateRect(hwnd,NULL,FALSE);
-          return;
-      }
-      // The paste box. Clicking it takes keyboard focus; Ctrl+V fills it. It is also
-      // filled straight from the clipboard on click when it is empty, because that is
-      // what everyone tries first.
-      if(mx>=p+14&&mx<=p+cw-14&&my>=py+102&&my<=py+128){
-          playClick();
-          g_pasteEditing=true; g_kpsEditing=false;
-          if(g_pasteBuffer.empty()) pasteFromClipboard(hwnd);
-          InvalidateRect(hwnd,NULL,FALSE);
-          return;
-      }
-      // Assign the pasted code to a slot. Inert until it decodes.
-      { int ay=py+152, aw=(cw-28-12)/3;
-        for(int i=0;i<PROFILE_SLOTS;i++){
-            int sx=p+14+i*(aw+6);
-            if(mx>=sx&&mx<=sx+aw&&my>=ay&&my<=ay+24){
-                if(!g_pasteValid){ showToast(L"Paste a valid share code first",T.red); InvalidateRect(hwnd,NULL,FALSE); return; }
-                Profile imported;
-                if(profileDecode(g_pasteBuffer,imported)){
-                    wchar_t nm[24]; swprintf(nm,24,L"Shared %d",i+1);
-                    imported.name=nm; imported.used=true;
-                    g_profiles[i]=imported;
-                    profilesSave();
-                    playToggle(true);
-                    wchar_t m[48]; swprintf(m,48,L"Saved to slot %d",i+1);
-                    showSuccessToast(m);
-                    g_pasteBuffer.clear(); g_pasteValid=false; g_pasteEditing=false;
-                }
-                InvalidateRect(hwnd,NULL,FALSE);
-                return;
-            }
-        }
-      }
-      // Clicking anywhere else in the card drops focus out of the box.
-      if(my>=py&&my<=py+PROFILE_CARD_H) g_pasteEditing=false;
-    }
+    // Profiles clicks moved to the macro page - see profilesHandleClick.
 
     // â”€â”€ UTILITIES CARD (l.yAutoLaunch = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int cx=l.yAutoLaunch+10+14+6; // top + header
@@ -19384,17 +19404,24 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp) return 0;
         break;
     case WM_NCHITTEST:{
-        // Let Windows keep doing the edges - resizing, and the corner cursors - then
-        // treat the header as the caption so dragging and double-click-to-maximise
-        // work without reimplementing either.
-        LRESULT ht=DefWindowProc(hwnd,msg,wp,lp);
-        if(ht!=HTCLIENT) return ht;
+        // The window buttons are tested first and are never handed to DefWindowProc.
+        // They used to be, and that is why closing sometimes took several clicks:
+        // WS_THICKFRAME makes DefWindowProc claim the frame border as resize handles,
+        // and WM_NCCALCSIZE puts that border INSIDE the client area - so the top-right
+        // corner, which is exactly where the close button is, came back as HTTOPRIGHT
+        // and the click began a resize instead. The explicit "pt.y<8 -> HTTOP" made it
+        // worse by turning the top eight pixels of a 44px button into another one.
+        //
+        // None of those resize zones did anything anyway: WM_GETMINMAXINFO pins the
+        // minimum and maximum size to the same numbers, so the window cannot be
+        // resized by dragging. They only swallowed clicks and showed a cursor that
+        // promised something impossible, so they are gone.
         POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd,&pt);
         RECT rc; GetClientRect(hwnd,&rc);
         const int BTN=46;
-        if(pt.y<8) return HTTOP;
-        if(pt.y<44 && pt.x < rc.right-BTN*2) return HTCAPTION;
+        if(pt.y<HEADER_H && pt.x>=rc.right-BTN*2) return HTCLIENT;   // minimise / close
+        if(pt.y<HEADER_H) return HTCAPTION;                          // drag the window
         return HTCLIENT;
     }
     case WM_SETCURSOR:{
@@ -19841,6 +19868,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_RBUTTONDOWN:{
         // Settings only, and only the profile slots - see settingsHandleRightClick.
+        if(activeTab==0 && !g_advancedMode && g_lockKind==LOCK_NONE){
+            Layout lp3=getLayout(hwnd);
+            profilesHandleRightClick(hwnd,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),
+                                     lp3.pad,lp3.yProfiles,lp3.cw);
+            return 0;
+        }
         if(activeTab==2 && g_lockKind==LOCK_NONE && !g_optimiseConfirmOpen){
             RECT crR; GetClientRect(hwnd,&crR);
             settingsHandleRightClick(hwnd,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),crR.right,crR.bottom-dockBottom());
@@ -20067,6 +20100,16 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             InvalidateRect(hwnd,NULL,FALSE);
             return 0;
         }}
+        // Profiles, on the basic macro page. Placed before the rest of the tab's
+        // handling so its buttons are not shadowed by anything underneath.
+        if(activeTab==0 && !g_advancedMode){
+            Layout lp2=getLayout(hwnd);
+            if(my>=lp2.yProfiles && my<=lp2.yProfiles+PROFILE_CARD_H){
+                profilesHandleClick(hwnd,mx,my,lp2.pad,lp2.yProfiles,lp2.cw);
+                InvalidateRect(hwnd,NULL,FALSE);
+                return 0;
+            }
+        }
         // ── mode switch + advanced panel ────────────────────────────────────
         if(activeTab==0){
             Layout la=getLayout(hwnd);
