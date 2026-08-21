@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.3"
+#define APP_VERSION      L"v3.1.4"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -91,6 +91,15 @@ static std::string xorDecrypt(const unsigned char* data, int len){
 #define LOG_FILE      L"logs.txt"
 #define APP_W         420
 #define APP_H         600
+// Landscape is a different window, not the same window with the dock moved. The frame
+// is fixed size in both - WM_GETMINMAXINFO pins min and max to the same numbers - so
+// switching orientation means changing which pair of numbers that is and resizing to
+// match.
+#define APP_W_LS      760
+#define APP_H_LS      430
+extern bool g_landscape;
+static inline int appW(){ return g_landscape ? APP_W_LS : APP_W; }
+static inline int appH(){ return g_landscape ? APP_H_LS : APP_H; }
 #define DOCK_H        52  // bottom tab dock height
 #define DOCK_W        58  // left rail width, in landscape
 // Landscape puts the tab dock down the left instead of along the bottom, which gives
@@ -100,7 +109,6 @@ static std::string xorDecrypt(const unsigned char* data, int len){
 // Everything that used to say DOCK_H asks one of these two instead, so neither layout
 // has to know which one is active: in landscape the bottom reserve is zero and the
 // left reserve is the rail, and in portrait it is the other way round.
-extern bool g_landscape;
 static inline int dockBottom(){ return g_landscape ? 0 : DOCK_H; }
 static inline int dockLeft()  { return g_landscape ? DOCK_W : 0; }
 
@@ -527,9 +535,32 @@ void drawVoidStars(HDC hdc,int W,int H){
 }
 #define T THEMES[themeIdx]
 
-// Fonts - default Consolas (index 2)
-const wchar_t* FONT_NAMES[] = {L"Calibri", L"Segoe UI", L"Consolas", L"Arial", L"Bahnschrift"};
-int fontIdx = 2; // Consolas default
+// Every one of these ships with Windows 10 and 11, so none of them can fail to load
+// and fall back to something arbitrary. Chosen for character rather than for being
+// present: Bahnschrift is the condensed industrial one, Cascadia Mono is the modern
+// terminal face, Segoe UI Variable is what current Windows itself is set in, and
+// Georgia is here because nothing else in the list has serifs.
+//
+// FONT_SIZES carries a per-face adjustment because the same point size renders at
+// visibly different weights across them - a list of names alone made half the app
+// change size when you switched.
+const wchar_t* FONT_NAMES[] = {
+    L"Segoe UI Variable Display", L"Bahnschrift", L"Cascadia Mono",
+    L"Consolas", L"Segoe UI", L"Calibri", L"Arial", L"Georgia",
+};
+// big, med, small, mono
+const int FONT_SIZES[][4] = {
+    {22,16,14,13},  // Segoe UI Variable Display
+    {23,17,15,13},  // Bahnschrift - condensed, so it can take a size more
+    {20,15,13,13},  // Cascadia Mono
+    {20,14,13,13},  // Consolas
+    {22,16,14,13},  // Segoe UI
+    {24,17,15,13},  // Calibri - small on the body, needs the most
+    {23,16,15,13},  // Arial
+    {22,16,14,13},  // Georgia
+};
+#define FONT_COUNT ((int)(sizeof(FONT_NAMES)/sizeof(FONT_NAMES[0])))
+int fontIdx = 0;
 
 // KPS presets - 20, 100, 200, 500, 750, 1000, 2000
 const int KPS_PRESETS[]   = {20, 100, 200, 500, 750, 1000, 2000};
@@ -12927,7 +12958,7 @@ static void playChime(){
 #define ID_BENCHMARK     155
 #define ID_PROFILE_ASSIGN_0 156     // "-> Slot N" buttons occupy 156..158
 // Slots + hint + copy + paste box + assign row.
-#define PROFILE_CARD_H   188
+#define PROFILE_CARD_H   170   // was 188; the instruction line became a '?'
 // Advanced macro widgets. 160..167 are the per-macro slot chips.
 #define ID_ADV_BASIC     170
 #define ID_ADV_ADVANCED  171
@@ -13014,6 +13045,19 @@ float tabAnim=0.0f;      // 0.0=Macro, 1.0=Settings (animated)
 int mainScrollPos=0;
 int mainTotalHeight=0;
 bool fontDropOpen=false;
+// Settings is three pages rather than one long scroll. Ten cards in a column meant the
+// licence key and the overlay grid were the same distance from the top, which is to say
+// nowhere in particular.
+//   0 Account - the key, the trial, updates, the vouch prompt
+//   1 Overlay - what shows over the game, and where
+//   2 App     - profiles, appearance, behaviour, maintenance
+int g_settPage=0;
+float g_settPagePos=0.0f;   // animates between pages, same spring as the dock
+#define SETT_PAGES 3
+#define SETT_TABS_H 34
+// Cards not on the current page are parked here. Nothing on screen can be at this
+// coordinate, so the existing hit tests miss them without needing a second guard.
+#define SETT_OFFPAGE (-20000)
 int  fontDropHov=-1;
 
 HFONT hFontBig, hFontMed, hFontSmall, hFontMono;
@@ -13179,6 +13223,9 @@ static int     g_tipSpotCount=0;
 #define ID_TIP_SCOPE       3
 #define ID_TIP_LANDSCAPE   4
 #define ID_TIP_RPC         5
+#define ID_TIP_PROFILES    6
+#define ID_TIP_OVPOS       7
+#define ID_TIP_MODE        8
 static const wchar_t* tipTextFor(int id){
     switch(id){
         case ID_TIP_RES_OVERLAY: return L"CPU, RAM, GPU and disk, over your game";
@@ -13186,6 +13233,9 @@ static const wchar_t* tipTextFor(int id){
         case ID_TIP_SCOPE:       return L"ON = whole system, OFF = just wrathic";
         case ID_TIP_LANDSCAPE:   return L"Tabs down the left instead of along the bottom, so the page gets the full height";
         case ID_TIP_RPC:         return L"Shows wrathic on your Discord profile while it is open";
+        case ID_TIP_PROFILES:    return L"Tap an empty slot to save what you have set now. Tap a saved one to load it. Right-click clears it.";
+        case ID_TIP_OVPOS:       return L"Pick a corner, or drag the overlay itself in-game. The lit cell is where it is now.";
+        case ID_TIP_MODE:        return L"M1 costs less CPU but holds the rate less steadily than a keyboard key";
         default: return L"";
     }
 }
@@ -13261,6 +13311,7 @@ void saveSettings() {
     regSetDWORD(L"TrigEnabled",(DWORD)triggerbotEnabled.load());
     regSetDWORD(L"TrigKey",(DWORD)trigKey.load());
     regSetDWORD(L"Landscape",(DWORD)(g_landscape?1:0));
+    regSetDWORD(L"SettPage",(DWORD)g_settPage);
     regSetDWORD(L"TrigR",(DWORD)trigR.load());
     regSetDWORD(L"TrigG",(DWORD)trigG.load());
     regSetDWORD(L"TrigB",(DWORD)trigB.load());
@@ -13326,6 +13377,7 @@ void loadSettings() {
     triggerbotEnabled = regGetDWORD(L"TrigEnabled",0)!=0;
     trigKey       = (int)regGetDWORD(L"TrigKey",VK_LBUTTON);
     g_landscape   = regGetDWORD(L"Landscape",0)!=0;
+    g_settPage    = std::max(0,std::min(SETT_PAGES-1,(int)regGetDWORD(L"SettPage",0)));
     trigR         = (int)regGetDWORD(L"TrigR",255);
     trigG         = (int)regGetDWORD(L"TrigG",0);
     trigB         = (int)regGetDWORD(L"TrigB",0);
@@ -13714,18 +13766,10 @@ void showTrayMenu(HWND hwnd) {
 // Changelog is shown inside splash screen
 
 void createFonts() {
+    if(fontIdx<0||fontIdx>=FONT_COUNT) fontIdx=0;
     const wchar_t* fn = FONT_NAMES[fontIdx];
-    // Per-font size adjustments - each font renders at different visual sizes
-    // Index: 0=Calibri, 1=Segoe UI, 2=Consolas, 3=Arial, 4=Bahnschrift
-    int szBig, szMed, szSm, szMono;
-    switch(fontIdx){
-        case 0:  szBig=24;szMed=17;szSm=15;szMono=13;break; // Calibri - needs larger
-        case 1:  szBig=22;szMed=16;szSm=14;szMono=13;break; // Segoe UI
-        case 2:  szBig=20;szMed=14;szSm=13;szMono=13;break; // Consolas - slightly smaller
-        case 3:  szBig=23;szMed=16;szSm=15;szMono=13;break; // Arial - slightly bigger
-        case 4:  szBig=22;szMed=16;szSm=14;szMono=13;break; // Bahnschrift
-        default: szBig=22;szMed=16;szSm=14;szMono=13;break;
-    }
+    int szBig =FONT_SIZES[fontIdx][0], szMed =FONT_SIZES[fontIdx][1];
+    int szSm  =FONT_SIZES[fontIdx][2], szMono=FONT_SIZES[fontIdx][3];
     auto mk=[&](int sz,int wt){
         return CreateFont(sz,0,0,0,wt,0,0,0,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,fn);
@@ -16500,7 +16544,7 @@ void drawCard(HDC hdc,int x,int y,int w,int h){
     // "Performance Mode" toggle. The toggle is gone and so is the glass: what it
     // bought was noise, and the off state was the better-looking one anyway.
     // Cards scrolled out of view are still skipped - settings draws nine of them.
-    if(y+h<-24 || y>APP_H+24) return;
+    if(y+h<-24 || y>appH()+24) return;
     drawRR(hdc,x,y,w,h,14,T.card,T.border,1);
 }
 // A free-floating rounded pill of glass: frosted backdrop, tint, lit top edge and a
@@ -17068,6 +17112,11 @@ static void drawCaptionButtons(HDC hdc,int W){
     }
 }
 
+// Tooltips are no longer a settings-only feature - any tab can put a '?' next to a
+// control and move the explanation behind it, which is the whole point of having them.
+static bool drawTipIcon(HDC hdc, int x, int y, int id, COLORREF col);
+static void drawSettingsTip(HDC hdc, int tx, int ty, const wchar_t* text, int W, int H);
+
 // The three tabs as glyphs rather than words: a bolt for the macro, a crosshair for
 // the triggerbot, sliders for settings. Drawn rather than shipped as bitmaps so they
 // take the theme's colour and stay sharp at any DPI.
@@ -17435,7 +17484,7 @@ void paintMain(HWND hwnd){
     // there is one key or six.
     drawCard(hdc,p,y,cw,92);
     drawText(hdc,L"KEYS TO SPAM",p+16,y+10,cw-32,14,T.subtext,hFontSmall);
-    drawText(hdc,L"M1 costs less CPU but holds KPS less steadily",p+16,y+26,cw-32,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawTipIcon(hdc,p+16,y+26,ID_TIP_MODE,T.subtext);
     EnterCriticalSection(&keyListCS);
     std::vector<int> keys=keysToSend;
     LeaveCriticalSection(&keyListCS);
@@ -17564,7 +17613,7 @@ void paintMain(HWND hwnd){
         // dead controls just reads as clutter. The switch above stays, so there is
         // always a way back.
         if(!triggerbotEnabled.load()){
-            drawText(hdc,L"Turn it on to set the colour, the bind and the tolerance.",
+            drawText(hdc,L"Turn it on to set it up.",
                      p+16,ty+8,cw-32,18,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             g_tbLay.yArm=-10000; g_tbLay.yKey=-10000; g_tbLay.yColour=-10000; g_tbLay.yTune=-10000;
             g_tbLay.tolW=0; g_tbLay.hueW=0; g_tbLay.pickW=0;
@@ -17729,6 +17778,11 @@ void paintMain(HWND hwnd){
         drawText(hdc,L"\u2715",tx+tw-closeW,ty,closeW,th,T.bg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
+    // Above the cards but below the header, and drawn here rather than inside the
+    // settings paint so a '?' on any tab is answered the same way.
+    if(g_tipVisible&&!g_tipText.empty())
+        drawSettingsTip(hdc,g_tipX,g_tipY,g_tipText.c_str(),W,H);
+
     // Last, so no amount of scrolling can put a card over the title or the window
     // buttons. Only the lock and the modal go above it, which is correct - both are
     // meant to cover the whole window.
@@ -17755,7 +17809,7 @@ static int calcOverlayCardH(){
     int h=10;
     h+=20+6;                           // header + AUTO pill row
     h+=24+4;                           // Resource Overlay
-    if(resOverlayEnabled) h+=6+14+32+8; // margin+label+pill+gap
+    if(resOverlayEnabled) h+=4+26+8; // margin+label+pill+gap
     h+=24+4;                           // KPS Overlay
     h+=24+4;                           // Show FPS Bar
     h+=24+4;                           // Sys/Macro Stats
@@ -17796,7 +17850,7 @@ static int calcAppearanceCardH(){
     int h=10;
     h+=14+6;                           // header
     h+=22+4;                           // font dropdown row
-    if(fontDropOpen) h+=5*22;          // expanded list
+    if(fontDropOpen) h+=FONT_COUNT*24;   // expanded list
     h+=1+6;                            // divider
     h+=14+6;                           // COLOUR THEME label
     h+=2*(30+4)-4+6;                   // theme swatches (2 rows x 3)
@@ -17836,20 +17890,26 @@ static int calcOvPosCardH(){
 // because it is the only card here that asks for something rather than showing it.
 SLayout getSLayoutW(int W){
     SLayout l; l.W=W; l.pad=14+dockLeft(); l.cw=l.W-l.pad-14-16;
-    // Below the header, not behind it.
-    int y = HEADER_H + 8 - settScrollPos;
-    l.yLic       = y; y += (licCopied?62:48) + GAP;
-    l.yTrial     = y; if(trialMode) y += 52 + GAP;
-    l.yUpdate    = y; y += 58 + GAP;
-    l.yProfiles  = y; y += PROFILE_CARD_H + GAP;
-    l.yRes       = y; y += calcOverlayCardH() + GAP;
-    if(kpsOverlayEnabled||resOverlayEnabled) y += calcOvPosCardH() + GAP;
-    l.yFont      = y; y += calcAppearanceCardH() + GAP;   // appearance card top
+    // Below the header and below the page tabs, not behind either.
+    int y = HEADER_H + 8 + SETT_TABS_H - settScrollPos;
+    l.yLic=l.yTrial=l.yUpdate=l.yProfiles=l.yRes=l.yFont=l.yMinimise=
+        l.yAutoLaunch=l.yVouch=SETT_OFFPAGE;
+    if(g_settPage==0){
+        l.yLic     = y; y += (licCopied?62:48) + GAP;
+        l.yTrial   = y; if(trialMode) y += 52 + GAP;
+        l.yUpdate  = y; y += 58 + GAP;
+        l.yVouch   = y; y += 48 + GAP;
+    } else if(g_settPage==1){
+        l.yRes     = y; y += calcOverlayCardH() + GAP;
+        if(kpsOverlayEnabled||resOverlayEnabled) y += calcOvPosCardH() + GAP;
+    } else {
+        l.yProfiles  = y; y += PROFILE_CARD_H + GAP;
+        l.yFont      = y; y += calcAppearanceCardH() + GAP;
+        l.yMinimise  = y; y += calcApplicationCardH() + GAP;
+        l.yAutoLaunch= y; y += calcUtilsCardH() + GAP;
+    }
     l.yFontDrop  = l.yFont + 10 + 14 + 6 + 22;            // font row start
     l.yTheme     = -1;                                    // embedded in appearance
-    l.yMinimise  = y; y += calcApplicationCardH() + GAP;  // application card top
-    l.yAutoLaunch= y; y += calcUtilsCardH() + GAP;        // utilities card
-    l.yVouch     = y; y += 48 + GAP;
     l.yChangelog = -1;                                    // in Application card
     settTotalHeight = y + settScrollPos + 8;
     return l;
@@ -17896,32 +17956,34 @@ void paintSettingsInto(HDC hdc,int W,int H){
 
     // KPS Overlay
     drawTipIcon(hdc,p+14,cx+5,ID_TIP_RES_OVERLAY,T.subtext);
-    drawText(hdc,L"KPS Overlay",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"Click rate",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-46,cx,kpsOverlayEnabled); cx+=24+4;
     // Resource Overlay
     drawTipIcon(hdc,p+14,cx+5,ID_TIP_KPS_OVERLAY,T.subtext);
-    drawText(hdc,L"Resource Overlay",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"Resources",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-46,cx,resOverlayEnabled); cx+=24+4;
 
     // Sub-toggle pill with label
     if(resOverlayEnabled){
-        cx+=6;
-        drawText(hdc,L"Show in resource overlay:",p+14,cx,cw-28,12,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        cx+=14;
-        drawRR(hdc,p+14,cx,cw-28,32,6,T.surface,T.border,1);
+        cx+=4;
+        // Four chips that light up, rather than a caption above a strip of words with
+        // dots under them. On/off is the whole state, so the chip carries it: filled
+        // when it is showing, outlined when it is not.
         int sc=(cw-28)/4;
         const wchar_t* slbl[4]={L"CPU",L"RAM",L"GPU",L"Disk"};
         bool sval[4]={overlayShowCpu,overlayShowRam,overlayShowGpu,overlayShowDisk};
         for(int i=0;i<4;i++){
-            drawText(hdc,slbl[i],p+14+sc*i,cx,sc,32,sval[i]?T.text:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            if(sval[i]) drawDot(hdc,p+14+sc*i+sc/2,cx+26,3,T.accent);
+            int bx=p+14+sc*i;
+            drawRR(hdc,bx,cx,sc-6,26,13,sval[i]?T.accent:T.btn,sval[i]?T.accent:T.border,1);
+            drawText(hdc,slbl[i],bx,cx,sc-6,26,sval[i]?T.bg:T.subtext,hFontSmall,
+                     DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
-        cx+=32+8;
+        cx+=26+8;
     }
 
     // Sys/Macro Stats
     drawTipIcon(hdc,p+14,cx+5,ID_TIP_SCOPE,T.subtext);
-    drawText(hdc,L"Sys / Macro Stats",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    drawText(hdc,L"Whole system",p+32,cx,cw-90,24,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawToggle(hdc,p+cw-46,cx,overlaySysStats); cx+=24+8;
     (void)cx;
     }
@@ -17934,16 +17996,22 @@ void paintSettingsInto(HDC hdc,int W,int H){
         int gcH = 22 + 3*(GBH+GBG) - GBG + 10;
         int gW=(cw-28)/3;
         drawCard(hdc,p,gy0,cw,posH);
-        drawText(hdc,L"OVERLAY POSITION",p+14,gy0+6,200,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        static const wchar_t* PL[9]={L"\u2196",L"\u2191",L"\u2197",L"\u2190",L"\u00b7",L"\u2192",L"\u2199",L"\u2193",L"\u2198"};
+        drawText(hdc,L"POSITION",p+14,gy0+6,200,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        drawTipIcon(hdc,p+14+64,gy0+5,ID_TIP_OVPOS,T.subtext);
+        // Nine cells standing for the nine places on screen, with the one nearest the
+        // overlay's actual position lit. Arrows in every cell said "this is a direction"
+        // when what they are is a destination, and none of them said where it is now.
+        int sw3=GetSystemMetrics(SM_CXSCREEN), sh3=GetSystemMetrics(SM_CYSCREEN);
+        int curC = overlayX < sw3/3 ? 0 : (overlayX < (sw3*2)/3 ? 1 : 2);
+        int curR = overlayY < sh3/3 ? 0 : (overlayY < (sh3*2)/3 ? 1 : 2);
         for(int i=0;i<9;i++){
             int gc=i%3, gr=i/3;
             int bx=p+14+gc*gW, by=gy0+22+gr*(GBH+GBG);
-            drawRR(hdc,bx,by,gW-4,GBH,8,T.btn,T.border,1);
-            drawText(hdc,PL[i],bx,by,gW-4,GBH,T.text,hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            bool here=(gc==curC&&gr==curR);
+            drawRR(hdc,bx,by,gW-4,GBH,8,here?T.accent:T.btn,here?T.accent:T.border,1);
+            drawDot(hdc,bx+(gW-4)/2,by+GBH/2,here?4:2,here?T.bg:T.subtext);
         }
-        // Drag hint
-        wchar_t posb[48]; swprintf(posb,48,L"Drag the overlay to reposition  (%d, %d)",overlayX,overlayY);
+        wchar_t posb[32]; swprintf(posb,32,L"%d, %d",overlayX,overlayY);
         drawText(hdc,posb,p+14,gy0+gcH+8,cw-28,20,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
@@ -18007,6 +18075,10 @@ void paintSettingsInto(HDC hdc,int W,int H){
     animateTo(g_settHoverAlpha, g_settHoverId?1.0f:0.0f, 0.07f);
     drawCard(hdc,p,y,cw,PROFILE_CARD_H);
     drawText(hdc,L"PROFILES",p+14,y+10,200,14,T.subtext,hFontSmall);
+    // The three rules for the slots used to be spelled out under them on a line of
+    // their own. They are the same three rules on every slot and you only need them
+    // once, so they moved behind a '?'.
+    drawTipIcon(hdc,p+14+64,y+9,ID_TIP_PROFILES,T.subtext);
     {
         int rowY=y+30, slotW=(cw-28-12)/3;
         for(int i=0;i<PROFILE_SLOTS;i++){
@@ -18019,30 +18091,28 @@ void paintSettingsInto(HDC hdc,int W,int H){
             else        swprintf(lbl,48,L"Slot %d",i+1);
             drawText(hdc,lbl,sx,rowY+3,slotW,17,pr.used?T.text:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             wchar_t sub[48];
-            if(pr.used) swprintf(sub,48,L"%d KPS",pr.kps); else wcscpy(sub,L"tap to save");
+            if(pr.used) swprintf(sub,48,L"%d KPS",pr.kps); else wcscpy(sub,L"empty");
             drawText(hdc,sub,sx,rowY+18,slotW,15,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
-        drawText(hdc,L"tap empty to save, saved to load \u00b7 right-click clears",
-                 p+14,y+70,cw-28,14,T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
 
         // Copy: same green tick + fade the license key copy uses, so the two feel like
         // the same action.
         float ca=g_profCopiedAlpha;
         float ce=getSettHover(ID_PROFILE_COPY);
         COLORREF cBg=lerpCol(lerpCol(T.btn,T.btnHov,ce),RGB(20,60,30),ca);
-        drawRR(hdc,p+14,y+88,cw-28,26,13,cBg,lerpCol(T.border,T.green,ca),1);
-        drawText(hdc,ca>0.5f?L"\u2713  Share code copied":L"Copy my setup as a share code",
-                 p+14,y+88,cw-28,26,lerpCol(lerpCol(T.subtext,T.text,ce),T.green,ca),
+        drawRR(hdc,p+14,y+70,cw-28,26,13,cBg,lerpCol(T.border,T.green,ca),1);
+        drawText(hdc,ca>0.5f?L"\u2713  Copied":L"\u29c9  Copy my setup",
+                 p+14,y+70,cw-28,26,lerpCol(lerpCol(T.subtext,T.text,ce),T.green,ca),
                  hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
         // Paste box. Typing is allowed but Ctrl+V is the point of it.
-        int by=y+120;
+        int by=y+102;
         bool empty=g_pasteBuffer.empty();
         COLORREF pbBorder = g_pasteEditing ? (empty?T.accent:(g_pasteValid?T.green:T.red))
                                            : (empty?T.border:(g_pasteValid?T.green:T.red));
         drawRR(hdc,p+14,by,cw-28,26,8,T.btn,pbBorder,1);
         std::wstring disp;
-        if(empty && !g_pasteEditing) disp=L"Paste a share code here";
+        if(empty && !g_pasteEditing) disp=L"Paste a code";
         else {
             disp=g_pasteBuffer;
             if(g_pasteEditing && ((GetTickCount()/500)%2)==0) disp+=L"_";
@@ -18058,7 +18128,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
             float hv=g_pasteValid?getSettHover(ID_PROFILE_ASSIGN_0+i):0.0f;
             drawRR(hdc,sx,ay,aw,24,12,g_pasteValid?lerpCol(T.btn,T.btnHov,hv):T.card,
                    g_pasteValid?T.border:T.border,1);
-            wchar_t t[32]; swprintf(t,32,L"\u2192 Slot %d",i+1);
+            wchar_t t[32]; swprintf(t,32,L"\u2192 %d",i+1);
             drawText(hdc,t,sx,ay,aw,24,g_pasteValid?lerpCol(T.subtext,T.text,hv):T.border,
                      hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
@@ -18073,11 +18143,25 @@ void paintSettingsInto(HDC hdc,int W,int H){
     drawRR(hdc,p+14,cx,cw-28,22,6,T.btn,T.border,1);
     drawText(hdc,FONT_NAMES[fontIdx],p+18,cx,cw-50,22,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     drawText(hdc,fontDropOpen?L"\u25b2":L"\u25bc",p+cw-26,cx,16,22,T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    if(fontDropOpen){int dy2=cx+26; drawRR(hdc,p+14,dy2,cw-28,5*22+4,6,T.card,T.border,1);
-    for(int i=0;i<5;i++){bool sel=(fontIdx==i);
-    if(sel)drawRR(hdc,p+16,dy2+2+i*22,cw-32,20,4,T.accent);
-    drawText(hdc,FONT_NAMES[i],p+22,dy2+2+i*22,cw-40,20,sel?T.text:T.subtext,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);}
-    cx+=5*22;}
+    if(fontDropOpen){
+        int dy2=cx+26;
+        drawRR(hdc,p+14,dy2,cw-28,FONT_COUNT*24+4,6,T.card,T.border,1);
+        // Each name drawn in its own face. A list of font names set in one font asks
+        // you to already know what they look like, which is the one thing the list is
+        // there to tell you.
+        for(int i=0;i<FONT_COUNT;i++){
+            bool sel=(fontIdx==i);
+            int ry=dy2+2+i*24;
+            if(sel) drawRR(hdc,p+16,ry,cw-32,22,4,T.accent);
+            HFONT pf=CreateFont(FONT_SIZES[i][2],0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+                                DEFAULT_PITCH,FONT_NAMES[i]);
+            drawText(hdc,FONT_NAMES[i],p+22,ry,cw-40,22,sel?T.bg:T.text,pf,
+                     DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DeleteObject(pf);
+        }
+        cx+=FONT_COUNT*24;
+    }
     cx+=22+4;
     fillRect(hdc,p+14,cx,cw-28,1,T.border); cx+=1+6;
     drawText(hdc,L"COLOUR THEME",p+14,cx,150,14,T.subtext,hFontSmall); cx+=14+6;
@@ -18148,10 +18232,23 @@ void paintSettingsInto(HDC hdc,int W,int H){
     {wchar_t tb[64]; swprintf(tb,64,L"Trial active \u2014 %d day(s) remaining",trialDaysLeft);
     drawText(hdc,tb,p+14,y+22,cw-28,18,T.accent,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);}}
 
-    // Tooltip (drawn on top of everything except header)
-    if(g_tipVisible&&!g_tipText.empty()){
-        drawSettingsTip(hdc,g_tipX,g_tipY,g_tipText.c_str(),W,H);
+    // Page tabs. Pinned rather than scrolled - they are how you get out of the page,
+    // so they cannot be something you have to scroll back up to reach.
+    {
+        const wchar_t* names[SETT_PAGES]={L"Account",L"Overlay",L"App"};
+        int tx=p, tw=cw+16, th=28, tyy=HEADER_H+6;
+        fillRect(hdc,0,HEADER_H,W,SETT_TABS_H+8,T.bg);   // cover anything scrolled under
+        drawRR(hdc,tx,tyy,tw,th,14,T.surface,T.border,1);
+        int segW=tw/SETT_PAGES;
+        animateTo(g_settPagePos,(float)g_settPage,0.18f);
+        drawSelBubble(hdc,tx+2+(int)(g_settPagePos*segW),tyy+2,segW-4,th-4,(th-4)/2);
+        for(int i=0;i<SETT_PAGES;i++){
+            float on=1.0f-std::min(1.0f,fabsf(g_settPagePos-(float)i));
+            drawText(hdc,names[i],tx+segW*i,tyy,segW,th,lerpCol(T.subtext,T.text,on),
+                     hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
     }
+
 
 }
 
@@ -18318,8 +18415,8 @@ int settingsHitTest(HWND hwnd, int mx, int my){
         int sx=p+14+i*(slotW+6);
         if(mx>=sx&&mx<=sx+slotW&&my>=py+30&&my<=py+66) return ID_PROFILE_0+i;
     }
-    if(mx>=p+14&&mx<=p+cw-14&&my>=py+88 &&my<=py+114) return ID_PROFILE_COPY;
-    if(mx>=p+14&&mx<=p+cw-14&&my>=py+120&&my<=py+146) return ID_PROFILE_PASTE;
+    if(mx>=p+14&&mx<=p+cw-14&&my>=py+70 &&my<=py+96 ) return ID_PROFILE_COPY;
+    if(mx>=p+14&&mx<=p+cw-14&&my>=py+102&&my<=py+128) return ID_PROFILE_PASTE;
     { int ay=py+152, aw=(cw-28-12)/3;
       for(int i=0;i<PROFILE_SLOTS;i++){
           int sx=p+14+i*(aw+6);
@@ -18357,6 +18454,21 @@ void settingsHandleRightClick(HWND hwnd, int mx, int my, int W, int H) {
 }
 
 void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
+    {   // Page tabs first - they sit above every card and must win the click.
+        SLayout lt = getSLayoutW(W);
+        int tx=lt.pad, tw=lt.cw+16, th=28, tyy=HEADER_H+6;
+        if(my>=tyy && my<=tyy+th && mx>=tx && mx<=tx+tw){
+            int seg=std::max(1,tw/SETT_PAGES);
+            int idx=std::max(0,std::min(SETT_PAGES-1,(mx-tx)/seg));
+            if(idx!=g_settPage){
+                playClick();
+                g_settPage=idx; settScrollPos=0; fontDropOpen=false;
+                saveSettings();
+                InvalidateRect(hwnd,NULL,FALSE);
+            }
+            return;
+        }
+    }
     SLayout l = getSLayout(hwnd);
     int p = l.pad, cw = l.cw;
     (void)W; (void)H;
@@ -18393,8 +18505,8 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
 
         // Sub-toggle pill (immediately after Resource Overlay)
         if(resOverlayEnabled){
-            cx+=6; cx+=14; // margin+label
-            if(my>=cx&&my<=cx+32&&mx>=p+14&&mx<=p+14+cw-28){
+            cx+=4;   // the caption line is gone; chips start straight after
+            if(my>=cx&&my<=cx+26&&mx>=p+14&&mx<=p+14+cw-28){
                 int sc=(cw-28)/4, ci=(mx-(p+14))/sc;
                 if(ci==0)overlayShowCpu=!overlayShowCpu;
                 else if(ci==1)overlayShowRam=!overlayShowRam;
@@ -18404,7 +18516,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
                     resOverlayEnabled=false;
                 playClick(); spawnOverlay(); saveSettings(); InvalidateRect(hwnd,NULL,FALSE);
             }
-            cx += 32+8;
+            cx += 26+8;
         }
 
         // Sys/Macro Stats
@@ -18477,7 +18589,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
           }
       }
       // Copy: put the code on the clipboard so it can be pasted into Discord.
-      if(mx>=p+14&&mx<=p+cw-14&&my>=py+88&&my<=py+114){
+      if(mx>=p+14&&mx<=p+cw-14&&my>=py+70&&my<=py+96){
           playClick();
           std::wstring code=profileEncode(profileFromCurrent(L"Current"));
           if(OpenClipboard(hwnd)){
@@ -18495,7 +18607,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       // The paste box. Clicking it takes keyboard focus; Ctrl+V fills it. It is also
       // filled straight from the clipboard on click when it is empty, because that is
       // what everyone tries first.
-      if(mx>=p+14&&mx<=p+cw-14&&my>=py+120&&my<=py+146){
+      if(mx>=p+14&&mx<=p+cw-14&&my>=py+102&&my<=py+128){
           playClick();
           g_pasteEditing=true; g_kpsEditing=false;
           if(g_pasteBuffer.empty()) pasteFromClipboard(hwnd);
@@ -18555,19 +18667,19 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
       // Font dropdown row
       if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+22){
           playClick();fontDropOpen=!fontDropOpen;InvalidateRect(hwnd,NULL,FALSE);return;}
-      if(fontDropOpen){
-          int dy3=cx+26;
-          int n=(int)(sizeof(FONT_NAMES)/sizeof(FONT_NAMES[0]));
-          for(int i=0;i<n;i++) if(mx>=p+14&&mx<=p+cw-14&&my>=dy3+i*22&&my<=dy3+(i+1)*22){
+      if(fontDropOpen){   // rows are 24 tall now, and there are FONT_COUNT of them
+          int dy3=cx+26+2;
+          const int n=FONT_COUNT, ROW=24;
+          for(int i=0;i<n;i++) if(mx>=p+14&&mx<=p+cw-14&&my>=dy3+i*ROW&&my<=dy3+(i+1)*ROW){
               playClick();fontIdx=i;fontDropOpen=false;createFonts();saveSettings();InvalidateRect(hwnd,NULL,FALSE);return;}
           // Click landed inside the open dropdown's footprint but not on an
           // item (e.g. its own padding) - still consume it so it can't fall
           // through to whatever sits underneath at the collapsed position.
-          int listBottom=dy3+n*22;
+          int listBottom=dy3+n*ROW;
           if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<listBottom) return;
       }
       // Theme buttons (2 rows x 3)
-      int thX=cx+22+(fontDropOpen?5*22:0)+4+1+6+14+6;
+      int thX=cx+22+(fontDropOpen?FONT_COUNT*24:0)+4+1+6+14+6;
       int btnW2=(cw-28-8)/3, btnH2=30, gap3=4;
       for(int i=0;i<6;i++){
           int col=i%3, row=i/3;
@@ -18591,6 +18703,21 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
           // Every page measures itself against the dock, so a stale scroll position
           // from the other orientation would leave the page part-way off screen.
           mainScrollPos=0; settScrollPos=0;
+          // The frame itself changes shape. Grown about the window's centre so it does
+          // not appear to jump across the desktop, and clamped back onto the monitor it
+          // is on in case that pushes an edge off screen.
+          RECT wr; GetWindowRect(hwnd,&wr);
+          int ncx=(wr.left+wr.right)/2, ncy=(wr.top+wr.bottom)/2;
+          int nw=appW(), nh=appH();
+          int nx=ncx-nw/2, ny=ncy-nh/2;
+          HMONITOR mon=MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST);
+          MONITORINFO mi={sizeof(mi)};
+          if(GetMonitorInfoW(mon,&mi)){
+              nx=std::max((int)mi.rcWork.left,std::min(nx,(int)mi.rcWork.right-nw));
+              ny=std::max((int)mi.rcWork.top, std::min(ny,(int)mi.rcWork.bottom-nh));
+          }
+          SetWindowPos(hwnd,NULL,nx,ny,nw,nh,SWP_NOZORDER|SWP_NOACTIVATE);
+          freeMainBackbuffer();   // the cached surface is the old shape
           InvalidateRect(hwnd,NULL,TRUE);
       }
     }
@@ -19192,11 +19319,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             if(was!=g_capHover) InvalidateRect(hwnd,NULL,FALSE);
         }
         {TRACKMOUSEEVENT tme={sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};TrackMouseEvent(&tme);}
-        if(activeTab==2){
+        {
             // Hover test against where the icons were actually drawn last frame,
-            // rather than against a second copy of the layout arithmetic. The old
-            // table also carried an id 4 that no icon has drawn since the changelog
-            // toggle moved, so that region was hoverable but invisible.
+            // rather than against a second copy of the layout arithmetic. Every tab
+            // registers its icons into the same table, so this is not gated on which
+            // one is open - a '?' that draws but never answers is worse than the
+            // sentence it replaced.
             bool anyHov=false;
             for(int i=0;i<g_tipSpotCount;i++){
                 const TipSpot& t=g_tipSpots[i];
@@ -19948,10 +20076,10 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         break;
     case WM_GETMINMAXINFO:{
         MINMAXINFO*mm=(MINMAXINFO*)lp;
-        mm->ptMinTrackSize.x=APP_W;
-        mm->ptMinTrackSize.y=APP_H;
-        mm->ptMaxTrackSize.x=APP_W;
-        mm->ptMaxTrackSize.y=APP_H;
+        mm->ptMinTrackSize.x=appW();
+        mm->ptMinTrackSize.y=appH();
+        mm->ptMaxTrackSize.x=appW();
+        mm->ptMaxTrackSize.y=appH();
         break;
     }
     case WM_CLOSE:
@@ -20319,7 +20447,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
         // taskbar preview and the drop shadow, so the frame stays and WM_NCCALCSIZE
         // takes its height to zero instead.
         WS_POPUP|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_CLIPCHILDREN,
-        CW_USEDEFAULT,CW_USEDEFAULT,APP_W,APP_H,
+        CW_USEDEFAULT,CW_USEDEFAULT,appW(),appH(),
         NULL,NULL,hInst,NULL);
     if(hwnd) showTrayIcon(hwnd);   // present for the whole session, added exactly once
 
