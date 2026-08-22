@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.7"
+#define APP_VERSION      L"v3.1.8"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -349,11 +349,14 @@ int themeIdx = 5;
 // costs one opaque blit per frame, and it exists so the frosted cards have something
 // worth refracting - a pane over flat black reads as plastic no matter how it is lit.
 struct ZStar { float x, y, z, pz; };
-static const int   ZSTAR_COUNT = 300;
+// 300 stars over a 420x600 window is about one per 840 pixels, which is what made the
+// field read as sparse dots rather than depth. Denser, and each one carries its own
+// brightness so they do not all pulse identically as they approach.
+static const int   ZSTAR_COUNT = 640;
 static ZStar       zStars[ZSTAR_COUNT];
 static bool        zStarsInit = false;
 static const float ZSTAR_NEAR = 0.055f;   // respawn once closer than this
-static const float ZSTAR_SPEED = 0.215f;  // depth units per second
+static const float ZSTAR_SPEED = 0.235f;  // depth units per second
 
 // The field is composed by writing pixels straight into a DIB rather than asking
 // GDI+ to rasterise a shape per star. Measured: 460 antialiased FillRectangles cost
@@ -521,11 +524,15 @@ void drawVoidStars(HDC hdc,int W,int H){
             float px=ccx + (s.x/s.pz)*spanX, py=ccy + (s.y/s.pz)*spanY;
             float dx=sx-px, dy=sy-py;
             float len=sqrtf(dx*dx+dy*dy);
-            if(len>1.0f){
-                int steps=(int)std::min(5.0f,len);
+            if(len>0.6f){
+                // One sample per pixel of travel rather than a fixed five. At five the
+                // trail of a fast star was five visibly separate dots with gaps between
+                // them, which is most of what "pixelated" was describing. Brightness
+                // ramps along the trail so it reads as a streak with a head.
+                int steps=(int)std::min(14.0f,len*1.6f+1.0f);
                 for(int k=1;k<=steps;k++){
                     float f=(float)k/(float)(steps+1);
-                    plotStar(W,H,px+dx*f,py+dy*f,rad*0.72f,(int)(lum*0.30f*f));
+                    plotStar(W,H,px+dx*f,py+dy*f,rad*(0.55f+0.35f*f),(int)(lum*0.34f*f*f));
                 }
             }
         }
@@ -16802,7 +16809,7 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // stop and restart around the transitions.
         updateVoidStars();
         InvalidateRect(hwnd,NULL,FALSE); return 0;
-    case WM_CREATE: SetTimer(hwnd,1,16,NULL); return 0; // 60fps animation
+    case WM_CREATE: SetTimer(hwnd,1,8,NULL); return 0; // 120fps - the splash is the first thing anyone sees
     case WM_DESTROY: KillTimer(hwnd,1); freeSplashResources(); return 0;
     case WM_PAINT:{
         PAINTSTRUCT ps; HDC hdc=BeginPaint(hwnd,&ps);
@@ -19708,9 +19715,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     // rendering it at 60fps and taking cycles off the frame the
                     // player is actually reacting to. Clicking makes that worse
                     // again, hence the third tier.
+                    // The tick is 8ms now, so "every 1" would be 120fps. Worth it when
+                    // the window is in front and being looked at; halved when it is
+                    // merely visible, because nobody is studying the background of a
+                    // window they are not using, and the drift is under a pixel a frame
+                    // either way.
                     static int voidSkip=0;
-                    int every = 1;
-                    if(robloxFocused.load()) every = macroRunning.load() ? 6 : 3;
+                    int every = (GetForegroundWindow()==hwnd) ? 1 : 2;
+                    if(robloxFocused.load()) every = macroRunning.load() ? 12 : 6;
                     if((++voidSkip % every)==0){
                         updateVoidStars();
                         InvalidateRect(hwnd,NULL,FALSE);
@@ -20697,7 +20709,7 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         }
         return 0;
     case WM_DESTROY:
-        saveSettings();KillTimer(hwnd,TIMER_ANIM);
+        saveSettings();KillTimer(hwnd,TIMER_ANIM);timeEndPeriod(1);
         hideTrayIcon();
         freeMainBackbuffer();
         appRunning=false;macroRunning=false;
@@ -20779,7 +20791,7 @@ LRESULT CALLBACK LicenseProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                                CARDX+12,FIELDY+9,CARDW-24,FIELDH-16,hwnd,(HMENU)ID_LICENSE_INPUT,NULL,NULL);
         SendMessage(hwndInput,WM_SETFONT,(WPARAM)(hFontMono?hFontMono:hFontSmall),TRUE);
         SendMessage(hwndInput,EM_SETCUEBANNER,FALSE,(LPARAM)L"WRTH-XXXX-XXXX-XXXX");
-        SetTimer(hwnd,1,33,NULL);   // drives the starfield and the button hover fade
+        SetTimer(hwnd,1,8,NULL);   // was 33ms, a visibly choppy 30fps on the one screen every new user meets first
         SetFocus(hwndInput);
         break;
     }
@@ -20938,6 +20950,9 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     Gdiplus::GdiplusStartup(&gdiplusToken,&gdipInput,NULL);
     InitializeCriticalSection(&keyListCS);
     loadAppIcon();
+    // Held for the whole session so every SetTimer in the app is honoured rather than
+    // rounded up to the ~15.6ms system tick. Released in WM_DESTROY.
+    timeBeginPeriod(1);
     gGlowCursor=createGlowCursor();
     lastKpsTick=GetTickCount();
 
@@ -21079,7 +21094,18 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     }
     ShowWindow(hwnd,nCmdShow);UpdateWindow(hwnd);
     fadeAlpha=0.0f;
-    SetTimer(hwnd,TIMER_ANIM,16,NULL);
+    // 8ms, not 16. Two things were capping this at a jittery 60fps:
+    //
+    // SetTimer is quantised to the system tick, ~15.6ms, unless the process has asked
+    // for 1ms timer resolution - which this app only did briefly inside the benchmark
+    // and the click engine. So a 16ms timer actually fired at 15.6 or 31.2ms depending
+    // on where the tick fell, and that alternation is what reads as stutter rather than
+    // a low frame rate. timeBeginPeriod is now held for the life of the window, so the
+    // interval is honoured.
+    //
+    // The animations themselves are delta-timed, so nothing moves faster - it moves in
+    // twice as many, half as large steps, which is the whole of the difference.
+    SetTimer(hwnd,TIMER_ANIM,8,NULL);
 
     spawnOverlay(); // Spawn if either enabled
     // Discord RPC persistent background thread
