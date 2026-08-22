@@ -409,8 +409,14 @@ static void buildSky(HDC ref,int W,int H){
             {0.20f,0.14f,0.50f,26},{0.82f,0.40f,0.44f,21},
             {0.32f,0.72f,0.54f,23},{0.74f,0.95f,0.40f,18}
         };
+        // Radius from the LONGER edge, not from the width. At 760x430 a width-based
+        // radius covered the window comfortably; at 420x600 the same fraction gave a
+        // 210px blob over a 600px-tall window, so the glow only reached the middle and
+        // the top and bottom fell away to flat black. Switching orientation therefore
+        // changed what the starfield was sitting on, which is what looked broken.
+        const REAL span=(REAL)std::max(W,H);
         for(const auto& b : blobs){
-            REAL bx=W*b.fx, by=H*b.fy, br=W*b.fr;
+            REAL bx=W*b.fx, by=H*b.fy, br=span*b.fr;
             GraphicsPath e; e.AddEllipse(bx-br,by-br,br*2,br*2);
             PathGradientBrush pg(&e);
             pg.SetCenterPoint(PointF(bx,by));
@@ -20663,6 +20669,19 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
     // WM_COMMAND / WM_CHAR handled via child windows, not needed here
     case WM_SIZE:
         if(wp!=SIZE_MINIMIZED){
+            // Rebuild the backdrop here rather than letting the next paint discover the
+            // size changed. buildSky draws four GDI+ path gradients and allocates a
+            // full-window copy; doing that inside the paint meant the first frame after
+            // an orientation change stalled long enough to be seen as the animation
+            // hitching, on top of whatever the resize itself cost.
+            if(themeIdx==5){
+                RECT crS; GetClientRect(hwnd,&crS);
+                if(crS.right>0&&crS.bottom>0){
+                    HDC dc=GetDC(hwnd);
+                    if(dc){ buildSky(dc,crS.right,crS.bottom); ReleaseDC(hwnd,dc); }
+                }
+            }
+            freeMainBackbuffer();   // the cached surface is the old shape
             InvalidateRect(hwnd,NULL,FALSE);
         }
         break;
