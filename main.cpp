@@ -20014,6 +20014,40 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // that is simply gone.
             if(my<HEADER_H) return 0;
         }
+
+        // The dock, before anything a tab does with a click. The comment on it always
+        // said "handled first" and it was not - it sat below the per-tab handlers, so
+        // any tab that swallowed a click swallowed navigation with it. Switching the
+        // triggerbot off did exactly that: its own handler returns early for every
+        // click while it is disabled, and in landscape - where the dock has no bottom
+        // strip to be excluded by - that included the rail itself, leaving no way out
+        // of the tab.
+        {
+            RECT crD; GetClientRect(hwnd,&crD);
+            bool onDock; int idx=0;
+            if(g_landscape){
+                onDock = (mx < DOCK_W);
+                int py=HEADER_H+10, ph=crD.bottom-HEADER_H-20, seg=std::max(1,ph/3);
+                idx=(my-py)/seg;
+            } else {
+                onDock = (my >= crD.bottom-DOCK_H);
+                int inset=10, pw=crD.right-inset*2, seg=std::max(1,pw/3);
+                idx=(mx-inset)/seg;
+            }
+            if(onDock){
+                idx=std::max(0,std::min(2,idx));
+                playClick();
+                // Tabs 0 and 1 share mainScrollPos but are different heights, so a
+                // position carried across lands somewhere that only made sense on the
+                // tab you left, or past its end entirely.
+                if(idx!=activeTab) mainScrollPos=0;
+                activeTab=idx;
+                if(idx==2){ settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; SetTimer(hwnd,TIMER_SETT,500,NULL); }
+                else KillTimer(hwnd,TIMER_SETT);
+                InvalidateRect(hwnd,NULL,FALSE);
+                return 0;
+            }
+        }
         g_pressedId=hitTest(hwnd,mx,my); // which control is being held
         if(g_lockKind!=LOCK_NONE){
             if(!g_lockRedirectUrl.empty()){
@@ -20074,7 +20108,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 if(!triggerbotEnabled.load()){
                     bool onSwitch = mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&
                                     myT>=g_tbLay.yEnable+32&&myT<=g_tbLay.yEnable+56;
-                    if(!onSwitch){ g_tbHexEditing=false; return 0; }
+                    // Never swallow the rail, whatever the handler order happens to be.
+                    if(!onSwitch && mxT>=dockLeft()){ g_tbHexEditing=false; return 0; }
                 }
                 // enable / disable
                 if(mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&myT>=g_tbLay.yEnable+32&&myT<=g_tbLay.yEnable+56){
@@ -20163,30 +20198,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         }
 
         {RECT cr10;GetClientRect(hwnd,&cr10);
-        bool onDock; int idx=0;
-        if(g_landscape){
-            onDock = (mx < DOCK_W);
-            int py=HEADER_H+10, ph=cr10.bottom-HEADER_H-20, seg=std::max(1,ph/3);
-            idx=(my-py)/seg;
-        } else {
-            onDock = (my >= cr10.bottom-DOCK_H);
-            int inset=10, pw=cr10.right-inset*2, seg=std::max(1,pw/3);
-            idx=(mx-inset)/seg;
-        }
-        // Dock tab bar always handled first
-        if(onDock){
-            idx=std::max(0,std::min(2,idx));
-            playClick();
-            // Tabs 0 and 1 share mainScrollPos but are different heights, so carrying a
-            // position across leaves the new tab scrolled to somewhere that only made
-            // sense on the old one - or past its end entirely.
-            if(idx!=activeTab) mainScrollPos=0;
-            activeTab=idx;
-            if(idx==2){ settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; SetTimer(hwnd,TIMER_SETT,500,NULL); }
-            else KillTimer(hwnd,TIMER_SETT);
-            InvalidateRect(hwnd,NULL,FALSE);
-            return 0;
-        }
         // Version toast click - previously unreachable: its Y-range sat
         // entirely inside the dock's clickable area, so the dock's own
         // tab-switch handler above always intercepted the click first and
