@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.6"
+#define APP_VERSION      L"v3.1.7"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13005,6 +13005,11 @@ std::atomic<bool> holdMode(false);
 std::atomic<bool> capturingHotkey(false);
 std::atomic<bool> capturingKey(false);
 std::atomic<bool> robloxFocused(false);
+// Whether Roblox is RUNNING, which is a different question from whether it is the
+// window in front. Arming only needs the game open - you arm from the app, then alt-tab
+// into it - so tying that to focus meant the bind could never be armed from the UI at
+// all. Firing still requires focus, since a keypress goes to whatever is in front.
+std::atomic<bool> robloxRunning(false);
 
 std::vector<int> keysToSend;
 CRITICAL_SECTION keyListCS;
@@ -13566,6 +13571,9 @@ std::atomic<LockKind> g_lockKind{LOCK_NONE};
 // Trial expiry as a UTC epoch, 0 when this key is not a trial. The server is the
 // authority; the old day counter only ever described the offline trial.
 std::atomic<long long> g_trialExpiryUtc{0};
+// Seconds until a vouch becomes compulsory. -1 when it does not apply to this licence,
+// 0 when the deadline has passed.
+std::atomic<long long> g_vouchSecsLeft{-1};
 std::wstring g_lockTitle;
 std::wstring g_lockSubtitle;
 std::wstring g_lockButtonText;   // empty = no button rendered
@@ -14000,11 +14008,23 @@ static long long nowEpochUtc(){
     return (long long)(u.QuadPart/10000000ULL) - 11644473600LL;
 }
 
+// Everyone gets 72 hours from the moment this shipped, not from whenever they
+// activated. Counting from activation would have locked out seven people the instant
+// the build went live, with no warning and no chance to comply - a rule that punishes
+// people for having bought early is not a rule worth having.
+//
+// Compiled in rather than read from the server: the macro authenticates with the
+// publishable key, and bot_config is not something that key should be able to read.
+#define VOUCH_GATE_EPOCH 1787356800LL   // 2026-08-22 00:00 UTC, the day this shipped
+#define VOUCH_GRACE_SECS (72*3600)
+
 // Returns: -1=network error, 0=invalid, 1=valid+match, 2=valid+just activated,
-//          3=hwid mismatch, 4=trial expired, 5=client key rejected (build out of date)
+//          3=hwid mismatch, 4=trial expired, 5=client key rejected (build out of date),
+//          6=vouch required
 int validateLicense(const std::wstring& key, const std::wstring& hwid) {
     // Silently validate - only log issues
-    std::wstring path=L"/rest/v1/licenses?license_key=eq."+key+L"&select=license_key,hwid,is_active,trial,expires_at,triggerbot";
+    std::wstring path=L"/rest/v1/licenses?license_key=eq."+key+
+                      L"&select=license_key,hwid,is_active,trial,expires_at,triggerbot,vouched,activated_at";
     int status=0;
     std::string resp=httpCall(path.c_str(),"",SUPABASE_ANON_STR(),"GET",&status);
     // 401/403 means the key this build ships with is no longer accepted, not that
@@ -14033,6 +14053,24 @@ int validateLicense(const std::wstring& key, const std::wstring& hwid) {
             if(std::string(now)>exStr){LOG_ERR(L"Trial expired - purchase a license");return 4;}
         }
     } else g_trialExpiryUtc = 0;   // a bought licence never shows a countdown
+
+    // The vouch gate. Only ever applies to a bought licence that has been activated:
+    // a key nobody has used yet has nothing to vouch about, and testers, boosters and
+    // trials are marked satisfied on the server side.
+    if(resp.find("\"vouched\":false")!=std::string::npos && !isTrial){
+        long long act=0;
+        auto ap=resp.find("\"activated_at\":\"");
+        if(ap!=std::string::npos){
+            ap+=16;
+            act=isoToEpochUtc(resp.substr(ap,resp.find("\"",ap)-ap));
+        }
+        if(act>0){
+            long long from = act > VOUCH_GATE_EPOCH ? act : VOUCH_GATE_EPOCH;
+            long long left = (from + VOUCH_GRACE_SECS) - nowEpochUtc();
+            g_vouchSecsLeft = left > 0 ? left : 0;
+            if(left <= 0){ LOG_ERR(L"Vouch required to keep using wrathic"); return 6; }
+        } else g_vouchSecsLeft = -1;
+    } else g_vouchSecsLeft = -1;
 
     bool noHWID=resp.find("\"hwid\":null")!=std::string::npos;
     bool match =resp.find("\"hwid\":\""+wtos(hwid)+"\"")!=std::string::npos;
@@ -14337,7 +14375,37 @@ void stopMacroTimer()   {}
 void updateMacroTimer() {}
 
 
-void focusThread(){while(appRunning){robloxFocused=checkRoblox();Sleep(500);}}
+// Is a Roblox process alive at all? Cheaper than it looks - the snapshot is only taken
+// when the game is not already the foreground window, which is the only time the answer
+// is not obvious.
+static bool robloxProcessAlive(){
+    if(gRobloxHwnd && IsWindow(gRobloxHwnd)) return true;
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+    if(snap==INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe={}; pe.dwSize=sizeof(pe);
+    bool found=false;
+    if(Process32FirstW(snap,&pe)){
+        do{
+            if(_wcsicmp(pe.szExeFile,L"RobloxPlayerBeta.exe")==0||
+               _wcsicmp(pe.szExeFile,L"Windows10Universal.exe")==0||
+               wcsstr(pe.szExeFile,L"Roblox")!=NULL){ found=true; break; }
+        } while(Process32NextW(snap,&pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+void focusThread(){
+    int slow=0;
+    while(appRunning){
+        robloxFocused=checkRoblox();
+        // The process scan is the expensive half, so it runs every fourth pass - two
+        // seconds - rather than twice a second. Launching a game is not something that
+        // needs noticing inside half a second.
+        if(robloxFocused.load()) robloxRunning=true;
+        else if(++slow>=4){ slow=0; robloxRunning=robloxProcessAlive(); }
+        Sleep(500);
+    }
+}
 
 void macroThread(){
     LOG_OK(L"Macro engine ready");
@@ -14767,6 +14835,17 @@ void resourceThread(){
                 if(hwndOverlay&&IsWindow(hwndOverlay)){DestroyWindow(hwndOverlay);hwndOverlay=NULL;}
                 if(hwndMain&&IsWindow(hwndMain)) InvalidateRect(hwndMain,NULL,TRUE);
                 LOG_ERR(L"License revoked - app locked");
+            } else if(r==6){
+                macroRunning=false;
+                g_lockKind=LOCK_LICENSE;
+                g_lockTitle=L"Leave a vouch to continue";
+                g_lockSubtitle=L"You have had wrathic for three days. Post a vouch in the Discord and it unlocks straight away.";
+                g_lockButtonText=L"Open the Discord";
+                g_lockRedirectUrl=L"https://discord.gg/MhdqYF4n8m";
+                g_lockFooter=L"It unlocks within a minute of you posting";
+                if(hwndOverlay&&IsWindow(hwndOverlay)){DestroyWindow(hwndOverlay);hwndOverlay=NULL;}
+                if(hwndMain&&IsWindow(hwndMain)) InvalidateRect(hwndMain,NULL,TRUE);
+                LOG_ERR(L"Locked - vouch required");
             } else if(r==4){
                 macroRunning=false;
                 g_lockKind=LOCK_LICENSE;
@@ -17424,6 +17503,25 @@ static void drawCaptionButtons(HDC hdc,int W){
     // Trial countdown. Every tab draws this row, so putting the clock here is what
     // makes it visible at all times - a day-long trial is short enough that hours
     // and minutes matter, which the settings card's "1 day(s) remaining" never said.
+    // Counts down before it locks rather than surprising them on day three.
+    long long vLeft=g_vouchSecsLeft.load();
+    if(vLeft>=0 && !g_trialExpiryUtc.load()){
+        wchar_t vb[64];
+        long long h=vLeft/3600;
+        if(h>=1) swprintf(vb,64,L"Vouch within %lldh",h);
+        else     swprintf(vb,64,L"Vouch within %lldm",vLeft/60);
+        SIZE vs={};
+        HGDIOBJ oldVF=SelectObject(hdc,hFontSmall);
+        GetTextExtentPoint32W(hdc,vb,(int)wcslen(vb),&vs);
+        SelectObject(hdc,oldVF);
+        int vw=vs.cx+20, vx=190, vy=(H-20)/2;
+        if(vx+vw < minX-8){
+            COLORREF vc = vLeft < 6*3600 ? T.red : T.subtext;
+            drawRR(hdc,vx,vy,vw,20,10,T.btn,vc,1);
+            drawText(hdc,vb,vx,vy,vw,20,vc,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+    }
+
     long long exp=g_trialExpiryUtc.load();
     if(exp){
         long long left=exp-nowEpochUtc();
@@ -18061,12 +18159,19 @@ void paintMain(HWND hwnd){
             drawText(hdc,trigArmHold.load()?L"Hold":L"Tap",p+cw-112,ty+30,48,24,T.text,
                      hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
             drawToggle(hdc,p+cw-56,ty+30,trigArmHold.load());
-            bool live = triggerbotEnabled.load() && (ak==0 || g_trigArmed.load());
+            bool live   = triggerbotEnabled.load() && (ak==0 || g_trigArmed.load());
+            bool open   = robloxRunning.load();
             bool inGame = robloxFocused.load();
-            drawText(hdc, !inGame ? L"Waiting for Roblox - it only fires while the game is in front"
-                                  : (ak ? (live?L"Armed - watching":L"Not armed - press your bind")
-                                        : L"No bind set, so the toggle above arms it"),
-                     p+16,ty+58,cw-32,14, (live&&inGame)?T.green:T.subtext, hFontSmall,
+            // Three states rather than two. It used to say "waiting for Roblox" whenever
+            // the game was not in front, which is the normal condition while you are
+            // setting it up in this window - so arming looked blocked when it was not.
+            const wchar_t* msg =
+                !open  ? L"Roblox is not open"
+              : !live  ? (ak ? L"Not armed - press your bind" : L"No bind set, so the toggle above arms it")
+              : !inGame? L"Armed - fires once you are back in the game"
+              :          L"Armed - watching";
+            drawText(hdc,msg,p+16,ty+58,cw-32,14,
+                     (live&&open)?T.green:T.subtext, hFontSmall,
                      DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         }
         g_tbLay.yArm=ty; ty+=90;
@@ -19073,7 +19178,13 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
 
     // â”€â”€ UPDATE CARD (l.yUpdate) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(mx>=p+14&&mx<=p+cw-14&&my>=l.yUpdate+26&&my<=l.yUpdate+48){
-        playClick();checkForUpdate();}
+        playClick();
+        // On its own thread. checkForUpdate makes an HTTPS request, and it was called
+        // straight from the click handler - so pressing the update card froze the whole
+        // window until GitHub answered or the request timed out, which is exactly the
+        // "UI stops responding" this app has been accused of.
+        std::thread([]{ checkForUpdate(); if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE); }).detach();
+    }
 
     // â”€â”€ LICENSE CARD (l.yLic) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int ly=l.yLic;
@@ -19656,7 +19767,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         }
         break;
     case WM_LBUTTONUP:
-        if(g_sliderDragging){ g_sliderDragging=false; ReleaseCapture(); saveSettings(); }
+        // Released whether or not the drag flag survived. Tying the release to the
+        // flag meant that if anything cleared it mid-gesture the capture stayed held,
+        // and a window holding the mouse capture stops responding to clicks anywhere
+        // else - which is what "the UI just stops working" looks like from outside.
+        if(GetCapture()==hwnd) ReleaseCapture();
+        if(g_sliderDragging){ g_sliderDragging=false; saveSettings(); }
         if(g_pressedId){ g_pressedId=0; InvalidateRect(hwnd,NULL,FALSE); }
         return 0;
     case WM_CAPTURECHANGED:
