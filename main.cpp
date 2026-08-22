@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.1.9"
+#define APP_VERSION      L"v3.2.0"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -111,6 +111,18 @@ static inline int appH(){ return g_landscape ? APP_H_LS : APP_H; }
 // left reserve is the rail, and in portrait it is the other way round.
 static inline int dockBottom(){ return g_landscape ? 0 : DOCK_H; }
 static inline int dockLeft()  { return g_landscape ? DOCK_W : 0; }
+
+#define HEADER_H 44
+// A strip under the header saying how long is left before a vouch becomes compulsory.
+// It was a pill in the caption row, which is small, easy to miss, and sits next to the
+// trial clock where it reads as decoration - the wrong shape for the only warning in
+// the app that ends with the macro refusing to run.
+#define BANNER_H 30
+extern std::atomic<long long> g_vouchSecsLeft;
+static inline bool vouchBannerOn(){ return g_vouchSecsLeft.load() >= 0; }
+static inline int  bannerH(){ return vouchBannerOn() ? BANNER_H : 0; }
+// Where page content starts: under the header, and under the banner when it is up.
+static inline int  topInset(){ return HEADER_H + bannerH(); }
 
 // ===================== PATH HELPERS =====================
 // Must be defined before anything that uses file I/O
@@ -13023,6 +13035,11 @@ std::atomic<bool> robloxFocused(false);
 // into it - so tying that to focus meant the bind could never be armed from the UI at
 // all. Firing still requires focus, since a keypress goes to whatever is in front.
 std::atomic<bool> robloxRunning(false);
+// The macro works in any game; only the triggerbot is Roblox-specific, because the
+// colour it watches for is a Blade Ball cue and means nothing anywhere else.
+std::atomic<bool> gameFocused(false);
+HWND gGameHwnd=NULL;                 // whatever game is in front, Roblox or otherwise
+static wchar_t gGameName[64]={};     // for the UI, so it can say what it found
 
 std::vector<int> keysToSend;
 CRITICAL_SECTION keyListCS;
@@ -14126,6 +14143,78 @@ std::wstring vkToString(int vk){
 // ===================== MACRO =====================
 HWND gRobloxHwnd=NULL;
 
+// Executables worth recognising by name. Anything here counts as a game whatever shape
+// its window is - some run windowed, and a borderless check alone would miss them.
+static const wchar_t* KNOWN_GAMES[] = {
+    L"RobloxPlayerBeta.exe", L"Windows10Universal.exe",
+    L"FortniteClient-Win64-Shipping.exe", L"cs2.exe", L"csgo.exe",
+    L"VALORANT-Win64-Shipping.exe", L"RustClient.exe", L"r5apex.exe",
+    L"Overwatch.exe", L"ModernWarfare.exe", L"cod.exe", L"BlackOpsColdWar.exe",
+    L"destiny2.exe", L"TslGame.exe", L"PalworldClient-Win64-Shipping.exe",
+    L"RainbowSix.exe", L"RainbowSix_BE.exe", L"Warframe.x64.exe",
+    L"THEFINALS.exe", L"DeltaForceClient-Win64-Shipping.exe",
+    L"Minecraft.Windows.exe", L"javaw.exe", L"FiveM.exe", L"GTA5.exe",
+    L"dota2.exe", L"League of Legends.exe", L"RiotClientServices.exe",
+    L"deadlock.exe", L"HD2.exe", L"helldivers2.exe", L"Marvel-Win64-Shipping.exe",
+};
+// Things that are fullscreen often enough to fool the shape test but are plainly not a
+// game. The list matters because a borderless browser is the common false positive.
+static const wchar_t* NOT_GAMES[] = {
+    L"explorer.exe", L"chrome.exe", L"msedge.exe", L"firefox.exe", L"opera.exe",
+    L"brave.exe", L"Discord.exe", L"Code.exe", L"devenv.exe", L"WindowsTerminal.exe",
+    L"Spotify.exe", L"vlc.exe", L"mpc-hc64.exe", L"obs64.exe", L"steam.exe",
+    L"EpicGamesLauncher.exe", L"ApplicationFrameHost.exe", L"SearchHost.exe",
+    L"ShellExperienceHost.exe", L"StartMenuExperienceHost.exe", L"Taskmgr.exe",
+};
+static bool nameIn(const wchar_t* name,const wchar_t* const* list,size_t n){
+    for(size_t i=0;i<n;i++) if(_wcsicmp(name,list[i])==0) return true;
+    return false;
+}
+// Covers its whole monitor and has no visible border - the shape a game takes whether
+// it calls that fullscreen or borderless windowed.
+static bool windowIsFullscreen(HWND h){
+    RECT wr; if(!GetWindowRect(h,&wr)) return false;
+    HMONITOR mon=MonitorFromWindow(h,MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi={sizeof(mi)};
+    if(!GetMonitorInfoW(mon,&mi)) return false;
+    const RECT& m=mi.rcMonitor;
+    // A few pixels of slack: some engines are off by one or two on a scaled display.
+    return wr.left<=m.left+2 && wr.top<=m.top+2 &&
+           wr.right>=m.right-2 && wr.bottom>=m.bottom-2;
+}
+
+// Is the window in front a game? Named executables count outright; anything else has to
+// be fullscreen AND not on the list of things that are fullscreen without being games.
+bool checkGameFocused(){
+    HWND fg=GetForegroundWindow();
+    if(!fg) return false;
+    if(fg==hwndMain||fg==hwndOverlay) return false;   // our own windows are not a game
+    DWORD pid=0; GetWindowThreadProcessId(fg,&pid);
+    if(!pid) return false;
+
+    wchar_t exe[64]={};
+    { HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+      if(snap==INVALID_HANDLE_VALUE) return false;
+      PROCESSENTRY32W pe={}; pe.dwSize=sizeof(pe);
+      if(Process32FirstW(snap,&pe)){
+          do{ if(pe.th32ProcessID==pid){ wcsncpy(exe,pe.szExeFile,63); break; } }
+          while(Process32NextW(snap,&pe));
+      }
+      CloseHandle(snap); }
+    if(!exe[0]) return false;
+
+    bool known = nameIn(exe,KNOWN_GAMES,sizeof(KNOWN_GAMES)/sizeof(KNOWN_GAMES[0]));
+    bool banned= nameIn(exe,NOT_GAMES,sizeof(NOT_GAMES)/sizeof(NOT_GAMES[0]));
+    bool isGame = known || (!banned && windowIsFullscreen(fg));
+    if(isGame){
+        gGameHwnd=fg;
+        wcsncpy(gGameName,exe,63);
+        // Drop the extension for display - nobody wants to read ".exe" in the UI.
+        wchar_t* dot=wcsrchr(gGameName,L'.'); if(dot) *dot=0;
+    }
+    return isGame;
+}
+
 bool checkRoblox(){
     HWND fg=GetForegroundWindow();
     if(!fg){ return false; }
@@ -14185,9 +14274,12 @@ static inline bool isMouseVk(int vk){ return vk==VK_LBUTTON||vk==VK_RBUTTON||vk=
 // using the cursor's current position translated to that window's client
 // coordinates, so it lands correctly regardless of what's on top on screen.
 static void postMouseToRoblox(int vk,bool down){
-    if(!gRobloxHwnd||!IsWindow(gRobloxHwnd)) return;
+    // Whichever game is in front. It was pinned to the Roblox window, so in any other
+    // game the fallback path had nowhere to post and mouse binds did nothing.
+    HWND target = (gGameHwnd&&IsWindow(gGameHwnd)) ? gGameHwnd : gRobloxHwnd;
+    if(!target||!IsWindow(target)) return;
     POINT pt; GetCursorPos(&pt);
-    ScreenToClient(gRobloxHwnd,&pt);
+    ScreenToClient(target,&pt);
     LPARAM lp=MAKELPARAM((short)pt.x,(short)pt.y);
     UINT msg; WPARAM wp;
     switch(vk){
@@ -14197,7 +14289,7 @@ static void postMouseToRoblox(int vk,bool down){
         case VK_XBUTTON2:  msg=down?WM_XBUTTONDOWN:WM_XBUTTONUP; wp=MAKEWPARAM(MK_XBUTTON2,XBUTTON2); break;
         default:           msg=down?WM_LBUTTONDOWN:WM_LBUTTONUP; wp=MK_LBUTTON; break;
     }
-    PostMessage(gRobloxHwnd,msg,wp,lp);
+    PostMessage(target,msg,wp,lp);
 }
 
 // Build INPUT structs for a single key (down + up)
@@ -14411,6 +14503,9 @@ void focusThread(){
     int slow=0;
     while(appRunning){
         robloxFocused=checkRoblox();
+        // Roblox is a game, so a positive there is a positive here without a second
+        // process scan; otherwise ask the general detector.
+        gameFocused = robloxFocused.load() ? true : checkGameFocused();
         // The process scan is the expensive half, so it runs every fourth pass - two
         // seconds - rather than twice a second. Launching a game is not something that
         // needs noticing inside half a second.
@@ -14519,7 +14614,7 @@ void hotkeyThread(){
             continue;
         }
         if(!capturingHotkey&&!capturingKey){
-            bool focused=robloxFocused.load();
+            bool focused=gameFocused.load();
             bool pressed=(GetAsyncKeyState(hotkeyVK.load())&0x8000)!=0;
             // The arm bind. Tap toggles, hold arms only while held - and the eyedropper
             // is served here too, since this is already the thread watching for keys.
@@ -14579,7 +14674,7 @@ void hotkeyThread(){
                         else LOG_INFO(L"Macro deactivated - toggle off");
                     }else if(macroRunning.load()){
                         macroRunning=false;
-                        LOG_INFO(L"Macro stopped - Roblox is not active or maximised");
+                        LOG_INFO(L"Macro stopped - no game is in front");
                     }
                 }
             }
@@ -17094,7 +17189,7 @@ Layout getLayout(HWND hwnd){
     int off=-mainScrollPos; // scroll offset
     // Below the mode switch, which sits below the 44px header. The switch used to be
     // drawn at yHotkey-40, which put it straight through the wrathic wordmark.
-    l.yHotkey      =96 +off;
+    l.yHotkey      =96 +bannerH() +off;
     l.yMode        =l.yHotkey +68;
     l.yKeys        =l.yMode   +68;
     l.yKps         =l.yKeys   +102;
@@ -17487,7 +17582,7 @@ static void drawOptimiseConfirm(HDC hdc,int W,int H){
 // past y=44 was drawn straight over the top of it - the title and the window buttons
 // disappeared under the cards. It owns the top 44px of every tab, so it goes last and
 // covers whatever ran underneath.
-#define HEADER_H 44
+// HEADER_H and the vouch banner helpers moved up to the layout constants.
 static void drawAppHeader(HDC hdc,int W);
 
 static void drawCaptionButtons(HDC hdc,int W){
@@ -17516,25 +17611,6 @@ static void drawCaptionButtons(HDC hdc,int W){
     // Trial countdown. Every tab draws this row, so putting the clock here is what
     // makes it visible at all times - a day-long trial is short enough that hours
     // and minutes matter, which the settings card's "1 day(s) remaining" never said.
-    // Counts down before it locks rather than surprising them on day three.
-    long long vLeft=g_vouchSecsLeft.load();
-    if(vLeft>=0 && !g_trialExpiryUtc.load()){
-        wchar_t vb[64];
-        long long h=vLeft/3600;
-        if(h>=1) swprintf(vb,64,L"Vouch within %lldh",h);
-        else     swprintf(vb,64,L"Vouch within %lldm",vLeft/60);
-        SIZE vs={};
-        HGDIOBJ oldVF=SelectObject(hdc,hFontSmall);
-        GetTextExtentPoint32W(hdc,vb,(int)wcslen(vb),&vs);
-        SelectObject(hdc,oldVF);
-        int vw=vs.cx+20, vx=190, vy=(H-20)/2;
-        if(vx+vw < minX-8){
-            COLORREF vc = vLeft < 6*3600 ? T.red : T.subtext;
-            drawRR(hdc,vx,vy,vw,20,10,T.btn,vc,1);
-            drawText(hdc,vb,vx,vy,vw,20,vc,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        }
-    }
-
     long long exp=g_trialExpiryUtc.load();
     if(exp){
         long long left=exp-nowEpochUtc();
@@ -17614,6 +17690,27 @@ static void drawAppHeader(HDC hdc,int W){
     if(activeTab==0)
         drawText(hdc,APP_VERSION,W-92-70,0,70,HEADER_H,T.subtext,hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
     drawCaptionButtons(hdc,W);
+
+    // The vouch countdown. Full width, directly under the header, on every tab, and
+    // drawn with the header so nothing scrolls over it. It was a small pill in the
+    // caption row beside the trial clock, which reads as decoration - the wrong shape
+    // for the only warning in the app that ends with the macro refusing to run.
+    if(vouchBannerOn()){
+        long long left=g_vouchSecsLeft.load();
+        bool urgent = left < 6*3600;
+        COLORREF bg = urgent ? RGB(58,20,22) : RGB(40,34,20);
+        COLORREF fg = urgent ? T.red : T.accent;
+        fillRect(hdc,0,HEADER_H,W,BANNER_H,bg);
+        fillRect(hdc,0,HEADER_H+BANNER_H-1,W,1,fg);
+        wchar_t msg[160];
+        if(left<=0) wcscpy(msg,L"Vouch in the Discord - the macro has stopped working");
+        else{
+            long long h=left/3600, m=(left%3600)/60;
+            if(h>=1) swprintf(msg,160,L"Vouch in the Discord within %lldh %lldm or the macro stops working",h,m);
+            else     swprintf(msg,160,L"Vouch in the Discord within %lldm or the macro stops working",m);
+        }
+        drawText(hdc,msg,12,HEADER_H,W-24,BANNER_H,fg,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
 }
 
 // ===== PROFILES CARD =====
@@ -18117,7 +18214,7 @@ void paintMain(HWND hwnd){
     // â”€â”€ SETTINGS TAB CONTENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if(activeTab==1 && !hasTriggerbot){
         // Not entitled: show what it is and how to get it, rather than a dead tab.
-        int ty=70-mainScrollPos;
+        int ty=70+bannerH()-mainScrollPos;
         drawCard(hdc,p,ty,cw,150);
         drawText(hdc,L"TRIGGERBOT",p+16,ty+12,200,12,T.subtext,hFontSmall);
         drawText(hdc,L"Not included in your licence",p+16,ty+34,cw-32,20,T.text,hFontMed,
@@ -18134,7 +18231,7 @@ void paintMain(HWND hwnd){
         // Was a hard 70, so the page ignored the scroll position entirely - the wheel
         // moved mainScrollPos and nothing on screen moved, which is why the tab could
         // not be scrolled no matter how far the content ran past the bottom.
-        int ty=70-mainScrollPos;
+        int ty=70+bannerH()-mainScrollPos;
         drawCard(hdc,p,ty,cw,68);
         drawText(hdc,L"TRIGGERBOT",p+16,ty+10,180,12,T.subtext,hFontSmall);
         drawText(hdc,triggerbotEnabled.load()?L"Watching for colour":L"Disabled",
@@ -18262,7 +18359,7 @@ void paintMain(HWND hwnd){
         // bottom one does. Icons only - there is no room for words at this width, and
         // the selected tab is named in the header anyway.
         const int inset=8, pillW=DOCK_W-16;
-        int px=inset, py=HEADER_H+10, ph=H-HEADER_H-20;
+        int px=inset, py=topInset()+10, ph=H-topInset()-20;
         drawGlassPill(hdc,px,py,pillW,ph,pillW/2);
         const int N=3;
         int segH=ph/N;
@@ -18423,7 +18520,7 @@ static int calcOvPosCardH(){
 SLayout getSLayoutW(int W){
     SLayout l; l.W=W; l.pad=14+dockLeft(); l.cw=l.W-l.pad-14-16;
     // Below the header and below the page tabs, not behind either.
-    int y = HEADER_H + 8 + SETT_TABS_H - settScrollPos;
+    int y = topInset() + 8 + SETT_TABS_H - settScrollPos;
     l.yLic=l.yTrial=l.yUpdate=l.yRes=l.yFont=l.yMinimise=
         l.yAutoLaunch=l.yVouch=SETT_OFFPAGE;
     l.yProfiles=SETT_OFFPAGE;   // drawn on the macro page now, never here
@@ -18705,8 +18802,8 @@ void paintSettingsInto(HDC hdc,int W,int H){
     // so they cannot be something you have to scroll back up to reach.
     {
         const wchar_t* names[SETT_PAGES]={L"Account",L"Overlay",L"App"};
-        int tx=p, tw=cw+16, th=28, tyy=HEADER_H+6;
-        fillRect(hdc,0,HEADER_H,W,SETT_TABS_H+8,T.bg);   // cover anything scrolled under
+        int tx=p, tw=cw+16, th=28, tyy=topInset()+6;
+        fillRect(hdc,0,topInset(),W,SETT_TABS_H+8,T.bg);   // cover anything scrolled under
         drawRR(hdc,tx,tyy,tw,th,14,T.surface,T.border,1);
         int segW=tw/SETT_PAGES;
         animateTo(g_settPagePos,(float)g_settPage,0.18f);
@@ -18993,7 +19090,7 @@ void profilesHandleRightClick(HWND hwnd,int mx,int my,int p,int py,int cw){
 void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
     {   // Page tabs first - they sit above every card and must win the click.
         SLayout lt = getSLayoutW(W);
-        int tx=lt.pad, tw=lt.cw+16, th=28, tyy=HEADER_H+6;
+        int tx=lt.pad, tw=lt.cw+16, th=28, tyy=topInset()+6;
         if(my>=tyy && my<=tyy+th && mx>=tx && mx<=tx+tw){
             int seg=std::max(1,tw/SETT_PAGES);
             int idx=std::max(0,std::min(SETT_PAGES-1,(mx-tx)/seg));
@@ -20030,7 +20127,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // scrolled up underneath it is not visible and must not be reachable - a
             // control hidden behind the title bar that still responds is worse than one
             // that is simply gone.
-            if(my<HEADER_H) return 0;
+            if(my<topInset()) return 0;
         }
 
         // The dock, before anything a tab does with a click. The comment on it always
@@ -20045,7 +20142,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             bool onDock; int idx=0;
             if(g_landscape){
                 onDock = (mx < DOCK_W);
-                int py=HEADER_H+10, ph=crD.bottom-HEADER_H-20, seg=std::max(1,ph/3);
+                int py=topInset()+10, ph=crD.bottom-topInset()-20, seg=std::max(1,ph/3);
                 idx=(my-py)/seg;
             } else {
                 onDock = (my >= crD.bottom-DOCK_H);
