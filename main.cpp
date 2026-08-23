@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.2.4"
+#define APP_VERSION      L"v3.2.5"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -17041,6 +17041,9 @@ void runOptimiseFlow(bool withRestorePoint){
 
 // ===================== SPLASH =====================
 HWND hwndSplash=NULL;
+// The splash normally says nothing. It only narrates when there is a reason to wait,
+// which in practice means an update is being fetched.
+bool g_splashShowStatus=false;
 void showSplash(HINSTANCE hInst); // forward decl - reused by WndProc's version toast click
 void fadeSplash(int from,int to,int step); // pumps messages so animation keeps running
 std::wstring splashMsg=L"Starting...";
@@ -17165,8 +17168,32 @@ LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
             }
 
-            // Version - bottom right, very dim
+            // What it is doing, under the rule. Silent for the ordinary case - the
+            // splash is an identity screen, not a fake loading bar - but an update is
+            // a wait long enough that saying nothing looks like a hang.
             SelectObject(mdc,s_splashFontSmall);
+            if(!splashMsg.empty() && g_splashShowStatus){
+                SetTextColor(mdc,RGB(150,150,170));
+                RECT sr={0,H/2+34,W,H/2+54};
+                DrawText(mdc,splashMsg.c_str(),-1,&sr,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+            }
+
+            // Progress bar, only while a download is running. Determinate wherever the
+            // server gives a length; a bar that fills at a rate nothing measures is
+            // worse than no bar.
+            int up=g_updateProgress.load();
+            if(up>=0 && up<=100){
+                int bw=200, bx=W/2-bw/2, by=H/2+62, bh=4;
+                HBRUSH tb=CreateSolidBrush(RGB(38,38,48));
+                RECT trk={bx,by,bx+bw,by+bh}; FillRect(mdc,&trk,tb); DeleteObject(tb);
+                int fw=(int)(bw*(up/100.0f));
+                if(fw>0){
+                    HBRUSH fb=CreateSolidBrush(RGB(120,120,235));
+                    RECT fil={bx,by,bx+fw,by+bh}; FillRect(mdc,&fil,fb); DeleteObject(fb);
+                }
+            }
+
+            // Version - bottom right, very dim
             SetTextColor(mdc,RGB(70,70,85));
             RECT vr={0,H-16,W-8,H-2};
             DrawText(mdc,APP_VERSION,-1,&vr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
@@ -21099,11 +21126,20 @@ void updateSplash(const wchar_t* s){
     if(hwndSplash){InvalidateRect(hwndSplash,NULL,TRUE);UpdateWindow(hwndSplash);}
 }
 static void splashWait(int ms){
-    // Pumps messages so WM_TIMER fires during loading steps
+    // Pumps messages so WM_TIMER fires during loading steps.
+    //
+    // The deadline is checked INSIDE the drain loop, not only around it. Draining until
+    // the queue is empty is only bounded if messages stop arriving, and they do not: two
+    // windows repaint on 8ms timers, and when the update lock is up its blurred overlay
+    // takes longer to draw than the interval that queues the next one. The drain then
+    // never finishes and this never returns - which is what stopped the splash-time
+    // update dead, after the timers were moved from 16ms to 8ms and made it reachable.
     DWORD end=GetTickCount()+(DWORD)ms;
     MSG m;
-    while(GetTickCount()<end){
-        while(PeekMessage(&m,NULL,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessage(&m);}
+    while((int)(end-GetTickCount())>0){
+        while((int)(end-GetTickCount())>0 && PeekMessage(&m,NULL,0,0,PM_REMOVE)){
+            TranslateMessage(&m); DispatchMessage(&m);
+        }
         Sleep(8);
     }
 }
@@ -21516,9 +21552,50 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     // Sync auto-launch toggle with registry
     autoLaunchEnabled=checkAutoLaunchReg();
 
-    // Version check - block if outdated
+    // Version check. An update used to mean the app opened, drew its whole interface,
+    // and then covered it with a lock telling you to go and fetch one - which is a
+    // strange thing to do when the app is already awake, already online, and perfectly
+    // able to fetch it itself. It does that here instead, while the splash is still up,
+    // and the user watches it happen.
+    g_splashShowStatus=true;
     updateSplash(L"Checking for updates...");
     if(!checkVersionBlocking()){
+        // Out of date. Download it on the splash rather than locking the window.
+        {
+            std::wstring found=L"Update found - " + latestVersion;
+            updateSplash(found.c_str());
+            splashWait(600);
+
+            std::atomic<bool> finished{false};
+            std::atomic<bool> ok{false};
+            std::thread([&]{ ok=startSelfUpdate(); finished=true; }).detach();
+
+            // Keep the splash alive and animating while it runs. Two minutes is far more
+            // than a 300KB download needs; the cap exists so a stalled connection ends
+            // in the lock screen rather than an splash that never goes away.
+            DWORD t0=GetTickCount();
+            while(!finished.load() && GetTickCount()-t0 < 120000){
+                int up=g_updateProgress.load();
+                if(!g_updateStage.empty()) updateSplash(g_updateStage.c_str());
+                (void)up;
+                MSG m;
+                while(PeekMessage(&m,NULL,0,0,PM_REMOVE)){ TranslateMessage(&m); DispatchMessage(&m); }
+                if(hwndSplash) InvalidateRect(hwndSplash,NULL,FALSE);
+                Sleep(16);
+            }
+            // On success startSelfUpdate has already asked the app to exit and handed
+            // over to the new build, so nothing after this runs. Reaching here means it
+            // failed, and the lock below is the fallback it always was.
+            if(ok.load()){
+                updateSplash(L"Restarting...");
+                splashWait(400);
+                hideSplash();
+                return 0;
+            }
+            updateSplash(L"Update failed - opening the app");
+            splashWait(800);
+        }
+        g_splashShowStatus=false;
         hideSplash();
         // g_lockKind is now LOCK_UPDATE - paintMain renders the lock overlay
         // (blurred app behind a glass card) and WM_LBUTTONDOWN only responds
