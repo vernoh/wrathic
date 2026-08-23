@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.2.3"
+#define APP_VERSION      L"v3.2.4"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13014,6 +13014,10 @@ static void playChime(){
 #define ID_OPEN_LOGS     207
 #define ID_MEM_CLEAN     208
 #define TIMER_ANIM       300
+// Posted by the updater to make the app exit for real. WM_CLOSE is not enough - it
+// hides to the tray when that setting is on, and the process has to actually go for the
+// file to be replaceable.
+#define WM_APP_QUIT_FOR_UPDATE (WM_APP+17)
 #define TIMER_SETT       301  // slower timer for settings refresh
 #define ID_TRAY_ICON     400
 #define ID_TRAY_SHOW     401
@@ -14027,6 +14031,10 @@ std::string githubGet(const char* path){
 // code, which is the half more likely to be correct.
 std::atomic<int>  g_updateProgress{-1};   // -1 idle, 0..100 downloading, 101 applying
 std::atomic<bool> g_updateFailed{false};
+// A line under the button describing the step in progress. The first version showed the
+// stage on the button alone, so once it read "Restarting..." and the restart did not
+// happen there was nothing left to say what had stalled.
+std::wstring g_updateStage;
 
 // Streams a URL to a file. Separate from githubGet because that accumulates into a
 // std::string, which is the wrong shape for a few hundred KB of binary.
@@ -14123,6 +14131,7 @@ static std::wstring latestAssetUrl(){
 static bool startSelfUpdate(){
     g_updateFailed=false;
     g_updateProgress=0;
+    g_updateStage=L"Finding the latest build...";
     std::wstring url=latestAssetUrl();
     if(url.empty()){ g_updateFailed=true; g_updateProgress=-1; return false; }
 
@@ -14131,12 +14140,14 @@ static bool startSelfUpdate(){
     std::wstring newPath=selfPath+L".new.exe";
     _wremove(newPath.c_str());
 
+    g_updateStage=L"Downloading";
     if(!downloadToFile(url.c_str(),newPath,&g_updateProgress)){
         g_updateFailed=true; g_updateProgress=-1;
         LOG_ERR(L"Update download failed");
         return false;
     }
     g_updateProgress=101;
+    g_updateStage=L"Verified. Closing so the file can be replaced...";
 
     // Hand over. The new build waits for this pid, replaces the original and starts it.
     wchar_t args[MAX_PATH*2];
@@ -14154,9 +14165,19 @@ static bool startSelfUpdate(){
     }
     if(sei.hProcess) CloseHandle(sei.hProcess);
     LOG_OK(L"Update downloaded - restarting");
-    appRunning=false;
-    PostQuitMessage(0);
-    if(hwndMain&&IsWindow(hwndMain)) DestroyWindow(hwndMain);
+    // Asked to close through its own window, from whichever thread this happens to be.
+    // The first attempt called PostQuitMessage and DestroyWindow directly, and this runs
+    // on a worker thread, so neither did anything: PostQuitMessage posts WM_QUIT to the
+    // CALLING thread's queue, which has no message loop, and DestroyWindow refuses
+    // outright on a window owned by another thread. The app therefore never exited, the
+    // updater sat waiting for a process that was not going anywhere, and the file it was
+    // trying to replace stayed locked - which is exactly what "it downloads and then
+    // nothing happens" looked like.
+    //
+    // PostMessage is the cross-thread way to say this, and the UI thread then shuts down
+    // through its normal path.
+    if(hwndMain && IsWindow(hwndMain)) PostMessage(hwndMain,WM_APP_QUIT_FOR_UPDATE,0,0);
+    else { appRunning=false; }
     return true;
 }
 
@@ -17665,11 +17686,20 @@ static void drawLockOverlay(HDC hdc,int W,int H){
         if(g_lockKind==LOCK_UPDATE){
             if(g_updateFailed.load())      lbl=L"Download failed - opening the page";
             else if(up>=0 && up<=100){ wchar_t b[48]; swprintf(b,48,L"Downloading  %d%%",up); lbl=b; }
-            else if(up==101)               lbl=L"Restarting...";
+            else if(up==101)               lbl=L"Closing to swap the file...";
+            else if(up==102)               lbl=L"Restarting...";
         }
         drawText(hdc,lbl.c_str(),ll.btnRect.left,ll.btnRect.top,
             ll.btnRect.right-ll.btnRect.left,ll.btnRect.bottom-ll.btnRect.top,
             RGB(255,255,255),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        // The step in words, under the button. An update is several things happening in
+        // sequence and any of them can be the one that stalls; a percentage alone cannot
+        // say which.
+        if(g_lockKind==LOCK_UPDATE && !g_updateStage.empty()){
+            drawText(hdc,g_updateStage.c_str(),ll.btnRect.left-40,ll.btnRect.bottom+8,
+                (ll.btnRect.right-ll.btnRect.left)+80,16,T.subtext,hFontSmall,
+                DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+        }
     }
     if(!g_lockFooter.empty()){
         drawText(hdc,g_lockFooter.c_str(),ll.footerRect.left,ll.footerRect.top,
@@ -21003,6 +21033,25 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         mm->ptMaxTrackSize.y=appH();
         break;
     }
+    case WM_APP_QUIT_FOR_UPDATE:
+        // Always exits, whatever the tray setting says. WM_CLOSE would have been the
+        // obvious thing to post, but with "minimise to tray" on it hides the window and
+        // leaves the process alive - and a live process still owns the file the updater
+        // is trying to replace.
+        //
+        // Then ExitProcess rather than the normal teardown. Destroying the window let the
+        // message loop end but the process stayed up: GdiplusShutdown blocks while the
+        // detached worker threads are still holding GDI+ objects, so the file never
+        // unlocked and the updater gave up waiting. Nothing here is worth waiting for -
+        // settings are written just above, and the executable is about to be replaced.
+        saveSettings();
+        profilesSave();
+        advSaveAll();
+        hideTrayIcon();
+        timeEndPeriod(1);
+        appRunning=false; macroRunning=false;
+        ExitProcess(0);
+        return 0;
     case WM_CLOSE:
         if(minimiseToTray){
             ShowWindow(hwnd, SW_HIDE);   // icon is already there, nothing to add
