@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.2.6"
+#define APP_VERSION      L"v3.2.7"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13024,6 +13024,13 @@ static void playChime(){
 // file to be replaceable.
 #define WM_APP_QUIT_FOR_UPDATE (WM_APP+17)
 #define TIMER_SETT       301  // slower timer for settings refresh
+// Posted by renderThread instead of relying on a timer. WM_TIMER is only synthesised
+// when the queue has nothing else in it and no paint is pending, so a window that is
+// always dirty - which is exactly what a vblank-paced starfield makes it - never
+// receives one. Measured: the dock spring advanced on 1 painted frame in 100, because
+// the tick that advances it was not arriving at all. A posted message is an ordinary
+// queued message and cannot be starved this way.
+#define WM_APP_TICK      (WM_APP+18)
 #define ID_TRAY_ICON     400
 #define ID_TRAY_SHOW     401
 #define ID_TRAY_EXIT     402
@@ -18058,10 +18065,123 @@ drawTipIcon(hdc,p+14+64,y+9,ID_TIP_PROFILES,T.subtext);
 // - 54fps against 82 - because a paint that finishes just after a flush returns has to
 // sit out the next one. WM_PAINT already coalesces, so a repaint request arriving while
 // one is in flight costs nothing, and the frames were already evenly spaced without it.
+// Every spring, fade and hover in the window, advanced one step. This used to live in
+// the WM_TIMER handler, which was fine while the timer was also what triggered the
+// repaint: state and frame moved together. Once frames came from the display's vblank
+// instead, the two rates no longer matched - the window drew at 165Hz while the dock
+// bar only moved 64 times a second, so each position of it was held for two or three
+// frames. That is what made the tab dock and the Basic/Advanced switch look stepped
+// after the frame pacing changed.
+//
+// Called from paintMain, so state advances exactly once per frame actually drawn, and
+// still from the timer, because on themes without the starfield the timer is what
+// decides whether anything needs repainting at all - and it reads these values to
+// decide. Everything here is delta-timed, so being called from two places changes the
+// step size and not the speed.
+static void advanceAnimations(HWND hwnd){
+    updateAnimTick(); // must run before any animateTo this frame
+
+    // Mode and running state - smooth transitions
+    animateTo(animModeHold,(float)holdMode.load(),0.07f); // ~70ms half-life
+    animateTo(animRunning,(float)macroRunning.load(),0.07f);
+    animateTo(g_pressAnim,g_pressedId?1.0f:0.0f,g_pressedId?0.025f:0.06f); // fast in, softer out
+    if(g_newKeyIdx>=0){
+        animateTo(g_newKeyAnim,1.0f,0.075f);
+        if(g_newKeyAnim>0.995f){ g_newKeyIdx=-1; g_newKeyAnim=0.0f; } // done, stop tracking
+    }
+    // Tab dock indicator animation (smooth bar, instant content)
+    // Dock tab animation â€” fixed speed, always finishes in ~600ms
+    {
+        float tabTarget=(float)activeTab;
+        animateTo(tabAnim,tabTarget,0.10f); // still drives label crossfade
+        {   // Semi-implicit Euler: stable at this stiffness and trivially cheap.
+            static LARGE_INTEGER sfreq={}, slast={};
+            if(sfreq.QuadPart==0){ QueryPerformanceFrequency(&sfreq); QueryPerformanceCounter(&slast); }
+            LARGE_INTEGER snow; QueryPerformanceCounter(&snow);
+            float sdt=(float)((double)(snow.QuadPart-slast.QuadPart)/(double)sfreq.QuadPart);
+            slast=snow;
+            if(sdt<=0.0f||sdt>0.05f) sdt=1.0f/60.0f;
+            const float k=190.0f, damp=19.0f; // ~1 small overshoot, settles in ~250ms
+            float accel=(tabTarget-g_tabPos)*k - g_tabVel*damp;
+            g_tabVel+=accel*sdt;
+            g_tabPos+=g_tabVel*sdt;
+            if(fabsf(tabTarget-g_tabPos)<0.0008f&&fabsf(g_tabVel)<0.01f){ g_tabPos=tabTarget; g_tabVel=0.0f; }
+            // Same spring, same constants, for the Basic/Advanced switch.
+            float mTarget=g_advancedMode?1.0f:0.0f;
+            float mAccel=(mTarget-g_modeSwitchPos)*k - g_modeSwitchVel*damp;
+            g_modeSwitchVel+=mAccel*sdt;
+            g_modeSwitchPos+=g_modeSwitchVel*sdt;
+            if(fabsf(mTarget-g_modeSwitchPos)<0.0008f&&fabsf(g_modeSwitchVel)<0.01f){ g_modeSwitchPos=mTarget; g_modeSwitchVel=0.0f; }
+            else if(activeTab==0) InvalidateRect(hwnd,NULL,FALSE);
+        }
+    }
+
+    // Hover states - fast ease out
+    int curHov=(int)(INT_PTR)hwndHovered;
+    for(int i=0;i<16;i++){
+        float tgt=(hoverBtnId[i]!=0&&hoverBtnId[i]==curHov)?1.0f:0.0f;
+        animateTo(hoverBtn[i],tgt,tgt>0.5f?0.05f:0.09f);
+    }
+
+    // Status dot pulse - blended with animRunning so it fades in/out smoothly
+    DWORD now=GetTickCount();
+    float pulse=0.55f+0.45f*(float)sin((double)now/400.0);
+    animMacroStatus=pulse*animRunning; // fade in/out with running state
+
+    // Window fade-in animation (delta-time)
+    animateTo(fadeAlpha,1.0f,0.08f);
+    animateTo(settFadeAlpha,1.0f,0.08f);
+}
+
+// One outstanding tick at a time. Posting unconditionally would queue them faster than
+// the pump drains them, which is the same starvation from the other direction.
+std::atomic<bool> g_tickPending{false};
+
+// Everything that has to keep happening whether or not anything is being drawn.
+// Reached from the posted tick, because WM_TIMER cannot be relied on while the
+// starfield keeps the window permanently dirty, and still from TIMER_SETT for the
+// case where it does fire.
+static void housekeepTick(HWND hwnd){
+    // The anti-debug sweep used to ride the animation timer and died with it.
+    antiDebugTick();
+    if(activeTab==2){
+        InvalidateRect(hwnd,NULL,FALSE); // settings always needs refresh for cpu/ram
+    }
+    // Track cumulative usage time (fires every 500ms = 0.5min per 60 ticks)
+    static int tickCount=0;
+    tickCount++;
+    if(tickCount>=120){ // every 60 seconds
+        tickCount=0;
+        usageMinutes++;
+        if(usageMinutes%5==0) saveSettings(); // save every 5 mins
+        if(usageMinutes%5==0) std::thread(pruneOldLogs).detach(); // keep logs.txt to the last hour
+        // Show vouch prompt after 5-10 minutes cumulative use
+        if(!vouchPrompted && usageMinutes>=7){
+            vouchPrompted=true;
+            saveSettings();
+            showToast(L"Enjoying wrathic? Leave a vouch on Discord! \u2192 Click here",RGB(99,102,241));
+            // Toast click will open discord - handled in WM_LBUTTONDOWN toast area
+        }
+    }
+}
+
+
 static void renderThread(HWND hwnd){
     int idle=0;
+    DWORD lastTick=GetTickCount();
     while(appRunning.load()){
         if(!hwnd||!IsWindow(hwnd)) break;
+
+        // Housekeeping - the anti-debug sweep, usage time, the settings readout. All of
+        // it used to hang off WM_TIMER and all of it stopped when the timer did. Checked
+        // before the minimise early-out because none of it depends on anything being
+        // drawn.
+        DWORD nowT=GetTickCount();
+        if(nowT-lastTick>=500){
+            lastTick=nowT;
+            if(!g_tickPending.exchange(true)) PostMessage(hwnd,WM_APP_TICK,0,0);
+            else g_tickPending=true;
+        }
         // Nothing on screen to animate: no vblank wait, just idle cheaply.
         if(IsIconic(hwnd)||themeIdx!=5){ Sleep(60); continue; }
 
@@ -18085,6 +18205,9 @@ void paintMain(HWND hwnd){
     g_cardDrawIndex=0;
     g_cardAnimActive=false;
     g_tipSpotCount=0;   // ? icons re-record themselves as they draw
+    // Before anything is measured or drawn, so the frame shows current values rather
+    // than whatever the last timer tick left behind.
+    advanceAnimations(hwnd);
     PAINTSTRUCT ps;HDC hdc_real=BeginPaint(hwnd,&ps);
     RECT cr;GetClientRect(hwnd,&cr);int W=cr.right,H=cr.bottom;
     if(!s_mainBufDC||W!=s_mainBufW||H!=s_mainBufH){
@@ -20003,6 +20126,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PAINT:
         // Uncomment to debug paint frequency: LOG_INFO(L"WM_PAINT");
         paintMain(hwnd);return 0;
+    case WM_APP_TICK:
+        // The reliable half-second heartbeat. Posted by renderThread, which is not
+        // at the mercy of the message queue being empty.
+        g_tickPending=false;
+        housekeepTick(hwnd);
+        return 0;
     case WM_TIMER:
         if(wp==20){
             KillTimer(hwnd,20);
@@ -20011,28 +20140,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             InvalidateRect(hwnd,NULL,FALSE);
             break;
         }
-        if(wp==TIMER_SETT){
-            if(activeTab==2){
-                InvalidateRect(hwnd,NULL,FALSE); // settings always needs refresh for cpu/ram
-            }
-            // Track cumulative usage time (fires every 500ms = 0.5min per 60 ticks)
-            static int tickCount=0;
-            tickCount++;
-            if(tickCount>=120){ // every 60 seconds
-                tickCount=0;
-                usageMinutes++;
-                if(usageMinutes%5==0) saveSettings(); // save every 5 mins
-                if(usageMinutes%5==0) std::thread(pruneOldLogs).detach(); // keep logs.txt to the last hour
-                // Show vouch prompt after 5-10 minutes cumulative use
-                if(!vouchPrompted && usageMinutes>=7){
-                    vouchPrompted=true;
-                    saveSettings();
-                    showToast(L"Enjoying wrathic? Leave a vouch on Discord! \u2192 Click here",RGB(99,102,241));
-                    // Toast click will open discord - handled in WM_LBUTTONDOWN toast area
-                }
-            }
-            break;
-        }
+        if(wp==TIMER_SETT){ housekeepTick(hwnd); break; }
         if(wp==TIMER_ANIM){
             static int frameCount=0;
             frameCount++;
@@ -20041,64 +20149,8 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             // IsIconic, but everything above it still ran 62x a second - measured at
             // 19% of a core with the window in the tray. Only the anti-debug sweep
             // still needs a heartbeat.
-            if(IsIconic(hwnd)){
-                if(frameCount%60==0) antiDebugTick();
-                break;
-            }
-            updateAnimTick(); // must run before any animateTo this frame
-            // Anti-debug check every 60 frames (~1s) not every frame
-            if(frameCount%60==0) antiDebugTick();
-
-            // Mode and running state - smooth transitions
-            animateTo(animModeHold,(float)holdMode.load(),0.07f); // ~70ms half-life
-            animateTo(animRunning,(float)macroRunning.load(),0.07f);
-            animateTo(g_pressAnim,g_pressedId?1.0f:0.0f,g_pressedId?0.025f:0.06f); // fast in, softer out
-            if(g_newKeyIdx>=0){
-                animateTo(g_newKeyAnim,1.0f,0.075f);
-                if(g_newKeyAnim>0.995f){ g_newKeyIdx=-1; g_newKeyAnim=0.0f; } // done, stop tracking
-            }
-            // Tab dock indicator animation (smooth bar, instant content)
-            // Dock tab animation â€” fixed speed, always finishes in ~600ms
-            {
-                float tabTarget=(float)activeTab;
-                animateTo(tabAnim,tabTarget,0.10f); // still drives label crossfade
-                {   // Semi-implicit Euler: stable at this stiffness and trivially cheap.
-                    static LARGE_INTEGER sfreq={}, slast={};
-                    if(sfreq.QuadPart==0){ QueryPerformanceFrequency(&sfreq); QueryPerformanceCounter(&slast); }
-                    LARGE_INTEGER snow; QueryPerformanceCounter(&snow);
-                    float sdt=(float)((double)(snow.QuadPart-slast.QuadPart)/(double)sfreq.QuadPart);
-                    slast=snow;
-                    if(sdt<=0.0f||sdt>0.05f) sdt=1.0f/60.0f;
-                    const float k=190.0f, damp=19.0f; // ~1 small overshoot, settles in ~250ms
-                    float accel=(tabTarget-g_tabPos)*k - g_tabVel*damp;
-                    g_tabVel+=accel*sdt;
-                    g_tabPos+=g_tabVel*sdt;
-                    if(fabsf(tabTarget-g_tabPos)<0.0008f&&fabsf(g_tabVel)<0.01f){ g_tabPos=tabTarget; g_tabVel=0.0f; }
-                    // Same spring, same constants, for the Basic/Advanced switch.
-                    float mTarget=g_advancedMode?1.0f:0.0f;
-                    float mAccel=(mTarget-g_modeSwitchPos)*k - g_modeSwitchVel*damp;
-                    g_modeSwitchVel+=mAccel*sdt;
-                    g_modeSwitchPos+=g_modeSwitchVel*sdt;
-                    if(fabsf(mTarget-g_modeSwitchPos)<0.0008f&&fabsf(g_modeSwitchVel)<0.01f){ g_modeSwitchPos=mTarget; g_modeSwitchVel=0.0f; }
-                    else if(activeTab==0) InvalidateRect(hwnd,NULL,FALSE);
-                }
-            }
-
-            // Hover states - fast ease out
-            int curHov=(int)(INT_PTR)hwndHovered;
-            for(int i=0;i<16;i++){
-                float tgt=(hoverBtnId[i]!=0&&hoverBtnId[i]==curHov)?1.0f:0.0f;
-                animateTo(hoverBtn[i],tgt,tgt>0.5f?0.05f:0.09f);
-            }
-
-            // Status dot pulse - blended with animRunning so it fades in/out smoothly
-            DWORD now=GetTickCount();
-            float pulse=0.55f+0.45f*(float)sin((double)now/400.0);
-            animMacroStatus=pulse*animRunning; // fade in/out with running state
-
-            // Window fade-in animation (delta-time)
-            animateTo(fadeAlpha,1.0f,0.08f);
-            animateTo(settFadeAlpha,1.0f,0.08f);
+            if(IsIconic(hwnd)) break;   // housekeepTick keeps the anti-debug heartbeat
+            advanceAnimations(hwnd);
 
             // Void stars: animate continuously, but this branch used to bypass both
             // the minimise check and the Roblox throttle below - so on the default
@@ -20477,8 +20529,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 // tab you left, or past its end entirely.
                 if(idx!=activeTab) mainScrollPos=0;
                 activeTab=idx;
-                if(idx==2){ settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; SetTimer(hwnd,TIMER_SETT,500,NULL); }
-                else KillTimer(hwnd,TIMER_SETT);
+                if(idx==2){ settScrollPos=0; settFadeAlpha=0.0f; g_kpsEditing=false; }
+                // TIMER_SETT is gone. It was started here and killed on leaving, which
+                // also meant usage time only accrued while the settings tab happened to
+                // be open - the vouch prompt waited on minutes that mostly never
+                // counted. renderThread posts the same tick every half second no matter
+                // which tab is showing.
                 InvalidateRect(hwnd,NULL,FALSE);
                 return 0;
             }
