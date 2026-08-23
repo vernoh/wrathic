@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.2.5"
+#define APP_VERSION      L"v3.2.6"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -512,6 +512,11 @@ void updateVoidStars(){
 void drawVoidStars(HDC hdc,int W,int H){
     if(W<=0||H<=0) return;
     if(!zStarsInit) initVoidStars();
+    // Advanced here rather than by whoever scheduled the repaint. The two were separate
+    // calls, so a frame that got dropped still advanced the field and a frame drawn
+    // twice did not - which is the uneven motion that reads as stutter no matter how
+    // high the frame rate is. One step per drawn frame, delta-timed, always.
+    updateVoidStars();
     if(!s_skyDC||W!=s_skyW||H!=s_skyH) buildSky(hdc,W,H);
     if(!s_skyBase){ return; }
 
@@ -15442,6 +15447,11 @@ std::atomic<bool> g_trigAvgValid{false};
 // Whether the whole screen is actually being watched, or only the centre. The two
 // behave differently enough that the UI has to say which one is running.
 std::atomic<bool> g_trigWholeScreen{false};
+// How much of the screen the chosen colour covers. A ball is a small object; if the
+// colour is matching thousands of samples it is not the ball, it is the UI - a menu
+// button, a health bar, the lobby background - and the triggerbot will fire on sight of
+// it and never stop. Published so the tab can say so before it costs someone a round.
+std::atomic<int> g_trigSampleTotal{0};
 // How many matching pixels count as a target, in the downscaled capture, and how long
 // a tap is held for.
 #define TB_MIN_MATCH   14
@@ -15580,6 +15590,7 @@ static DWORD WINAPI triggerbotThread(LPVOID){
             }
             hit = matches>=TB_MIN_MATCH;
             g_trigMatches=matches;
+            g_trigSampleTotal=(ph/TB_STRIDE)*(pw/TB_STRIDE);
             g_trigDomR=bR; g_trigDomG=bG; g_trigDomB=bB;
             // The average of what the tolerance is currently letting through. Widening
             // the tolerance drags this away from the target, which is the only way to
@@ -17112,10 +17123,9 @@ static void freeSplashResources(){
 LRESULT CALLBACK SplashProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_TIMER:
-        // Always step the field. Gating this on the changelog froze the background
-        // the moment that screen appeared, which is what made the animation visibly
-        // stop and restart around the transitions.
-        updateVoidStars();
+        // The step happens inside drawVoidStars now, once per frame actually drawn, so
+        // stepping here as well would advance the field twice on every splash frame and
+        // make it drift at double speed before the app opens.
         InvalidateRect(hwnd,NULL,FALSE); return 0;
     case WM_CREATE: SetTimer(hwnd,1,8,NULL); return 0; // 120fps - the splash is the first thing anyone sees
     case WM_DESTROY: KillTimer(hwnd,1); freeSplashResources(); return 0;
@@ -18033,6 +18043,42 @@ drawTipIcon(hdc,p+14+64,y+9,ID_TIP_PROFILES,T.subtext);
 }
 }
 
+// Frames used to be scheduled by SetTimer, and SetTimer is quantised to the system
+// tick - so a window asking for 8ms got frames roughly 15.6 or 31.2ms apart, alternating
+// between the two. Delta-timed animation hides a low frame rate but not an uneven one:
+// the field visibly surged and stalled, which is what "laggy stars" was describing. The
+// paint itself was never the problem; it measured 8.9ms against 31ms of wall clock.
+//
+// DwmFlush returns at the compositor's next vertical blank, so this loop runs at exactly
+// the monitor's refresh rate with evenly spaced frames, and the app draws in step with
+// what the screen is actually doing rather than against a timer that knows nothing
+// about it.
+// Tried and rejected: a "wait for the previous frame to finish before asking for the
+// next" gate. It sounds right, but measured it cost a whole vblank of latency per frame
+// - 54fps against 82 - because a paint that finishes just after a flush returns has to
+// sit out the next one. WM_PAINT already coalesces, so a repaint request arriving while
+// one is in flight costs nothing, and the frames were already evenly spaced without it.
+static void renderThread(HWND hwnd){
+    int idle=0;
+    while(appRunning.load()){
+        if(!hwnd||!IsWindow(hwnd)) break;
+        // Nothing on screen to animate: no vblank wait, just idle cheaply.
+        if(IsIconic(hwnd)||themeIdx!=5){ Sleep(60); continue; }
+
+        // The game gets priority over the decoration. Unfocused the field still moves -
+        // it is on screen and being looked at - but there is no case for full rate on a
+        // window nobody is using.
+        int every = (GetForegroundWindow()==hwnd) ? 1 : 2;
+        if(robloxFocused.load()) every = macroRunning.load() ? 12 : 6;
+
+        // Falls back to a plain sleep if the compositor is off, which on Win10/11 means
+        // something has gone wrong rather than a supported configuration.
+        if(FAILED(DwmFlush())) Sleep(8);
+
+        if((++idle % every)==0) InvalidateRect(hwnd,NULL,FALSE);
+    }
+}
+
 void paintMain(HWND hwnd){
     // Per-frame card state: draw order keys the hover slots, and the flag is
     // re-derived each frame by drawCard rather than latching on forever.
@@ -18543,7 +18589,7 @@ void paintMain(HWND hwnd){
                  hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         g_tbLay.yKey=ty; ty+=76;
 
-        drawCard(hdc,p,ty,cw,120);
+        drawCard(hdc,p,ty,cw,146);
         drawText(hdc,L"TARGET COLOUR",p+16,ty+10,200,12,T.subtext,hFontSmall);
         // Two halves. The top is the colour that was asked for; the bottom is the mean
         // of what the current tolerance is actually letting through, so widening the
@@ -18581,7 +18627,30 @@ void paintMain(HWND hwnd){
             }
             g_tbLay.hueX=hx; g_tbLay.hueY=hy; g_tbLay.hueW=hw2; g_tbLay.hueH=hh;
         }
-        g_tbLay.yColour=ty; ty+=130;
+        // A colour is only useful here if the ball is the only thing wearing it. Pick the
+        // white of a Blade Ball menu button and the scanner will find it in the lobby, in
+        // the shop, in the killfeed - and fire at all of them. The user cannot see that
+        // from a hex code, so it is measured and said out loud: how much of the screen
+        // the colour currently covers, and whether it is too washed out to match at all.
+        {   int r0=trigR.load(), g0=trigG.load(), b0=trigB.load();
+            int mx=(r0>g0?(r0>b0?r0:b0):(g0>b0?g0:b0));
+            int mn=(r0<g0?(r0<b0?r0:b0):(g0<b0?g0:b0));
+            int tot=g_trigSampleTotal.load(), mt=g_trigMatches.load();
+            wchar_t wbuf[128]; const wchar_t* warn=NULL; COLORREF wc=T.red;
+            if(mx-mn<45){
+                // The scanner rejects near-greys outright, so this colour can never hit.
+                warn=L"Too washed out - the scanner skips greys. Pick a vivid colour.";
+            } else if(tot>0 && mt*100 > tot*4){
+                swprintf(wbuf,128,L"This colour is on ~%d%% of the screen - it will fire on menus too.",
+                         (mt*100)/(tot>0?tot:1));
+                warn=wbuf;
+            } else if(tot>0 && mt>0){
+                warn=L"Looks unique on screen."; wc=T.green;
+            }
+            if(warn) drawText(hdc,warn,p+16,ty+112,cw-32,16,wc,hFontSmall,
+                              DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+        }
+        g_tbLay.yColour=ty; ty+=156;
 
         g_tbLay.yTune=-10000; g_tbLay.tolW=0;
 
@@ -18810,9 +18879,11 @@ void paintSettingsInto(HDC hdc,int W,int H){
 
 
 
-    // Background
-    fillRect(hdc,0,0,W,H,T.bg);
-    if(themeIdx==5) drawVoidStars(hdc,W,H);
+    // No background here. paintMain has already filled it and drawn the starfield into
+    // the same buffer before calling this, so doing it again composed and blitted the
+    // whole field a second time every frame - and the second pass overwrote the first,
+    // making the first pure waste. That is why the settings tab ran at half the frame
+    // rate of every other page.
 
     int sfadeY=0; // no position offset - keeps click areas aligned with painted positions
     int y=l.yRes;
@@ -20072,13 +20143,13 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     // merely visible, because nobody is studying the background of a
                     // window they are not using, and the drift is under a pixel a frame
                     // either way.
-                    static int voidSkip=0;
-                    int every = (GetForegroundWindow()==hwnd) ? 1 : 2;
-                    if(robloxFocused.load()) every = macroRunning.load() ? 12 : 6;
-                    if((++voidSkip % every)==0){
-                        updateVoidStars();
-                        InvalidateRect(hwnd,NULL,FALSE);
-                    }
+                    // Nothing here any more. The starfield is driven by renderThread,
+                    // which waits on the display's vertical blank instead of on a
+                    // WM_TIMER. Everything above about tick rates was solving the wrong
+                    // problem: measured, a frame cost 8.9ms to paint but frames arrived
+                    // 31ms apart, so the cost was never the bottleneck - the schedule
+                    // was. SetTimer rounds to the system tick, and no amount of asking
+                    // for 8ms made WM_TIMER arrive every 8ms.
                 }
             } else {
                 // Only repaint if something is actually animating
@@ -21110,7 +21181,10 @@ int maxS5=std::max(0,(int)contentH5-(int)cr5.bottom);
         }
         return 0;
     case WM_DESTROY:
-        saveSettings();KillTimer(hwnd,TIMER_ANIM);timeEndPeriod(1);
+        // profilesSave and advSaveAll belong here too. Only the update path called them,
+        // so closing the app the ordinary way quietly discarded any profile or advanced
+        // macro edited since the last time something else happened to flush them.
+        saveSettings();profilesSave();advSaveAll();KillTimer(hwnd,TIMER_ANIM);timeEndPeriod(1);
         hideTrayIcon();
         freeMainBackbuffer();
         appRunning=false;macroRunning=false;
@@ -21207,8 +21281,8 @@ LRESULT CALLBACK LicenseProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_TIMER:
         // The background drifts here exactly as it does in the app, so the two do not
-        // feel like different programs stitched together.
-        if(themeIdx==5) updateVoidStars();
+        // feel like different programs stitched together. Stepped by the draw, same as
+        // everywhere else.
         animateTo(g_licBtnHover,g_licHovering?1.0f:0.0f,0.08f);
         InvalidateRect(hwnd,NULL,FALSE);
         return 0;
@@ -21540,7 +21614,10 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     //
     // The animations themselves are delta-timed, so nothing moves faster - it moves in
     // twice as many, half as large steps, which is the whole of the difference.
+    // Still 8ms, but it now only advances animation state - hovers, springs, fades.
+    // Repaints for the starfield come from renderThread instead.
     SetTimer(hwnd,TIMER_ANIM,8,NULL);
+    std::thread(renderThread,hwnd).detach();
 
     spawnOverlay(); // Spawn if either enabled
     // Discord RPC persistent background thread
@@ -21634,9 +21711,26 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
     MSG msg;
     while(GetMessage(&msg,NULL,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}
 
+    // Closing the window is not the same as the process ending, and this is where the
+    // difference used to bite. GdiplusShutdown blocks until nothing is using GDI+, and
+    // the worker threads here are detached - the click engine, the focus watcher, the
+    // resource monitor, the triggerbot - so if any of them is mid-frame it never
+    // returns. The window vanishes, the process stays, and because a live process still
+    // holds the single-instance mutex, launching wrathic again does nothing at all.
+    //
+    // The threads are asked to stop and given a moment to notice. Whether they all did
+    // or not, the process then exits: the only thing worth finishing is writing settings
+    // to disk, and that happened in WM_DESTROY before this line was reached.
+    appRunning=false; macroRunning=false;
     stopMacroEngine();
+    stopTriggerbotEngine();
+    { // The longest sleep any worker sits in is 500ms, so this covers a full cycle.
+      DWORD until=GetTickCount()+700;
+      while((int)(until-GetTickCount())>0) Sleep(20); }
     DeleteCriticalSection(&keyListCS);
     if(gInputBufCSInit) DeleteCriticalSection(&gInputBufCS);
-    if(gdiplusToken) Gdiplus::GdiplusShutdown(gdiplusToken);
+    // Deliberately not GdiplusShutdown. Windows reclaims every handle at process exit,
+    // so it buys nothing here and is the one call that can hang forever.
+    ExitProcess(0);
     return 0;
 }
