@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.2.2"
+#define APP_VERSION      L"v3.2.3"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13715,9 +13715,9 @@ bool checkVersionBlocking(){
     wchar_t sub[160];
     swprintf(sub,160,L"You're running %ls \u2014 the latest version is %ls",APP_VERSION,wver);
     g_lockSubtitle=sub;
-    g_lockButtonText=L"Get the Latest Version";
-    g_lockRedirectUrl=UPDATE_DOWNLOAD_URL;
-    g_lockFooter=L"wrathic will unlock automatically once updated";
+    g_lockButtonText=L"Update now";
+    g_lockRedirectUrl=UPDATE_DOWNLOAD_URL;   // the fallback, if the download fails
+    g_lockFooter=L"Downloads and restarts itself - nothing to save or install";
     if(hwndOverlay&&IsWindow(hwndOverlay)){DestroyWindow(hwndOverlay);hwndOverlay=NULL;}
     return false;
 }
@@ -14013,6 +14013,183 @@ std::string githubGet(const char* path){
     while(InternetReadFile(hR,buf,sizeof(buf)-1,&rd)&&rd>0){buf[rd]=0;resp+=buf;rd=0;}
     InternetCloseHandle(hR);InternetCloseHandle(hC);InternetCloseHandle(hN);
     return resp;
+}
+
+// ===================== AUTO-UPDATE: APPLYING IT =====================
+// Updating meant opening a browser, finding the download, saving it over the old file
+// and starting it again - four steps to fix a lockout the app imposed on you. It does
+// it itself now.
+//
+// No installer and no helper script. A running .exe cannot be overwritten, so the NEW
+// build does the replacing: it is downloaded beside the current one, launched with
+// --apply-update, and that copy waits for this process to exit, copies itself over the
+// original, starts it and removes itself. The updater is therefore always the newer
+// code, which is the half more likely to be correct.
+std::atomic<int>  g_updateProgress{-1};   // -1 idle, 0..100 downloading, 101 applying
+std::atomic<bool> g_updateFailed{false};
+
+// Streams a URL to a file. Separate from githubGet because that accumulates into a
+// std::string, which is the wrong shape for a few hundred KB of binary.
+static bool downloadToFile(const wchar_t* url,const std::wstring& dest,std::atomic<int>* prog){
+    HINTERNET hN=InternetOpenW(L"wrathic/1.0",INTERNET_OPEN_TYPE_DIRECT,NULL,NULL,0);
+    if(!hN) return false;
+    // GitHub answers an asset URL with a redirect to its object store. WinINet follows
+    // those unless told not to - there is no FOLLOW_REDIRECTS flag, only
+    // NO_AUTO_REDIRECT, so the default is what is wanted here.
+    HINTERNET hU=InternetOpenUrlW(hN,url,NULL,0,
+        INTERNET_FLAG_RELOAD|INTERNET_FLAG_NO_CACHE_WRITE|INTERNET_FLAG_SECURE,0);
+    if(!hU){ InternetCloseHandle(hN); return false; }
+
+    DWORD status=0,len=sizeof(status),idx=0;
+    HttpQueryInfoW(hU,HTTP_QUERY_STATUS_CODE|HTTP_QUERY_FLAG_NUMBER,&status,&len,&idx);
+    if(status && status!=200){ InternetCloseHandle(hU); InternetCloseHandle(hN); return false; }
+
+    DWORD total=0; len=sizeof(total); idx=0;
+    HttpQueryInfoW(hU,HTTP_QUERY_CONTENT_LENGTH|HTTP_QUERY_FLAG_NUMBER,&total,&len,&idx);
+
+    FILE* f=_wfopen(dest.c_str(),L"wb");
+    if(!f){ InternetCloseHandle(hU); InternetCloseHandle(hN); return false; }
+    char buf[16384]; DWORD rd=0, got=0;
+    bool ok=true;
+    while(InternetReadFile(hU,buf,sizeof(buf),&rd) && rd>0){
+        if(fwrite(buf,1,rd,f)!=rd){ ok=false; break; }
+        got+=rd;
+        if(prog && total>0) prog->store((int)std::min(100.0,(double)got*100.0/(double)total));
+        rd=0;
+    }
+    fclose(f);
+    InternetCloseHandle(hU); InternetCloseHandle(hN);
+    if(!ok || got==0){ _wremove(dest.c_str()); return false; }
+
+    // It has to be a Windows executable. A truncated download or an error page saved
+    // under this name would otherwise be copied over a working install.
+    FILE* v=_wfopen(dest.c_str(),L"rb");
+    if(!v) return false;
+    char mz[2]={}; size_t n=fread(mz,1,2,v);
+    fseek(v,0,SEEK_END); long sz=ftell(v);
+    fclose(v);
+    if(n!=2 || mz[0]!='M' || mz[1]!='Z' || sz<64*1024){ _wremove(dest.c_str()); return false; }
+    return true;
+}
+
+// Reads a JSON string field starting at or after `from`, tolerating whitespace between
+// the key, the colon and the value. The parsers elsewhere in this file count fixed
+// offsets instead, which works on Supabase because it answers in compact JSON - GitHub
+// pretty-prints, so `"name": "wrathic.exe"` has a space that a fixed offset walks
+// straight past. This is why the first version of the updater found no asset at all.
+static bool jsonField(const std::string& src,size_t from,const char* key,
+                      std::string& out,size_t* endOut){
+    std::string k=std::string("\"")+key+"\"";
+    size_t p=src.find(k,from);
+    if(p==std::string::npos) return false;
+    p+=k.size();
+    while(p<src.size() && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
+    if(p>=src.size() || src[p]!=':') return false;
+    p++;
+    while(p<src.size() && (src[p]==' '||src[p]=='\t'||src[p]=='\n'||src[p]=='\r')) p++;
+    if(p>=src.size() || src[p]!='"') return false;
+    p++;
+    size_t e=src.find('"',p);
+    if(e==std::string::npos) return false;
+    out=src.substr(p,e-p);
+    if(endOut) *endOut=e;
+    return true;
+}
+
+// The asset URL for the current release, read from the same API the version check uses.
+static std::wstring latestAssetUrl(){
+    std::string resp=githubGet("/repos/vernoh/wrathic/releases/latest");
+    if(resp.empty()) return L"";
+    // Judged on the url itself rather than on the "name" beside it. Pairing them was
+    // the obvious approach and the wrong one: an asset's name field comes BEFORE its
+    // url in the response, so walking forwards paired the release's own title with the
+    // first asset's url and then skipped past the name that actually mattered. The
+    // download url ends in the filename anyway, which is the same information without
+    // depending on field order.
+    size_t pos=0;
+    for(int guard=0; guard<64; guard++){
+        std::string url; size_t ue=0;
+        if(!jsonField(resp,pos,"browser_download_url",url,&ue)) break;
+        if(url.size()>4 && _stricmp(url.c_str()+url.size()-4,".exe")==0 &&
+           url.rfind("https://",0)==0)
+            return std::wstring(url.begin(),url.end());
+        pos=ue;
+    }
+    return L"";
+}
+
+// Downloads the new build and hands over to it. Returns only on failure - on success
+// the process is on its way out.
+static bool startSelfUpdate(){
+    g_updateFailed=false;
+    g_updateProgress=0;
+    std::wstring url=latestAssetUrl();
+    if(url.empty()){ g_updateFailed=true; g_updateProgress=-1; return false; }
+
+    wchar_t self[MAX_PATH]={}; GetModuleFileNameW(NULL,self,MAX_PATH);
+    std::wstring selfPath=self;
+    std::wstring newPath=selfPath+L".new.exe";
+    _wremove(newPath.c_str());
+
+    if(!downloadToFile(url.c_str(),newPath,&g_updateProgress)){
+        g_updateFailed=true; g_updateProgress=-1;
+        LOG_ERR(L"Update download failed");
+        return false;
+    }
+    g_updateProgress=101;
+
+    // Hand over. The new build waits for this pid, replaces the original and starts it.
+    wchar_t args[MAX_PATH*2];
+    swprintf(args,MAX_PATH*2,L"--apply-update \"%s\" %lu",selfPath.c_str(),GetCurrentProcessId());
+    SHELLEXECUTEINFOW sei={sizeof(sei)};
+    sei.lpFile=newPath.c_str();
+    sei.lpParameters=args;
+    sei.nShow=SW_HIDE;
+    sei.fMask=SEE_MASK_NOCLOSEPROCESS;
+    if(!ShellExecuteExW(&sei)){
+        g_updateFailed=true; g_updateProgress=-1;
+        _wremove(newPath.c_str());
+        LOG_ERR(L"Could not start the updater");
+        return false;
+    }
+    if(sei.hProcess) CloseHandle(sei.hProcess);
+    LOG_OK(L"Update downloaded - restarting");
+    appRunning=false;
+    PostQuitMessage(0);
+    if(hwndMain&&IsWindow(hwndMain)) DestroyWindow(hwndMain);
+    return true;
+}
+
+// The other side of the handover, running as the freshly downloaded build.
+static int applyUpdate(const std::wstring& target,DWORD parentPid){
+    // Wait for the old process to let go of the file. Bounded: if it will not exit,
+    // replacing the exe underneath it is not something to force.
+    if(parentPid){
+        HANDLE h=OpenProcess(SYNCHRONIZE,FALSE,parentPid);
+        if(h){ WaitForSingleObject(h,15000); CloseHandle(h); }
+    }
+    wchar_t self[MAX_PATH]={}; GetModuleFileNameW(NULL,self,MAX_PATH);
+
+    // A few attempts: antivirus often holds a new .exe open for a moment after it runs.
+    bool ok=false;
+    for(int i=0;i<20 && !ok;i++){
+        if(CopyFileW(self,target.c_str(),FALSE)) ok=true; else Sleep(250);
+    }
+    if(ok){
+        SHELLEXECUTEINFOW sei={sizeof(sei)};
+        sei.lpFile=target.c_str();
+        sei.nShow=SW_SHOWNORMAL;
+        ShellExecuteExW(&sei);
+    } else {
+        // Could not replace it - most likely it lives somewhere that needs elevation.
+        // Leave the download in place and point at it rather than failing silently.
+        MessageBoxW(NULL,
+            L"wrathic downloaded the update but could not replace the running file.\n\n"
+            L"Move it out of a protected folder, or replace it by hand with the .new.exe "
+            L"sitting beside it.",
+            L"wrathic - update",MB_OK|MB_ICONWARNING);
+    }
+    return 0;
 }
 
 // ===================== LICENSE =====================
@@ -17481,7 +17658,16 @@ static void drawLockOverlay(HDC hdc,int W,int H){
         drawRR(hdc,ll.btnRect.left,ll.btnRect.top,
             ll.btnRect.right-ll.btnRect.left,ll.btnRect.bottom-ll.btnRect.top,
             12,T.red,0,0);
-        drawText(hdc,g_lockButtonText.c_str(),ll.btnRect.left,ll.btnRect.top,
+        // While an update is running the button reports it, so a download of a few
+        // hundred KB over a slow line does not look like a button that did nothing.
+        std::wstring lbl=g_lockButtonText;
+        int up=g_updateProgress.load();
+        if(g_lockKind==LOCK_UPDATE){
+            if(g_updateFailed.load())      lbl=L"Download failed - opening the page";
+            else if(up>=0 && up<=100){ wchar_t b[48]; swprintf(b,48,L"Downloading  %d%%",up); lbl=b; }
+            else if(up==101)               lbl=L"Restarting...";
+        }
+        drawText(hdc,lbl.c_str(),ll.btnRect.left,ll.btnRect.top,
             ll.btnRect.right-ll.btnRect.left,ll.btnRect.bottom-ll.btnRect.top,
             RGB(255,255,255),hFontMed,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
@@ -18421,6 +18607,8 @@ void paintMain(HWND hwnd){
     // meant to cover the whole window.
     drawAppHeader(hdc,W);
 
+    // Repaint while a download is running so the percentage on the button moves.
+    if(g_lockKind==LOCK_UPDATE && g_updateProgress.load()>=0) InvalidateRect(hwnd,NULL,FALSE);
     if(g_lockKind!=LOCK_NONE) drawLockOverlay(hdc,W,H);
     else if(g_optimiseConfirmOpen) drawOptimiseConfirm(hdc,W,H);
 
@@ -20173,7 +20361,24 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 RECT crL;GetClientRect(hwnd,&crL);
                 LockLayout ll=computeLockLayout(crL.right,crL.bottom);
                 if(mx>=ll.btnRect.left&&mx<=ll.btnRect.right&&my>=ll.btnRect.top&&my<=ll.btnRect.bottom){
-                    ShellExecuteW(NULL,L"open",g_lockRedirectUrl.c_str(),NULL,NULL,SW_SHOW);
+                    if(g_lockKind==LOCK_UPDATE){
+                        // Off the UI thread: this downloads a few hundred KB, and doing
+                        // it inline would freeze the window for the whole transfer.
+                        if(g_updateProgress.load()<0){
+                            playClick();
+                            std::thread([]{
+                                if(!startSelfUpdate()){
+                                    // Fell back to the browser rather than leaving them
+                                    // stuck behind a lock with a button that did nothing.
+                                    ShellExecuteW(NULL,L"open",UPDATE_DOWNLOAD_URL,NULL,NULL,SW_SHOW);
+                                }
+                                if(hwndMain&&IsWindow(hwndMain)) InvalidateRect(hwndMain,NULL,FALSE);
+                            }).detach();
+                            InvalidateRect(hwnd,NULL,FALSE);
+                        }
+                    } else {
+                        ShellExecuteW(NULL,L"open",g_lockRedirectUrl.c_str(),NULL,NULL,SW_SHOW);
+                    }
                 }
             }
             return 0;
@@ -21047,6 +21252,31 @@ bool showLicenseWindow(HINSTANCE hInst){
 
 // ===================== WINMAIN =====================
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR lpCmdLine,int nCmdShow){
+    // Running as the updater: replace the build that launched us, start it, and go.
+    // Checked before the single-instance mutex, because the process being replaced is
+    // still alive at this point and holds it - taking that path would exit immediately
+    // and the update would never be applied.
+    {
+        int argc=0; LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
+        if(argv){
+            for(int i=1;i<argc;i++){
+                if(_wcsicmp(argv[i],L"--apply-update")==0 && i+2<argc){
+                    std::wstring target=argv[i+1];
+                    DWORD pid=(DWORD)_wtoi(argv[i+2]);
+                    LocalFree(argv);
+                    return applyUpdate(target,pid);
+                }
+            }
+            LocalFree(argv);
+        }
+    }
+    // Clean up the download left beside us by a previous update. Harmless if absent,
+    // and it is the one file the old build could not delete - it was running from it.
+    {
+        wchar_t me[MAX_PATH]={}; GetModuleFileNameW(NULL,me,MAX_PATH);
+        std::wstring leftover=std::wstring(me)+L".new.exe";
+        _wremove(leftover.c_str());
+    }
     // One copy only. Two running at once means two macro engines racing on SendInput,
     // two tray icons, and two processes writing the same settings - the second one to
     // exit wins and the first one's changes vanish. Raise the existing window instead,
