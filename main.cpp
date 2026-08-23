@@ -20207,7 +20207,9 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // ── TRIGGERBOT TAB CLICKS ────────────────────────────────────────────
         if(activeTab==1 && !hasTriggerbot){
             RECT crU; GetClientRect(hwnd,&crU);
-            int pU=14, cwU=crU.right-pU*2;
+            // Same reason as the tab below it - the upsell card is drawn at l.pad.
+            Layout lU=getLayout(hwnd);
+            int pU=lU.pad, cwU=lU.cw;
             int mxU=GET_X_LPARAM(lp), myU=GET_Y_LPARAM(lp);
             if(mxU>=pU+16&&mxU<=pU+cwU-16&&myU>=g_tbLay.yEnable&&myU<=g_tbLay.yEnable+30){
                 playClick();
@@ -20217,7 +20219,13 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         }
         if(activeTab==1 && hasTriggerbot){
             RECT crT; GetClientRect(hwnd,&crT);
-            int pT=14, cwT=crT.right-pT*2;
+            // From the layout, not a hardcoded 14. The paint uses l.pad, which includes
+            // the width of the landscape rail; this did not, so in landscape every
+            // control on the tab was hit-tested 58px to the left of where it was drawn
+            // and the buttons near the left edge - the arm bind among them - could not
+            // be pressed at all.
+            Layout lT=getLayout(hwnd);
+            int pT=lT.pad, cwT=lT.cw;
             int mxT=GET_X_LPARAM(lp), myT=GET_Y_LPARAM(lp);
             if(myT < crT.bottom-dockBottom()){
                 bool handled=false;
