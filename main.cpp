@@ -53,7 +53,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.2.1"
+#define APP_VERSION      L"v3.2.2"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13419,7 +13419,8 @@ void loadSettings() {
     trigG         = (int)regGetDWORD(L"TrigG",0);
     trigB         = (int)regGetDWORD(L"TrigB",0);
     trigDelayMs   = std::max(0,std::min(500,(int)regGetDWORD(L"TrigDelay",0)));
-    trigHoldMode  = regGetDWORD(L"TrigHold",0)!=0;
+    trigHoldMode  = false;   // fixed; the stored TrigHold is ignored
+    trigArmHold   = true;    // fixed; see the declarations
     int hk=(int)regGetDWORD(L"HotkeyVK",VK_F8);
     hotkeyVK = hk ? hk : VK_F8;
     holdMode = regGetDWORD(L"HoldMode",0)!=0;
@@ -14616,17 +14617,12 @@ void hotkeyThread(){
         if(!capturingHotkey&&!capturingKey){
             bool focused=gameFocused.load();
             bool pressed=(GetAsyncKeyState(hotkeyVK.load())&0x8000)!=0;
-            // The arm bind. Tap toggles, hold arms only while held - and the eyedropper
-            // is served here too, since this is already the thread watching for keys.
+            // The arm bind is held: armed exactly while the key is down, never latched.
+            // The eyedropper is served here too, since this is already the thread
+            // watching for keys.
             {
                 int ak=trigArmKey.load();
-                if(ak){
-                    static bool armWas=false;
-                    bool ad=(GetAsyncKeyState(ak)&0x8000)!=0;
-                    if(trigArmHold.load()) g_trigArmed=ad;
-                    else if(ad && !armWas) g_trigArmed=!g_trigArmed.load();
-                    armWas=ad;
-                }
+                if(ak) g_trigArmed=(GetAsyncKeyState(ak)&0x8000)!=0;
                 if(g_trigPicking.load()){
                     // Wait for the button that started this to come back up before
                     // listening for the next press. Without that, the very click on
@@ -15217,12 +15213,22 @@ std::atomic<int>  trigTolerance{TRIG_TOLERANCE};
 // pass, and a ball is far more than 3px across.
 #define TB_STRIDE 3
 std::atomic<int>  trigDelayMs{0};             // optional reaction delay
-std::atomic<bool> trigHoldMode{false};        // hold while seen, vs a single tap
+// Fixed, not settings. The arm bind is held and the trigger key is tapped, and neither
+// combination anyone could pick instead was one they wanted:
+//
+//   arm on tap left the triggerbot running after you had stopped thinking about it,
+//   which is how it ends up firing during a menu or someone else's turn. Holding means
+//   it is live exactly as long as you are asking for it.
+//
+//   holding the trigger key parries once and then keeps the key down, so the next ball
+//   arrives with the input already held and nothing happens. One press per target is
+//   the only behaviour that works.
+std::atomic<bool> trigHoldMode{false};        // always false now - the key is tapped
 // The bind that arms it. Separate from trigKey, which is the key it presses - those
 // were conflated before, so the only way to arm the triggerbot was a toggle in the UI
 // and you could not start it without alt-tabbing out of the game.
 std::atomic<int>  trigArmKey{0};              // 0 = unbound, arm from the UI only
-std::atomic<bool> trigArmHold{false};         // hold to keep it armed, vs tap to toggle
+std::atomic<bool> trigArmHold{true};          // always true now - the bind is held
 std::atomic<bool> g_trigArmed{false};         // what the bind actually says right now
 // Eyedropper: set from the UI, cleared once a colour has been taken.
 std::atomic<bool> g_trigPicking{false};
@@ -16461,7 +16467,7 @@ static void profileApply(const Profile& p){
     // Loading a profile still does not arm the triggerbot. The two can run together
     // now, but having a profile switch one on behind the user's back is the sort of
     // surprise that costs someone a match.
-    trigHoldMode=p.tbHold; trigKey=p.tbKey;
+    trigKey=p.tbKey;   // tbHold is ignored - hold/tap are no longer choices
     trigR=p.tbR; trigG=p.tbG; trigB=p.tbB;
     // Tolerance is fixed now, so a profile written when it was adjustable must not
     // drag an old value back in. The field stays in the file for format compatibility.
@@ -18266,9 +18272,8 @@ void paintMain(HWND hwnd){
             drawRR(hdc,p+16,ty+30,86,24,8,T.btn,g_tbArmCapturing?T.accent:T.border,1);
             drawText(hdc,g_tbArmCapturing?L"press a key":(ak?vkToString(ak).c_str():L"none"),
                      p+16,ty+30,86,24,ak?T.accent:T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            drawText(hdc,trigArmHold.load()?L"Hold":L"Tap",p+cw-112,ty+30,48,24,T.text,
+            drawText(hdc,L"hold to arm",p+cw-160,ty+30,144,24,T.subtext,
                      hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-            drawToggle(hdc,p+cw-56,ty+30,trigArmHold.load());
             bool live   = triggerbotEnabled.load() && (ak==0 || g_trigArmed.load());
             bool open   = robloxRunning.load();
             bool inGame = robloxFocused.load();
@@ -18277,7 +18282,7 @@ void paintMain(HWND hwnd){
             // setting it up in this window - so arming looked blocked when it was not.
             const wchar_t* msg =
                 !open  ? L"Roblox is not open"
-              : !live  ? (ak ? L"Not armed - press your bind" : L"No bind set, so the toggle above arms it")
+              : !live  ? (ak ? L"Hold your bind to arm it" : L"No bind set - it stays on while enabled")
               : !inGame? L"Armed - fires once you are back in the game"
               :          L"Armed - watching";
             drawText(hdc,msg,p+16,ty+58,cw-32,14,
@@ -18291,9 +18296,8 @@ void paintMain(HWND hwnd){
         drawRR(hdc,p+16,ty+30,86,24,8,T.btn,T.border,1);
         drawText(hdc,g_tbCapturing?L"press a key":vkToString(trigKey.load()).c_str(),
                  p+16,ty+30,86,24,T.accent,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        drawText(hdc,trigHoldMode.load()?L"Hold":L"Tap",p+cw-112,ty+30,48,24,T.text,
+        drawText(hdc,L"tapped once per ball",p+cw-190,ty+30,174,24,T.subtext,
                  hFontSmall,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-        drawToggle(hdc,p+cw-56,ty+30,trigHoldMode.load());
         g_tbLay.yKey=ty; ty+=76;
 
         drawCard(hdc,p,ty,cw,120);
@@ -20264,10 +20268,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         if(hwndMain) InvalidateRect(hwndMain,NULL,FALSE);
                     }).detach();
                 }
-                // arm hold / tap
-                else if(mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&myT>=g_tbLay.yArm+30&&myT<=g_tbLay.yArm+54){
-                    playToggle(); trigArmHold=!trigArmHold.load(); g_trigArmed=false; saveSettings(); handled=true;
-                }
                 // eyedropper
                 else if(mxT>=g_tbLay.pickX&&mxT<=g_tbLay.pickX+g_tbLay.pickW&&
                         myT>=g_tbLay.pickY&&myT<=g_tbLay.pickY+g_tbLay.pickH){
@@ -20289,10 +20289,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 else if(mxT>=pT+16&&mxT<=pT+102&&myT>=g_tbLay.yKey+30&&myT<=g_tbLay.yKey+54){
                     playClick(); g_tbCapturing=true;
                     std::thread(captureTriggerKey).detach(); handled=true;
-                }
-                // hold / tap
-                else if(mxT>=pT+cwT-56&&mxT<=pT+cwT-12&&myT>=g_tbLay.yKey+30&&myT<=g_tbLay.yKey+54){
-                    playToggle(); trigHoldMode=!trigHoldMode.load(); saveSettings(); handled=true;
                 }
                 // hex field
                 else if(mxT>=pT+70&&mxT<=pT+180&&myT>=g_tbLay.yColour+30&&myT<=g_tbLay.yColour+56){
