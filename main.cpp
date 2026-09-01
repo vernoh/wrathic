@@ -43,9 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "advapi32.lib")  // registry + OpenProcessToken/AdjustTokenPrivileges
+#pragma comment(lib, "advapi32.lib")  // registry (Reg* functions)
 #pragma comment(lib, "pdh.lib")       // Pdh* counters in resourceThread
-#pragma comment(lib, "srclient.lib")  // SRSetRestorePointW
 #pragma comment(lib, "comdlg32.lib")  // GetOpenFileNameW / GetSaveFileNameW
 #pragma comment(lib, "d3d11.lib")     // Desktop Duplication - see SCREEN CAPTURE
 #pragma comment(lib, "dxgi.lib")
@@ -53,7 +52,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <dxgi1_2.h>
 #include "logo_icon.h"
 
-#define APP_VERSION      L"v3.2.7"
+#define APP_VERSION      L"v3.2.8"
 #define CHANGELOG_VERSION L"v3.1.0-beta"
 #define UPDATE_URL        "https://api.github.com/repos/vernoh/wrathic/releases/latest"
 #define TRIAL_DAYS        1
@@ -13495,7 +13494,6 @@ std::atomic<bool> robloxWasRunning(false);
 
 
 
-void cleanMemory(); // forward declaration
 void robloxLaunchWatchThread(){
     while(appRunning){
         if(autoLaunchEnabled){
@@ -13508,9 +13506,6 @@ void robloxLaunchWatchThread(){
                     SetForegroundWindow(hwndMain);
                     LOG_OK(L"Roblox detected - macro window shown");
                 }
-                // Auto RAM cleanup on Roblox launch
-                LOG_INFO(L"Running automatic RAM cleanup for Roblox...");
-                std::thread(cleanMemory).detach();
             }
             if(!running&&robloxWasRunning){
                 // Roblox closed - hide macro
@@ -13627,14 +13622,6 @@ std::wstring g_lockButtonText;   // empty = no button rendered
 std::wstring g_lockRedirectUrl;  // empty = button (if any) is non-interactive
 std::wstring g_lockFooter;       // small helper line under the button/card
 
-// Optimise confirmation modal state
-bool g_optimiseConfirmOpen=false;
-bool g_optimiseRestorePoint=true; // default checked - safer default
-bool g_optimiseRunning=false;
-bool g_optimiseDecisionPending=false; // true while waiting on user's continue/cancel choice after a restore-point failure
-bool g_optimiseUserCancelled=false;
-std::wstring g_optimiseStatus;
-int g_optimiseRestoreResult=0; // 0=not attempted, 1=succeeded, 2=failed
 static const wchar_t* UPDATE_DOWNLOAD_URL = L"https://github.com/vernoh/wrathic/releases/latest";
 
 // Shared geometry for the lock overlay card - computed once here so the
@@ -16818,7 +16805,6 @@ static void pasteFromClipboard(HWND hwnd){
 }
 
 // ===================== MEMORY CLEANER =====================
-std::wstring cleanRamStatus = L"";
 bool licCopied = false;
 
 // Custom KPS/ms entry - click the speed label to type an exact value
@@ -16858,204 +16844,6 @@ std::wstring g_kpsEditBuffer;
 
 float licCopiedAlpha = 0.0f; // animated toward licCopied?1:0 each frame for a smooth fade
 DWORD licCopiedTick = 0;
-
-// NtSetSystemInformation for standby list flush
-typedef LONG(WINAPI*NtSetSysInfo_t)(UINT,PVOID,ULONG);
-
-void cleanMemory(){
-    static const wchar_t* THROTTLE_PROCS[]={
-        L"SearchIndexer.exe",L"SearchProtocolHost.exe",L"SearchFilterHost.exe",
-        L"MsMpEng.exe",L"SgrmBroker.exe",L"CompatTelRunner.exe",L"WmiPrvSE.exe",
-        L"OneDrive.exe",L"GoogleCrashHandler.exe",L"chrome.exe",L"msedge.exe",L"firefox.exe",
-        L"CCleaner64.exe",L"Dropbox.exe",L"GoogleDriveFS.exe",L"Discord.exe",
-        L"Steam.exe",L"EpicGamesLauncher.exe",L"EpicWebHelper.exe",L"steamwebhelper.exe",
-        L"AGSService.exe",L"NvBroadcast.exe",L"nvcontainer.exe",
-        L"AdobeARM.exe",L"Spotify.exe",L"Teams.exe",L"Slack.exe",L"zoom.exe",
-        NULL
-    };
-    auto lg=[](const wchar_t* t,const wchar_t* m,const wchar_t* s){
-        addLog(t,m); cleanRamStatus=s; InvalidateRect(hwndMain,NULL,FALSE);
-    };
-    addLog(L"INFO",L"-------- Optimisation started --------");
-    MEMORYSTATUSEX ms={}; ms.dwLength=sizeof(ms); GlobalMemoryStatusEx(&ms);
-    SIZE_T beforeMB=ms.ullAvailPhys/1024/1024;
-    SIZE_T totalMB=ms.ullTotalPhys/1024/1024;
-    wchar_t buf[512];
-    swprintf(buf,512,L"System RAM: %zu MB total, %zu MB free before",totalMB,beforeMB);
-    addLog(L"INFO",buf);
-    lg(L"INFO",L"[1/7] Trimming process working sets...",L"[1/7] Trimming...");
-    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
-    {int trimmed=0,failed=0;
-    DWORD ownPid=GetCurrentProcessId();
-    HANDLE hSnap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
-    if(hSnap!=INVALID_HANDLE_VALUE){
-        PROCESSENTRY32 pe={}; pe.dwSize=sizeof(pe);
-        if(Process32First(hSnap,&pe)) do {
-            if(pe.th32ProcessID==ownPid) continue;
-            HANDLE h=OpenProcess(PROCESS_SET_QUOTA|PROCESS_QUERY_INFORMATION,FALSE,pe.th32ProcessID);
-            if(h){EmptyWorkingSet(h);SetProcessWorkingSetSize(h,(SIZE_T)-1,(SIZE_T)-1);CloseHandle(h);trimmed++;}
-            else failed++;
-            if(trimmed%20==0) Sleep(1);
-        } while(Process32Next(hSnap,&pe));
-        CloseHandle(hSnap);
-    }
-    swprintf(buf,512,L"[1/7] Trimmed %d processes (%d skipped)",trimmed,failed);
-    lg(L"OK",buf,L"[1/7] Done");}
-    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_NORMAL);
-    Sleep(60);
-    lg(L"INFO",L"[2/7] Throttling background bloat...",L"[2/7] Throttling...");
-    {int throttled=0;
-    HANDLE hSnap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
-    if(hSnap!=INVALID_HANDLE_VALUE){
-        PROCESSENTRY32 pe={}; pe.dwSize=sizeof(pe);
-        if(Process32First(hSnap,&pe)) do {
-            for(int i=0;THROTTLE_PROCS[i];i++){
-                if(_wcsicmp(pe.szExeFile,THROTTLE_PROCS[i])==0){
-                    HANDLE h=OpenProcess(PROCESS_SET_INFORMATION,FALSE,pe.th32ProcessID);
-                    if(h){SetPriorityClass(h,IDLE_PRIORITY_CLASS);
-                    swprintf(buf,512,L"  Throttled %ls",pe.szExeFile);
-                    addLog(L"OK",buf);throttled++;CloseHandle(h);}
-                    break;
-                }
-            }
-        } while(Process32Next(hSnap,&pe));
-        CloseHandle(hSnap);
-    }
-    swprintf(buf,512,L"[2/7] Throttled %d bloat processes",throttled);
-    lg(L"OK",buf,L"[2/7] Done");}
-    Sleep(60);
-    lg(L"INFO",L"[3/7] Setting High Performance power plan...",L"[3/7] Power plan...");
-    {SHELLEXECUTEINFOW sei={}; sei.cbSize=sizeof(sei);
-    sei.fMask=SEE_MASK_NOCLOSEPROCESS|SEE_MASK_NO_CONSOLE;
-    sei.lpVerb=L"open"; sei.lpFile=L"powercfg";
-    sei.lpParameters=L"/setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
-    sei.nShow=SW_HIDE;
-    bool ok=ShellExecuteExW(&sei)&&(INT_PTR)sei.hInstApp>32;
-    if(ok&&sei.hProcess){WaitForSingleObject(sei.hProcess,2000);CloseHandle(sei.hProcess);}
-    lg(L"OK",ok?L"[3/7] High Performance set":L"[3/7] Needs admin",ok?L"[3/7] Done":L"[3/7] Skipped");}
-    Sleep(40);
-    lg(L"INFO",L"[4/7] Flushing DNS + disabling GameBar...",L"[4/7] DNS + GameBar...");
-    {bool dnsOk=false;
-    typedef BOOL(WINAPI* DnsFlush_t)();
-    HMODULE hDns=LoadLibraryW(L"dnsapi.dll");
-    if(hDns){DnsFlush_t fn2=(DnsFlush_t)GetProcAddress(hDns,"DnsFlushResolverCache");
-        if(fn2&&fn2()){ dnsOk=true; } FreeLibrary(hDns);}
-    addLog(L"OK",dnsOk?L"  DNS flushed":L"  DNS skipped");
-    HKEY hk; DWORD v=0;
-    if(RegOpenKeyExW(HKEY_CURRENT_USER,L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR",0,KEY_SET_VALUE,&hk)==ERROR_SUCCESS){
-        RegSetValueExW(hk,L"AppCaptureEnabled",0,REG_DWORD,(BYTE*)&v,4);RegCloseKey(hk);
-        addLog(L"OK",L"  GameBar capture disabled");}
-    if(RegOpenKeyExW(HKEY_CURRENT_USER,L"System\\GameConfigStore",0,KEY_SET_VALUE,&hk)==ERROR_SUCCESS){
-        RegSetValueExW(hk,L"GameDVR_Enabled",0,REG_DWORD,(BYTE*)&v,4);RegCloseKey(hk);
-        addLog(L"OK",L"  GameDVR disabled");}
-    lg(L"OK",L"[4/7] DNS + GameBar done",L"[4/7] Done");}
-    Sleep(40);
-    lg(L"INFO",L"[5/7] Flushing memory page lists...",L"[5/7] Page lists...");
-    {HANDLE hToken=NULL;
-    if(OpenProcessToken(GetCurrentProcess(),TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,&hToken)){
-        TOKEN_PRIVILEGES tp={}; LookupPrivilegeValue(NULL,SE_PROF_SINGLE_PROCESS_NAME,&tp.Privileges[0].Luid);
-        tp.PrivilegeCount=1; tp.Privileges[0].Attributes=SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(hToken,FALSE,&tp,0,NULL,NULL); CloseHandle(hToken);}
-    NtSetSysInfo_t fn3=(NtSetSysInfo_t)GetProcAddress(GetModuleHandle(L"ntdll.dll"),"NtSetSystemInformation");
-    if(fn3){UINT c=3;fn3(80,&c,4);c=4;fn3(80,&c,4);
-        lg(L"OK",L"[5/7] Page lists flushed",L"[5/7] Done");}
-    else lg(L"INFO",L"[5/7] Skipped (needs admin)",L"[5/7] Skipped");}
-    Sleep(40);
-    lg(L"INFO",L"[6/7] Clearing stale temp files...",L"[6/7] Temp files...");
-    SIZE_T tempFreedBytes=0; int tempDeleted=0;
-    {wchar_t tempPath[MAX_PATH]={};
-    DWORD tlen=GetTempPathW(MAX_PATH,tempPath);
-    if(tlen>0&&tlen<MAX_PATH){
-        std::wstring pattern=std::wstring(tempPath)+L"*";
-        WIN32_FIND_DATAW fd={};
-        HANDLE hFind=FindFirstFileW(pattern.c_str(),&fd);
-        if(hFind!=INVALID_HANDLE_VALUE){
-            FILETIME nowFt; SYSTEMTIME nowSt; GetSystemTime(&nowSt); SystemTimeToFileTime(&nowSt,&nowFt);
-            ULARGE_INTEGER nowU; nowU.LowPart=nowFt.dwLowDateTime; nowU.HighPart=nowFt.dwHighDateTime;
-            do{
-                if(wcscmp(fd.cFileName,L".")==0||wcscmp(fd.cFileName,L"..")==0) continue;
-                if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
-                // Only touch files untouched for 24h+ - never delete anything
-                // actively in use right now (also skips files locked by
-                // another process, which DeleteFile below just silently fails on)
-                ULARGE_INTEGER wU; wU.LowPart=fd.ftLastWriteTime.dwLowDateTime; wU.HighPart=fd.ftLastWriteTime.dwHighDateTime;
-                if(nowU.QuadPart-wU.QuadPart<864000000000ULL) continue;
-                ULARGE_INTEGER sz; sz.LowPart=fd.nFileSizeLow; sz.HighPart=fd.nFileSizeHigh;
-                std::wstring full=std::wstring(tempPath)+fd.cFileName;
-                if(DeleteFileW(full.c_str())){ tempFreedBytes+=sz.QuadPart; tempDeleted++; }
-            } while(FindNextFileW(hFind,&fd));
-            FindClose(hFind);
-        }
-    }
-    swprintf(buf,512,L"[6/7] Cleared %d temp files (%.1f MB)",tempDeleted,tempFreedBytes/1024.0/1024.0);
-    lg(L"OK",buf,L"[6/7] Done");}
-    Sleep(40);
-    lg(L"INFO",L"[7/7] Measuring results...",L"[7/7] Measuring...");
-    GlobalMemoryStatusEx(&ms);
-    SIZE_T afterMB=ms.ullAvailPhys/1024/1024;
-    SIZE_T freed=afterMB>beforeMB?afterMB-beforeMB:0;
-    swprintf(buf,512,L"RAM: %zu MB -> %zu MB free (+%zu MB)",beforeMB,afterMB,freed);
-    addLog(L"OK",buf);
-    addLog(L"OK",L"-------- Optimisation complete --------");
-    swprintf(buf,512,L"+ Freed %zu MB RAM  (%zu -> %zu MB free)\n+ %d temp files cleared (%.1f MB)\n+ Bloat throttled, DNS cleared, GameBar off",freed,beforeMB,afterMB,tempDeleted,tempFreedBytes/1024.0/1024.0);
-    cleanRamStatus=buf; InvalidateRect(hwndMain,NULL,FALSE);
-    showSuccessToast(L"Optimisation complete");
-}
-
-// Runs on a background thread from the Optimise confirmation modal. Creating
-// a restore point can take a few seconds and Windows only allows one every
-// ~24h by default - if it fails or is skipped, optimisation still proceeds.
-void runOptimiseFlow(bool withRestorePoint){
-    g_optimiseRunning=true;
-    g_optimiseDecisionPending=false;
-    g_optimiseUserCancelled=false;
-    g_optimiseRestoreResult=0;
-    g_optimiseStatus=L"Preparing...";
-    cleanRamStatus.clear();
-    InvalidateRect(hwndMain,NULL,FALSE);
-
-    if(withRestorePoint){
-        g_optimiseStatus=L"Creating System Restore point...";
-        InvalidateRect(hwndMain,NULL,FALSE);
-        LOG_INFO(L"Creating System Restore point...");
-        RESTOREPOINTINFOW rp={};
-        rp.dwEventType=BEGIN_SYSTEM_CHANGE;
-        rp.dwRestorePtType=MODIFY_SETTINGS;
-        wcsncpy(rp.szDescription,L"wrathic - before optimise",MAX_DESC_W-1);
-        STATEMGRSTATUS st={};
-        BOOL ok=SRSetRestorePointW(&rp,&st);
-        g_optimiseRestoreResult = ok?1:2;
-        if(ok){
-            LOG_OK(L"System Restore point created");
-        } else {
-            LOG_ERR(L"Could not create Restore point (Windows limits these to once/24h)");
-            // Don't silently proceed - pause here and let the user decide,
-            // per request. The modal shows Continue/Cancel while this waits.
-            g_optimiseDecisionPending=true;
-            g_optimiseStatus=L"Restore point failed - continue anyway?";
-            InvalidateRect(hwndMain,NULL,FALSE);
-            while(g_optimiseDecisionPending){ Sleep(50); }
-            if(g_optimiseUserCancelled){
-                LOG_INFO(L"Optimisation cancelled by user after restore point failure");
-                g_optimiseRunning=false;
-                g_optimiseConfirmOpen=false;
-                InvalidateRect(hwndMain,NULL,FALSE);
-                return;
-            }
-        }
-    }
-
-    cleanMemory(); // updates g_optimiseStatus-visible cleanRamStatus through its own phases
-
-    std::wstring extra;
-    if(g_optimiseRestoreResult==1) extra=L"\n+ Restore point created successfully";
-    else if(g_optimiseRestoreResult==2) extra=L"\n! Restore point failed (skipped, optimisation still ran)";
-    cleanRamStatus += extra;
-
-    g_optimiseRunning=false;
-    g_optimiseConfirmOpen=false;
-    InvalidateRect(hwndMain,NULL,FALSE);
-}
 
 // ===================== SPLASH =====================
 HWND hwndSplash=NULL;
@@ -17750,95 +17538,6 @@ static void drawLockOverlay(HDC hdc,int W,int H){
             ll.footerRect.right-ll.footerRect.left,ll.footerRect.bottom-ll.footerRect.top,
             T.subtext,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
-}
-
-// ===================== OPTIMISE CONFIRM MODAL =====================
-struct OptimiseLayout{ int cardX,cardY,cardW,cardH; RECT checkboxRect,cancelRect,confirmRect,statusRect; };
-static OptimiseLayout computeOptimiseLayout(int W,int H){
-    OptimiseLayout L{};
-    L.cardW=std::min(320,W-64); L.cardH=200;
-    L.cardX=(W-L.cardW)/2; L.cardY=(H-L.cardH)/2;
-    int cbY=L.cardY+94;
-    L.checkboxRect={L.cardX+20,cbY,L.cardX+L.cardW-20,cbY+34};
-    L.statusRect={L.cardX+20,cbY,L.cardX+L.cardW-20,cbY+50};
-    int btnY=L.cardY+L.cardH-46;
-    int btnW=(L.cardW-20-10-20)/2;
-    L.cancelRect={L.cardX+20,btnY,L.cardX+20+btnW,btnY+34};
-    L.confirmRect={L.cardX+L.cardW-20-btnW,btnY,L.cardX+L.cardW-20,btnY+34};
-    return L;
-}
-static void drawOptimiseConfirm(HDC hdc,int W,int H){
-    using namespace Gdiplus;
-    // Simple dim scrim - no blur needed for a quick confirmation
-    { Graphics g(hdc); SolidBrush scrim(Color(150,GetRValue(T.bg),GetGValue(T.bg),GetBValue(T.bg))); g.FillRectangle(&scrim,0,0,W,H); }
-
-    OptimiseLayout ol=computeOptimiseLayout(W,H);
-    { Graphics g(hdc); g.SetSmoothingMode(SmoothingModeAntiAlias);
-      int rr=18,d=rr*2;
-      SolidBrush cardBrush(Color(240,GetRValue(T.card),GetGValue(T.card),GetBValue(T.card)));
-      GraphicsPath cp;
-      cp.AddArc(ol.cardX,ol.cardY,d,d,180,90);
-      cp.AddArc(ol.cardX+ol.cardW-d,ol.cardY,d,d,270,90);
-      cp.AddArc(ol.cardX+ol.cardW-d,ol.cardY+ol.cardH-d,d,d,0,90);
-      cp.AddArc(ol.cardX,ol.cardY+ol.cardH-d,d,d,90,90);
-      cp.CloseFigure();
-      g.FillPath(&cardBrush,&cp);
-      Pen borderPen(Color(60,GetRValue(T.accent),GetGValue(T.accent),GetBValue(T.accent)),1.2f);
-      g.DrawPath(&borderPen,&cp);
-    }
-
-    bool showingStatus = g_optimiseRunning || g_optimiseDecisionPending;
-    drawText(hdc,showingStatus?L"Optimising...":L"Optimise Memory?",ol.cardX+20,ol.cardY+18,ol.cardW-40,24,T.text,hFontMed,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    drawText(hdc,L"Trims wrathic's working set and throttles background bloat.",ol.cardX+20,ol.cardY+44,ol.cardW-40,42,T.subtext,hFontSmall,DT_LEFT|DT_TOP|DT_WORDBREAK);
-
-    if(showingStatus){
-        // Spinner - simple rotating arc, ticks with GetTickCount so it
-        // animates smoothly without needing its own state
-        RECT& sr=ol.statusRect;
-        int spSz=16, spCx=sr.left+spSz/2, spCy=sr.top+spSz/2+2;
-        float ang=(float)(GetTickCount()%1000)/1000.0f*360.0f;
-        Graphics g(hdc); g.SetSmoothingMode(SmoothingModeAntiAlias);
-        Pen spinPen(Color(220,GetRValue(T.accent),GetGValue(T.accent),GetBValue(T.accent)),2.5f);
-        spinPen.SetStartCap(LineCapRound); spinPen.SetEndCap(LineCapRound);
-        g.DrawArc(&spinPen,spCx-spSz/2,spCy-spSz/2,spSz,spSz,ang,270.0f);
-
-        std::wstring statusText = cleanRamStatus.empty()?g_optimiseStatus:cleanRamStatus;
-        // Only show the first line here (cleanRamStatus can have multiple lines by the end)
-        size_t nl=statusText.find(L'\n');
-        if(nl!=std::wstring::npos) statusText=statusText.substr(0,nl);
-        drawText(hdc,statusText.c_str(),sr.left+spSz+10,sr.top,sr.right-sr.left-spSz-10,20,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    } else {
-        // Checkbox - single-line label. DT_VCENTER is documented as only
-        // supported with DT_SINGLELINE; combining it with DT_WORDBREAK (as
-        // before) silently drops the vertical centering once text could
-        // wrap, which is why the box and label used to drift apart.
-        RECT& cb=ol.checkboxRect;
-        int boxSz=18, boxY=cb.top+(34-boxSz)/2;
-        drawRR(hdc,cb.left,boxY,boxSz,boxSz,4,g_optimiseRestorePoint?T.accent:T.btn,T.border,1);
-        if(g_optimiseRestorePoint){
-            drawText(hdc,L"\u2713",cb.left,boxY,boxSz,boxSz,RGB(255,255,255),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        }
-        drawText(hdc,L"Create a Windows Restore point first",cb.left+boxSz+8,cb.top,cb.right-cb.left-boxSz-8,34,T.text,hFontSmall,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    }
-
-    // Buttons
-    bool decisionMode = g_optimiseDecisionPending;
-    const wchar_t* cancelLabel = L"Cancel";
-    const wchar_t* confirmLabel = decisionMode?L"Continue Anyway":L"Optimise";
-    bool buttonsDimmed = g_optimiseRunning && !decisionMode;
-    BYTE btnA = buttonsDimmed?90:255;
-    drawRR(hdc,ol.cancelRect.left,ol.cancelRect.top,ol.cancelRect.right-ol.cancelRect.left,34,10,T.btn,T.border,1);
-    drawText(hdc,cancelLabel,ol.cancelRect.left,ol.cancelRect.top,ol.cancelRect.right-ol.cancelRect.left,34,buttonsDimmed?T.subtext:T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    COLORREF confirmBg = decisionMode?T.red:T.accent;
-    { Graphics g(hdc); g.SetSmoothingMode(SmoothingModeAntiAlias);
-      SolidBrush cb2(Color(btnA,GetRValue(confirmBg),GetGValue(confirmBg),GetBValue(confirmBg)));
-      GraphicsPath p2; int rr2=10,d2=rr2*2;
-      int bx=ol.confirmRect.left, by=ol.confirmRect.top, bw2=ol.confirmRect.right-ol.confirmRect.left, bh2=34;
-      p2.AddArc(bx,by,d2,d2,180,90); p2.AddArc(bx+bw2-d2,by,d2,d2,270,90);
-      p2.AddArc(bx+bw2-d2,by+bh2-d2,d2,d2,0,90); p2.AddArc(bx,by+bh2-d2,d2,d2,90,90);
-      p2.CloseFigure(); g.FillPath(&cb2,&p2);
-    }
-    drawText(hdc,confirmLabel,ol.confirmRect.left,ol.confirmRect.top,ol.confirmRect.right-ol.confirmRect.left,34,RGB(255,255,255),hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 }
 
 // Minimise and close, drawn in the app's own palette. Close warms to red on hover
@@ -18851,15 +18550,19 @@ void paintMain(HWND hwnd){
     if(g_tipVisible&&!g_tipText.empty())
         drawSettingsTip(hdc,g_tipX,g_tipY,g_tipText.c_str(),W,H);
 
-    // Last, so no amount of scrolling can put a card over the title or the window
-    // buttons. Only the lock and the modal go above it, which is correct - both are
-    // meant to cover the whole window.
-    drawAppHeader(hdc,W);
-
     // Repaint while a download is running so the percentage on the button moves.
     if(g_lockKind==LOCK_UPDATE && g_updateProgress.load()>=0) InvalidateRect(hwnd,NULL,FALSE);
+    // The lock goes on BEFORE the header, not after. It is meant to cover the page,
+    // but covering the window's own minimise and close along with it left someone told
+    // to update with no way out of the window but the taskbar - the buttons were still
+    // clickable (WM_LBUTTONDOWN tests them before the lock swallows the click) but
+    // blurred out of sight. Drawing the header last puts those two buttons back on top,
+    // crisp, while everything else stays behind the blur.
     if(g_lockKind!=LOCK_NONE) drawLockOverlay(hdc,W,H);
-    else if(g_optimiseConfirmOpen) drawOptimiseConfirm(hdc,W,H);
+
+    // Last, so no amount of scrolling can put a card over the title or the window
+    // buttons, and so the caption buttons stay above the lock.
+    drawAppHeader(hdc,W);
 
     BitBlt(hdc_real,0,0,W,H,hdc,0,0,SRCCOPY);
     EndPaint(hwnd,&ps);
@@ -18887,30 +18590,13 @@ static int calcOverlayCardH(){
     return h;
 }
 
-// UTILITIES card: optimise, logs, cfg
+// UTILITIES card: open logs, benchmark
 static int calcUtilsCardH(){
     int h=10;
     h+=14+6;                           // header label
-    h+=28+6;                           // Optimise / Open Logs
+    h+=28+6;                           // Open Logs
     h+=28+6;                           // Benchmark
     if(!g_benchSpecs.empty()) h+=16;   // the specs line under it
-    if(!cleanRamStatus.empty()){
-        // Count real \n-separated segments, each further estimated for
-        // word-wrap at ~40 chars/line - the old size()/32 guess ignored
-        // actual line breaks entirely and badly undercounted once this
-        // grew to multiple real lines (temp files + restore point etc.)
-        int lines=0;
-        size_t pos=0;
-        while(pos<=cleanRamStatus.size()){
-            size_t nl=cleanRamStatus.find(L'\n',pos);
-            size_t segLen=(nl==std::wstring::npos?cleanRamStatus.size():nl)-pos;
-            int segLines=(int)(segLen/40)+1;
-            lines+=segLines;
-            if(nl==std::wstring::npos) break;
-            pos=nl+1;
-        }
-        h+=lines*16+6;
-    }
     h+=8;
     return h;
 }
@@ -19092,9 +18778,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
     {int uH=calcUtilsCardH(); drawCard(hdc,p,y,cw,uH);
     int cx=y+10;
     drawText(hdc,L"UTILITIES",p+14,cx,150,14,T.subtext,hFontSmall); cx+=14+6;
-    int hw2=(cw-28-8)/2;
-    drawRR(hdc,p+14,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Optimise",p+14,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    drawRR(hdc,p+14+hw2+8,cx,hw2,28,8,T.btn,T.border,1); drawText(hdc,L"Open Logs",p+14+hw2+8,cx,hw2,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    drawRR(hdc,p+14,cx,cw-28,28,8,T.btn,T.border,1); drawText(hdc,L"Open Logs",p+14,cx,cw-28,28,T.text,hFontSmall,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     // Benchmark sits on its own row: it is the one control here that changes how the
     // macro behaves, rather than being a utility.
     cx+=28+6;
@@ -19125,21 +18809,7 @@ void paintSettingsInto(HDC hdc,int W,int H){
                      DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
     if(!g_benchSpecs.empty()) cx+=16;
-    cx+=28+6;
-    if(!cleanRamStatus.empty()){
-        bool done=cleanRamStatus.find(L"Freed")!=std::wstring::npos;
-        SetTextColor(hdc,done?T.green:T.accent); SetBkMode(hdc,TRANSPARENT);
-        SelectObject(hdc,hFontSmall);
-        int lines=0; size_t pos=0;
-        while(pos<=cleanRamStatus.size()){
-            size_t nl=cleanRamStatus.find(L'\n',pos);
-            size_t segLen=(nl==std::wstring::npos?cleanRamStatus.size():nl)-pos;
-            lines+=(int)(segLen/40)+1;
-            if(nl==std::wstring::npos) break;
-            pos=nl+1;
-        }
-        RECT sr={p+14,cx,p+14+cw-28,cx+lines*16+8}; DrawText(hdc,cleanRamStatus.c_str(),-1,&sr,DT_LEFT|DT_TOP|DT_WORDBREAK);
-    }(void)cx;}
+    (void)cx;}
 
     // Profiles moved to the macro page - see drawProfilesCard.
 
@@ -19649,9 +19319,7 @@ void settingsHandleClick(HWND hwnd, int mx, int my, int W, int H) {
 
     // â”€â”€ UTILITIES CARD (l.yAutoLaunch = card top) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     { int cx=l.yAutoLaunch+10+14+6; // top + header
-      int hw=(cw-28-8)/2;
-      if(mx>=p+14      &&mx<=p+14+hw   &&my>=cx&&my<=cx+28){playClick();g_optimiseConfirmOpen=true;InvalidateRect(hwnd,NULL,FALSE);}
-      if(mx>=p+14+hw+8 &&mx<=p+14+hw+8+hw&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",dataPath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
+      if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+28){playClick();ShellExecute(NULL,L"open",dataPath(LOG_FILE).c_str(),NULL,NULL,SW_SHOW);}
       cx+=28+6;
       if(mx>=p+14&&mx<=p+cw-14&&my>=cx&&my<=cx+28){
           playClick();
@@ -20214,7 +19882,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 for(int i=0;i<16;i++){
                     if(hoverBtn[i]>0.002f&&hoverBtn[i]<0.998f){needRepaint=true;break;}
                 }
-                if(g_optimiseRunning||g_optimiseDecisionPending) needRepaint=true;
                 if(g_kpsEditing) needRepaint=true;
                 if(g_advRecording.load()) needRepaint=true;   // step list is filling
                 if(activeTab==1 && triggerbotEnabled.load()) needRepaint=true; // live readout
@@ -20477,7 +20144,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                                      lp3.pad,lp3.yProfiles,lp3.cw);
             return 0;
         }
-        if(activeTab==2 && g_lockKind==LOCK_NONE && !g_optimiseConfirmOpen){
+        if(activeTab==2 && g_lockKind==LOCK_NONE){
             RECT crR; GetClientRect(hwnd,&crR);
             settingsHandleRightClick(hwnd,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),crR.right,crR.bottom-dockBottom());
         }
@@ -20565,32 +20232,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     }
                 }
             }
-            return 0;
-        }
-        if(g_optimiseConfirmOpen){
-            RECT crO;GetClientRect(hwnd,&crO);
-            OptimiseLayout ol=computeOptimiseLayout(crO.right,crO.bottom);
-            if(g_optimiseDecisionPending){
-                // Restore point failed - Confirm is relabelled "Continue Anyway", Cancel aborts the whole flow
-                if(mx>=ol.cancelRect.left&&mx<=ol.cancelRect.right&&my>=ol.cancelRect.top&&my<=ol.cancelRect.bottom){
-                    playClick(); g_optimiseUserCancelled=true; g_optimiseDecisionPending=false; InvalidateRect(hwnd,NULL,FALSE);
-                } else if(mx>=ol.confirmRect.left&&mx<=ol.confirmRect.right&&my>=ol.confirmRect.top&&my<=ol.confirmRect.bottom){
-                    playClick(); g_optimiseDecisionPending=false; InvalidateRect(hwnd,NULL,FALSE);
-                }
-            } else if(!g_optimiseRunning){
-                RECT& cb=ol.checkboxRect;
-                if(mx>=cb.left&&mx<=cb.right&&my>=cb.top&&my<=cb.bottom){
-                    playClick(); g_optimiseRestorePoint=!g_optimiseRestorePoint; InvalidateRect(hwnd,NULL,FALSE);
-                } else if(mx>=ol.cancelRect.left&&mx<=ol.cancelRect.right&&my>=ol.cancelRect.top&&my<=ol.cancelRect.bottom){
-                    playClick(); g_optimiseConfirmOpen=false; InvalidateRect(hwnd,NULL,FALSE);
-                } else if(mx>=ol.confirmRect.left&&mx<=ol.confirmRect.right&&my>=ol.confirmRect.top&&my<=ol.confirmRect.bottom){
-                    playClick();
-                    std::thread(runOptimiseFlow,g_optimiseRestorePoint).detach();
-                    InvalidateRect(hwnd,NULL,FALSE);
-                }
-            }
-            // while running (and not awaiting a decision) the modal is
-            // non-interactive - just shows progress
             return 0;
         }
         // ── TRIGGERBOT TAB CLICKS ────────────────────────────────────────────
